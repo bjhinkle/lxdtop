@@ -1,0 +1,1548 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 BJ Hinkle
+"""lxdtop: a live, btop-style view of an LXD host, one row per container or VM.
+
+Run it on the LXD host itself, in a terminal or over SSH. It is laid out for a
+160x45 screen (a small console monitor or a large terminal window) and adapts
+to smaller windows by dropping panels, then columns. It uses only the Python
+standard library: copy this one file to the host (for example ~/bin/lxdtop)
+and run it.
+
+    lxdtop            run it (q quits, s changes the sort, - and + change speed)
+    lxdtop --dump     print one frame as plain text and exit (for testing)
+
+Top to bottom: a status line (LXD version, clock, counts); host panels for
+CPU, memory and network; CPU use stacked by instance beside a live feed of
+LXD events; then one row per container or VM.
+
+Everything it does is read-only. Each refresh it reads:
+    /sys/fs/cgroup/lxc.payload.<name>/      CPU, memory and task counters per container
+    /proc/<pid>/stat, /proc/<pid>/cgroup    the busiest process inside each container,
+                                            and each VM's QEMU process (CPU, memory)
+    /proc/spl/kstat/zfs/<pool>/objset-*     disk reads and writes per instance (ZFS)
+    /sys/class/net/<nic>/statistics/        network bytes per instance (veth/tap) and host port
+    /proc/stat, /proc/meminfo, hwmon, ...   host totals, temperature, clock speed
+It also talks to LXD over its local socket, GET requests and an event stream
+only: every 15 seconds for names, state, addresses and pool usage, and
+continuously for lifecycle events. That socket needs membership in the lxd
+group (or root). Without it lxdtop still runs, minus IPs, the network
+columns, VMs, stopped instances and the event feed.
+
+Needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3.
+Tested on Ubuntu 24.04 with LXD 6.7 and Python 3.12.
+"""
+
+import argparse
+import base64
+import collections
+import curses
+import glob
+import http.client
+import json
+import locale
+import os
+import socket
+import threading
+import time
+import types
+import urllib.parse
+
+VERSION = "1.3.2 (2026-10-01)"
+TIMEZONE = None      # the clock's default (None = the system's); TZ overrides it
+CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
+CGROUP_PREFIX = "lxc.payload."
+ZFS_KSTAT_GLOB = "/proc/spl/kstat/zfs/*/objset-*"
+ZFS_ARCSTATS = "/proc/spl/kstat/zfs/arcstats"
+LXD_SOCKETS = ([os.path.join(os.environ["LXD_DIR"], "unix.socket")] if os.environ.get("LXD_DIR") else []) + [
+    "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/lxd/unix.socket"]
+API_EVERY = 15                     # seconds between LXD API refreshes
+REPEAT_WINDOW = 600                # an event seen again within 10 minutes joins its earlier line
+CLOCK_TICKS = os.sysconf("SC_CLK_TCK")   # unit of the CPU times in /proc/<pid>/stat (100 a second)
+
+HISTORY = 900                      # samples kept per graph (30 min at 2 s)
+RATE_WINDOW = 4                    # disk and network rates average over the last 3 intervals
+INTERVALS = (1, 2, 3, 5, 10)       # seconds; - and + step through these
+SORTS = ("cpu", "mem", "disk", "net", "name")
+SORT_COLUMNS = {"cpu": {"cpu"}, "mem": {"mem"}, "disk": {"rd", "wr"},
+                "net": {"net_in", "net_out"}, "name": {"name"}}
+GRAPH_SCALES = (10, 25, 50, 100, 200, 400, 800, 1200, 1600, 2400, 3200, 6400)  # % of one core
+HOST = "\0host"                    # graph key for CPU used outside any container
+SERIES = ("s0", "s1", "s2", "s3", "s4")
+MB = 1024 * 1024
+
+# Color styles as (color, bold). On the Linux console bold means the bright
+# version of a color, so ("black", True) is grey. Bright blue is avoided for
+# text: in Ubuntu's console palette it is pure blue, too dark to read on black.
+COLORS = ("black", "red", "green", "yellow", "blue", "magenta", "cyan", "white")
+STYLES = {
+    "title": ("white", True),
+    "text": ("white", False),
+    "bright": ("white", True),
+    "dim": ("black", True),
+    "faint": ("black", True),          # background texture: empty meter cells, idle dots
+    "lo": ("green", True),
+    "mid": ("yellow", True),
+    "hi": ("red", True),
+    "mem": ("magenta", True),
+    "arc": ("blue", False),
+    "free": ("green", False),
+    "swap": ("yellow", False),
+    "ip": ("cyan", False),
+    "key": ("yellow", True),
+    "net_in": ("green", True),
+    "net_out": ("magenta", True),
+    # Panel borders, after btop: each box gets its own muted color.
+    "b_cpu": ("green", False),
+    "b_mem": ("yellow", False),
+    "b_net": ("cyan", False),
+    "b_graph": ("blue", False),
+    "b_events": ("magenta", False),
+    "b_table": ("red", False),
+    # The five busiest containers in the CPU graph, then everything else.
+    "s0": ("green", True),
+    "s1": ("cyan", True),
+    "s2": ("yellow", True),
+    "s3": ("magenta", True),
+    "s4": ("blue", False),
+    "other": ("white", False),
+    "host": ("black", True),
+    # Event feed.
+    "ev_start": ("green", True),
+    "ev_stop": ("yellow", True),
+    "ev_delete": ("red", True),
+    "ev_snap": ("magenta", True),
+    "ev_exec": ("cyan", True),
+}
+
+# Terminals with 256 colors (macOS Terminal, iTerm2) get these instead, as
+# (color number, bold). On the Linux console bold black is a readable mid grey,
+# but many terminals draw it nearly black, and their dark blue is hard to read
+# too, so those styles use fixed shades from the 256-color palette there.
+STYLES_256 = {
+    "dim": (247, False),
+    "faint": (240, False),
+    "host": (244, False),
+    "arc": (74, False),
+    "s4": (75, False),
+    "b_graph": (68, False),
+}
+
+# Drawing characters. Ubuntu's Linux console font (Uni2-Fixed16) has no half
+# blocks and no dark shade, so graphs use only full block, medium shade and
+# light shade (what btop uses on a console too). It draws the rounded corners
+# with its square ones, which is fine; other terminals show them rounded.
+# Containers are marked with a dot, VMs with a square.
+GLYPHS_UNICODE = dict(full="█", mid="▒", low="░", cell="■", cell_off="■", idle="·", dot="●", vm="■",
+                      h="─", v="│", tl="╭", tr="╮", bl="╰", br="╯",
+                      tab_l="┐", tab_r="┌", foot_l="┘", foot_r="└",
+                      up="▲", down="▼", sorted="↓", more="…", deg="°", times="×")
+GLYPHS_ASCII = dict(full="#", mid="=", low="-", cell="#", cell_off=".", idle=".", dot="*", vm="#",
+                    h="-", v="|", tl="+", tr="+", bl="+", br="+",
+                    tab_l="[", tab_r="]", foot_l="[", foot_r="]",
+                    up="^", down="v", sorted="v", more="~", deg="", times="x")
+G = GLYPHS_UNICODE
+
+EVENT_LABELS = {
+    "instance-started": ("started", "ev_start"),
+    "instance-restarted": ("restarted", "ev_start"),
+    "instance-resumed": ("unfrozen", "ev_start"),
+    "instance-created": ("created", "ev_start"),
+    "instance-stopped": ("stopped", "ev_stop"),
+    "instance-shutdown": ("shut down", "ev_stop"),
+    "instance-paused": ("frozen", "ev_stop"),
+    "instance-deleted": ("deleted", "ev_delete"),
+    "instance-snapshot-created": ("snapshot", "ev_snap"),
+    "instance-snapshot-deleted": ("snap rm", "ev_snap"),
+    "instance-restored": ("restored", "ev_snap"),
+    "instance-exec": ("exec", "ev_exec"),
+    "instance-console": ("console", "ev_exec"),
+    "instance-file-pushed": ("file push", "ev_exec"),
+    "instance-file-deleted": ("file rm", "ev_exec"),
+    "instance-file-retrieved": ("file pull", "dim"),
+    "instance-log-retrieved": ("log read", "dim"),
+    "instance-updated": ("config", "text"),
+    "instance-renamed": ("renamed", "text"),
+}
+
+
+# --- Reading the kernel's counters -------------------------------------------
+
+def read(path):
+    if not path:
+        return None
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def read_int(path):
+    """First number in a file; None if it's missing or says "max" (no limit)."""
+    try:
+        return int(read(path).split()[0])
+    except (AttributeError, IndexError, ValueError):
+        return None
+
+
+def read_fields(path, wanted):
+    """Pick "name value" lines out of files like cpu.stat and memory.stat."""
+    found = {}
+    for line in (read(path) or "").splitlines():
+        name, _, value = line.partition(" ")
+        if name in wanted:
+            found[name] = int(value)
+            if len(found) == len(wanted):
+                break
+    return found
+
+
+def read_kstat(path, wanted):
+    """ZFS kstat files: two header lines, then "name type value" rows."""
+    text = read(path)
+    if text is None:
+        return None
+    found = {}
+    for line in text.splitlines()[2:]:
+        parts = line.split(None, 2)
+        if len(parts) == 3 and parts[0] in wanted:
+            found[parts[0]] = parts[2].strip()
+    return found
+
+
+def read_io_stat(path):
+    """Fallback for non-ZFS storage: block I/O the kernel charged to the container."""
+    text = read(path)
+    if text is None:
+        return None
+    rd = wr = 0
+    for line in text.splitlines():
+        for field in line.split()[1:]:
+            key, _, value = field.partition("=")
+            if key == "rbytes":
+                rd += int(value)
+            elif key == "wbytes":
+                wr += int(value)
+    return rd, wr
+
+
+def find_zfs_datasets():
+    """Map instance names to the ZFS kstat file for their disk.
+
+    ZFS keeps per-dataset totals of bytes read and written. Each container's
+    root disk is its own dataset (<pool>/containers/<name>) and each VM's disk
+    its own volume (<pool>/virtual-machines/<name>.block), which gives a
+    per-instance disk view. Reads served from ZFS's memory cache count too, so
+    DISK R means "reads by the instance", not only reads that reached the drive.
+    """
+    mapping = {}
+    for path in glob.glob(ZFS_KSTAT_GLOB):
+        dataset = (read_kstat(path, ("dataset_name",)) or {}).get("dataset_name", "")
+        for marker, suffix in (("/containers/", ""), ("/virtual-machines/", ".block")):
+            _, sep, name = dataset.rpartition(marker)
+            if sep and name.endswith(suffix) and "/" not in name and "@" not in name:
+                mapping[name[:len(name) - len(suffix)]] = path
+    return mapping
+
+
+def read_cpu_times():
+    """Busy and total CPU time from /proc/stat: the whole host, then each CPU thread."""
+    whole, threads = (0, 0), []
+    for line in (read("/proc/stat") or "").splitlines():
+        if not line.startswith("cpu"):
+            break
+        fields = [int(x) for x in line.split()[1:9]]
+        idle = fields[3] + fields[4]                 # idle + waiting on I/O
+        reading = (sum(fields) - idle, sum(fields))
+        if line.startswith("cpu "):
+            whole = reading
+        else:
+            threads.append(reading)
+    return whole, threads
+
+
+def busy_pct(now, before):
+    busy, total = now[0] - before[0], now[1] - before[1]
+    return max(0.0, min(100.0, busy / total * 100)) if total > 0 else 0.0
+
+
+def read_meminfo():
+    info = dict.fromkeys(("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"), 0)
+    for line in (read("/proc/meminfo") or "").splitlines():
+        name, _, rest = line.partition(":")
+        if name in info:
+            info[name] = int(rest.split()[0]) * 1024
+    return info
+
+
+def find_cpu_temp_sensor():
+    """The CPU temperature file (AMD k10temp or Intel coretemp), if the host has one."""
+    for hwmon in sorted(glob.glob("/sys/class/hwmon/hwmon*")):
+        if (read(hwmon + "/name") or "").strip() in ("k10temp", "zenpower", "coretemp"):
+            return hwmon + "/temp1_input"
+    return None
+
+
+def physical_nics():
+    """Network ports backed by real hardware that are currently up."""
+    return sorted(os.path.basename(path) for path in glob.glob("/sys/class/net/*")
+                  if os.path.exists(path + "/device")
+                  and (read(path + "/operstate") or "").strip() == "up")
+
+
+def read_vm_process(pid):
+    """CPU time (microseconds), resident memory (bytes) and start time of a VM's QEMU process.
+
+    LXD runs each VM as a QEMU process on the host, outside any container
+    cgroup. Returns None if that process is gone or the PID now belongs to
+    something else.
+    """
+    stat = read(f"/proc/{pid}/stat") if pid else None
+    if not stat or "(qemu" not in stat:
+        return None
+    fields = stat[stat.rfind(")") + 2:].split()
+    rss = 0
+    for line in (read(f"/proc/{pid}/status") or "").splitlines():
+        if line.startswith("VmRSS:"):
+            rss = int(line.split()[1]) * 1024
+            break
+    return (int(fields[11]) + int(fields[12])) * 1_000_000 // CLOCK_TICKS, rss, int(fields[19])
+
+
+def read_net(host_ends):
+    """Bytes in and out so far over an instance's host-side network interfaces.
+
+    An instance's network cable is a pair of virtual interfaces: one end inside
+    it (eth0), one end on the host (vethXXXX for a container, tapXXXX for a VM).
+    Bytes the host end receives are bytes the instance sent, so in/out swap here.
+    """
+    net = None
+    for name in host_ends:
+        host_rx = read_int(f"/sys/class/net/{name}/statistics/rx_bytes")
+        host_tx = read_int(f"/sys/class/net/{name}/statistics/tx_bytes")
+        if host_rx is not None and host_tx is not None:
+            n_in, n_out = net or (0, 0)
+            net = (n_in + host_tx, n_out + host_rx)
+    return net
+
+
+def container_of(pid):
+    """Which container a process runs in, from /proc/<pid>/cgroup (None means the host)."""
+    for line in (read(f"/proc/{pid}/cgroup") or "").splitlines():
+        path = line.split(":", 2)[-1]                # cgroup v2: "0::/lxc.payload.<name>/..."
+        if path.startswith("/" + CGROUP_PREFIX):
+            return path[len(CGROUP_PREFIX) + 1:].split("/", 1)[0]
+    return None
+
+
+def new_row(cg, inst, **fields):
+    """One table row; fields not given stay empty until a reading fills them."""
+    row = dict(cg=cg, name=inst.get("name", cg), state=inst.get("status", "Running"), live=True,
+               vm=False, ip=inst.get("ipv4", ""), mem=None, tasks=None, top=None, up=None,
+               cpu=None, rd=None, wr=None, net_in=None, net_out=None)
+    row.update(fields)
+    return row
+
+
+def rate(now_total, before_total, secs):
+    """Change per second between two readings of a counter that only goes up.
+
+    Same idea as working out bits per second from two "show interface"
+    readings: take the difference and divide by the seconds in between. A
+    total that went DOWN means the container restarted and its counters reset,
+    so that one interval counts as zero.
+    """
+    if secs <= 0 or now_total < before_total:
+        return 0.0
+    return (now_total - before_total) / secs
+
+
+class ProcessTable:
+    """Which processes run in which container, and how busy each one is.
+
+    A process is placed once, when it first shows up, from its /proc/<pid>/cgroup
+    line. After that only container processes are re-read each interval. Host
+    processes are re-checked every 30 intervals, because a process started by
+    `lxc exec` begins on the host side and then moves into the container.
+    """
+
+    def __init__(self):
+        self.owner = {}           # pid -> container name, or None for host processes
+        self.ticks = {}           # pid -> CPU time at the last reading, in clock ticks
+        self.busy = {}            # pid -> CPU %, smoothed
+        self.top = {}             # container -> (busiest process name, its CPU %)
+        self.started = {}         # container -> start of its oldest process, ticks after boot
+        self.last = None
+        self.rounds = 0
+
+    def sample(self, now):
+        secs = now - self.last if self.last else 0.0
+        self.last, self.rounds = now, self.rounds + 1
+        if self.rounds % 30 == 0:
+            self.owner = {pid: cg for pid, cg in self.owner.items() if cg is not None}
+        alive = {int(name) for name in os.listdir("/proc") if name.isdigit()}
+        for pid in list(self.owner):
+            if pid not in alive:
+                del self.owner[pid]
+                self.ticks.pop(pid, None)
+                self.busy.pop(pid, None)
+        top, started = {}, {}
+        for pid in alive:
+            if pid not in self.owner:
+                self.owner[pid] = container_of(pid)
+            cg = self.owner[pid]
+            if cg is None:
+                continue
+            stat = read(f"/proc/{pid}/stat")
+            if not stat:
+                continue
+            # The name sits in parentheses and can contain spaces, so split after the last ")".
+            name = stat[stat.find("(") + 1:stat.rfind(")")]
+            fields = stat[stat.rfind(")") + 2:].split()
+            ticks, start = int(fields[11]) + int(fields[12]), int(fields[19])   # utime+stime, starttime
+            before = self.ticks.get(pid)
+            self.ticks[pid] = ticks
+            if before is not None and secs > 0:
+                pct = max(0, ticks - before) / CLOCK_TICKS / secs * 100
+                self.busy[pid] = (self.busy.get(pid, pct) + pct) / 2
+            busy = self.busy.get(pid, 0.0)
+            if cg not in top or busy > top[cg][1]:
+                top[cg] = (name, busy)
+            started[cg] = min(start, started.get(cg, start))
+        self.top, self.started = top, started
+
+
+# --- LXD's API and event stream -------------------------------------------------
+
+class UnixHTTPConnection(http.client.HTTPConnection):
+    """Plain HTTP, but over LXD's local unix socket instead of a TCP port."""
+
+    def __init__(self, path, timeout=5):
+        super().__init__("lxd", timeout=timeout)
+        self.socket_path = path
+
+    def connect(self):
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.sock.settimeout(self.timeout)
+        self.sock.connect(self.socket_path)
+
+
+class LxdApi:
+    """Asks LXD for its instances (and, once a minute, versions and pool usage).
+
+    Runs in the background, GET requests only. The screen never waits on LXD:
+    it draws from the most recent answer, so a slow or restarting daemon can't
+    freeze the display.
+    """
+
+    def __init__(self, socket_path):
+        self.socket_path = socket_path
+        self.lock = threading.Lock()
+        self.instances = {}           # cgroup name -> {name, status, veths, ipv4}
+        self.server = {}              # LXD version, OS, kernel
+        self.pools = []               # (pool name, bytes used, bytes total)
+        self.status = "starting"
+        self.rounds = 0
+        self.wake = threading.Event()  # set this to refresh early (a new container appeared)
+
+    def get(self, path):
+        conn = UnixHTTPConnection(self.socket_path)
+        try:
+            conn.request("GET", path)
+            reply = conn.getresponse()
+            body = json.loads(reply.read())
+        finally:
+            conn.close()
+        if reply.status != 200:
+            raise ValueError(body.get("error") or f"HTTP {reply.status}")
+        return body.get("metadata")
+
+    def fetch_instances(self):
+        found = {}
+        for inst in self.get("/1.0/instances?recursion=2&all-projects=true") or []:
+            project = inst.get("project") or "default"
+            # Containers outside the default project get "<project>_" in their cgroup name.
+            cg = inst["name"] if project == "default" else f"{project}_{inst['name']}"
+            veths, ipv4 = [], ""
+            for ifname, nic in ((inst.get("state") or {}).get("network") or {}).items():
+                if ifname == "lo":
+                    continue
+                if nic.get("host_name"):
+                    veths.append(nic["host_name"])
+                for addr in nic.get("addresses") or []:
+                    if not ipv4 and addr.get("family") == "inet" and addr.get("scope") == "global":
+                        ipv4 = addr.get("address", "")
+            found[cg] = dict(name=inst["name"], status=inst.get("status", "?"), veths=veths, ipv4=ipv4,
+                             type=inst.get("type", "container"), pid=(inst.get("state") or {}).get("pid"))
+        return found
+
+    def fetch_server(self):
+        env = (self.get("/1.0") or {}).get("environment") or {}
+        server = dict(version=env.get("server_version", ""), kernel=env.get("kernel_version", ""),
+                      os=f"{env.get('os_name', '')} {env.get('os_version', '')}".strip())
+        pools = []
+        for pool in self.get("/1.0/storage-pools?recursion=1") or []:
+            path = f"/1.0/storage-pools/{urllib.parse.quote(pool['name'])}/resources"
+            space = (self.get(path) or {}).get("space") or {}
+            if space.get("total"):
+                pools.append((pool["name"], space.get("used", 0), space["total"]))
+        return server, pools
+
+    def fetch(self):
+        try:
+            instances = self.fetch_instances()
+            server, pools = self.fetch_server() if self.rounds % 4 == 0 else (self.server, self.pools)
+            status = "ok"
+        except PermissionError:
+            instances, status = None, "no access"        # not in the lxd group
+        except (OSError, ValueError, KeyError, http.client.HTTPException) as err:
+            instances, status = None, f"error ({type(err).__name__})"
+        with self.lock:
+            if instances is not None:
+                self.instances, self.server, self.pools = instances, server, pools
+                self.rounds += 1
+            self.status = status
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            self.wake.wait(API_EVERY)
+            self.wake.clear()
+            self.fetch()
+
+    def snapshot(self):
+        with self.lock:
+            return dict(self.instances), self.status, dict(self.server), list(self.pools)
+
+
+class LxdEvents:
+    """Listens to LXD's live event stream for the activity feed.
+
+    LXD announces each lifecycle change on a websocket: containers starting and
+    stopping, snapshots, exec sessions, file transfers. A websocket is an HTTP
+    request that turns into a long-lived two-way channel carrying small framed
+    messages. LXD also sends a "ping" now and then and expects a "pong" back,
+    much like a keepalive on a routing adjacency.
+    """
+
+    def __init__(self, socket_path, show_commands=False):
+        self.socket_path = socket_path
+        self.show_commands = show_commands
+        self.lock = threading.Lock()
+        self.feed = collections.deque(maxlen=50)     # newest first
+        self.status = "connecting"
+
+    def start(self):
+        threading.Thread(target=self._loop, daemon=True).start()
+
+    def _loop(self):
+        while True:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            try:
+                self._listen(sock)
+            except PermissionError:
+                self.status = "no access"
+            except (OSError, ValueError, ConnectionError):
+                self.status = "reconnecting"
+            finally:
+                sock.close()
+            time.sleep(5)
+
+    def _listen(self, sock):
+        sock.connect(self.socket_path)
+        key = base64.b64encode(os.urandom(16)).decode()
+        sock.sendall(("GET /1.0/events?type=lifecycle HTTP/1.1\r\nHost: lxd\r\n"
+                      "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                      f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+        stream = sock.makefile("rb")
+        if b" 101 " not in stream.readline():
+            raise ConnectionError("LXD refused the event stream")
+        while stream.readline() not in (b"\r\n", b""):
+            pass                                     # skip the rest of the reply headers
+        self.status = "live"
+        message = b""
+        while True:
+            head = stream.read(2)
+            if len(head) < 2:
+                raise ConnectionError("event stream closed")
+            final, opcode, size = head[0] & 0x80, head[0] & 0x0F, head[1] & 0x7F
+            if size == 126:
+                size = int.from_bytes(stream.read(2), "big")
+            elif size == 127:
+                size = int.from_bytes(stream.read(8), "big")
+            mask = stream.read(4) if head[1] & 0x80 else b""
+            payload = stream.read(size)
+            if mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 8:                          # LXD is closing the connection
+                raise ConnectionError("event stream closed")
+            if opcode == 9:                          # ping: answer with a pong (ours must be masked)
+                pong_mask = os.urandom(4)
+                sock.sendall(bytes([0x8A, 0x80 | len(payload)]) + pong_mask
+                             + bytes(b ^ pong_mask[i % 4] for i, b in enumerate(payload)))
+            elif opcode in (0, 1, 2):                # a message, possibly in several pieces
+                message += payload
+                if final:
+                    self._record(json.loads(message))
+                    message = b""
+
+    def _record(self, event):
+        meta = event.get("metadata") or {}
+        parts = urllib.parse.unquote(meta.get("source", "")).split("/")   # /1.0/instances/<name>/...
+        name = meta.get("name") or (parts[3] if len(parts) > 3 else "")
+        detail = ""
+        if len(parts) > 5 and parts[4] == "snapshots":
+            name, detail = parts[3], parts[5]
+        context = meta.get("context") or {}
+        command = context.get("command")
+        # Exec events carry the full command line, which can include a password,
+        # so commands stay off the screen unless --show-commands was given.
+        if not detail:
+            if isinstance(command, list) and self.show_commands:
+                detail = " ".join(command)
+            else:
+                detail = str(context.get("path") or "")
+        user = (meta.get("requestor") or {}).get("username", "")
+        action, now = meta.get("action", ""), time.time()
+        key = (action, name, detail, user)
+        with self.lock:
+            # Something that repeats (a monitoring script running `lxc exec` every
+            # few seconds, say) becomes one line with a count instead of a screenful:
+            # the earlier line moves back to the top with its count and time updated.
+            for i, entry in enumerate(self.feed):
+                if entry["key"] == key and now - entry["t"] < REPEAT_WINDOW:
+                    del self.feed[i]
+                    entry["t"], entry["count"] = now, entry["count"] + 1
+                    self.feed.appendleft(entry)
+                    return
+            self.feed.appendleft(dict(key=key, t=now, action=action, name=name, detail=detail,
+                                      user=user, count=1))
+
+    def snapshot(self):
+        with self.lock:
+            return list(self.feed), self.status
+
+
+# --- Sampling ----------------------------------------------------------------
+
+class Monitor:
+    """Reads every counter once per interval and keeps the history for the graphs."""
+
+    def __init__(self, api, events):
+        self.api, self.events = api, events
+        self.ncpu = os.cpu_count() or 1
+        self.procs = ProcessTable()
+        self.past = {}                 # recent readings per container, to work out rates
+        self.cpu_history = {}          # container -> recent CPU % (for its history column)
+        self.stack = collections.deque(maxlen=HISTORY)      # per sample: {container: CPU %}
+        self.net_in = collections.deque(maxlen=HISTORY)     # host ports, bytes/s
+        self.net_out = collections.deque(maxlen=HISTORY)
+        self.rows, self.host, self.nic_rates = [], {}, {}
+        self.server, self.pools, self.api_status = {}, [], "off"
+        self.zfs, self.zfs_checked = {}, 0.0
+        self.nics, self.nics_checked, self.prev_nics = [], 0.0, {}
+        self.prev_cpu = None
+        self.asked = set()             # new containers we've already asked LXD about
+        self.series_style = {}         # container -> graph color, kept steady between frames
+        self.temp_file = find_cpu_temp_sensor()
+        self.freq_files = glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")
+
+    def sample(self):
+        now = time.monotonic()
+        instances = {}
+        if self.api:
+            instances, self.api_status, self.server, self.pools = self.api.snapshot()
+        if now - self.zfs_checked > 30:
+            self.zfs, self.zfs_checked = find_zfs_datasets(), now
+        uptime = float((read("/proc/uptime") or "0").split()[0])
+        self.procs.sample(now)
+        self.sample_host(uptime)
+        self.sample_network(now)
+        self.sample_instances(now, instances, uptime)
+
+    def sample_host(self, uptime):
+        whole, threads = read_cpu_times()
+        cpu, per_thread = None, []
+        if self.prev_cpu:
+            cpu = busy_pct(whole, self.prev_cpu[0])
+            per_thread = [busy_pct(a, b) for a, b in zip(threads, self.prev_cpu[1])]
+        self.prev_cpu = (whole, threads)
+        mem = read_meminfo()
+        # ZFS's cache (the ARC) shows up as "used" memory; split it out.
+        arc = int((read_kstat(ZFS_ARCSTATS, ("size",)) or {}).get("size", 0))
+        temp = read_int(self.temp_file)
+        speeds = [s for s in (read_int(f) for f in self.freq_files) if s]
+        try:
+            root = os.statvfs("/")
+            root_total, root_used = root.f_blocks * root.f_frsize, (root.f_blocks - root.f_bfree) * root.f_frsize
+        except OSError:
+            root_total = root_used = 0
+        self.host = dict(
+            cpu=cpu, threads=per_thread,
+            temp=temp / 1000 if temp else None,                         # millidegrees
+            mhz=sum(speeds) / len(speeds) / 1000 if speeds else None,   # kHz
+            mem_total=mem["MemTotal"], mem_free=mem["MemAvailable"], arc=arc,
+            mem_used=max(0, mem["MemTotal"] - mem["MemAvailable"] - arc),
+            swap_total=mem["SwapTotal"], swap_used=mem["SwapTotal"] - mem["SwapFree"],
+            root_total=root_total, root_used=root_used,
+            load=(read("/proc/loadavg") or "0 0 0").split()[:3], uptime=uptime)
+
+    def sample_network(self, now):
+        if now - self.nics_checked > 60:
+            self.nics, self.nics_checked = physical_nics(), now
+        rates = {}
+        for nic in self.nics:
+            rx = read_int(f"/sys/class/net/{nic}/statistics/rx_bytes")
+            tx = read_int(f"/sys/class/net/{nic}/statistics/tx_bytes")
+            if rx is None or tx is None:
+                continue
+            before = self.prev_nics.get(nic)
+            self.prev_nics[nic] = (now, rx, tx)
+            if before:
+                secs = now - before[0]
+                rates[nic] = (rate(rx, before[1], secs), rate(tx, before[2], secs))
+        if rates:
+            self.net_in.append(sum(r[0] for r in rates.values()))
+            self.net_out.append(sum(r[1] for r in rates.values()))
+        self.nic_rates = rates
+
+    def sample_instances(self, now, instances, uptime):
+        rows, readings = [], {}
+        for path in sorted(glob.glob(CGROUP_GLOB)):
+            cg = os.path.basename(path)[len(CGROUP_PREFIX):]
+            cpu_usec = read_fields(path + "/cpu.stat", ("usage_usec",)).get("usage_usec")
+            if cpu_usec is None:
+                continue                          # it stopped between listing and reading
+            inst = instances.get(cg, {})
+            if self.api and cg not in instances and cg not in self.asked:
+                self.asked.add(cg)                # a container LXD hasn't told us about yet:
+                self.api.wake.set()               # ask once now rather than wait 15 seconds
+            # memory.current includes file cache the kernel can drop at any time.
+            # Like `docker stats`, subtract the inactive part of that cache to show
+            # what the container is actually holding on to.
+            current = read_int(path + "/memory.current") or 0
+            inactive = read_fields(path + "/memory.stat", ("inactive_file",)).get("inactive_file", 0)
+            started = self.procs.started.get(cg)
+            row = new_row(cg, inst, mem=max(0, current - inactive), tasks=read_int(path + "/pids.current"),
+                          top=self.procs.top.get(cg),
+                          up=uptime - started / CLOCK_TICKS if started is not None else None)
+            disk, disk_src = self.read_disk(cg, path)
+            self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings)
+            rows.append(row)
+
+        # VMs have no container cgroup: LXD runs each one as a QEMU process on the
+        # host, so read that process instead (CPU time, resident memory, start time).
+        for cg, inst in instances.items():
+            if inst.get("type") != "virtual-machine" or inst["status"] != "Running" or cg in readings:
+                continue
+            process = read_vm_process(inst.get("pid"))
+            if not process:
+                continue
+            cpu_usec, rss, start = process
+            row = new_row(cg, inst, vm=True, mem=rss, up=uptime - start / CLOCK_TICKS)
+            disk, disk_src = self.read_disk(cg)
+            self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings)
+            rows.append(row)
+
+        # Anything else LXD knows about is stopped (or a VM whose process couldn't be read).
+        for cg, inst in instances.items():
+            if cg not in readings:
+                rows.append(new_row(cg, inst, live=False, vm=inst.get("type") == "virtual-machine"))
+        for cg in list(self.cpu_history):
+            if cg not in readings:
+                del self.cpu_history[cg]
+        self.past, self.rows = readings, rows
+
+        if self.host.get("cpu") is not None:
+            sample = {r["cg"]: r["cpu"] for r in rows if r["cpu"]}
+            outside = self.host["cpu"] * self.ncpu - sum(sample.values())   # host % -> % of one core
+            sample[HOST] = max(0.0, outside)
+            self.stack.append(sample)
+
+    def read_disk(self, cg, cgroup_path=None):
+        """Bytes read and written so far: from ZFS if the instance's disk is there, else the cgroup."""
+        kstat = self.zfs.get(cg)
+        if kstat:
+            stats = read_kstat(kstat, ("nread", "nwritten"))
+            if stats and "nread" in stats:
+                return (int(stats["nread"]), int(stats["nwritten"])), "zfs"
+            self.zfs_checked = 0                  # dataset was remounted: look it up again
+        if cgroup_path:
+            return read_io_stat(cgroup_path + "/io.stat"), "io"
+        return None, None
+
+    def measure(self, row, now, cpu_usec, disk, disk_src, net, readings):
+        """Work out rates against this instance's recent readings, then keep this one."""
+        cg = row["cg"]
+        past = self.past.get(cg) or collections.deque(maxlen=RATE_WINDOW)
+        if past:
+            last, oldest = past[-1], past[0]
+            # CPU time is counted in microseconds; one core flat out = 1,000,000 per second = 100%.
+            row["cpu"] = rate(cpu_usec, last["cpu"], now - last["t"]) / 10_000
+            # Disk and network come in bursts, so average them over the last few
+            # readings rather than show whatever happened in the last interval.
+            secs = now - oldest["t"]
+            if disk and oldest["disk"] and oldest["disk_src"] == disk_src:
+                row["rd"] = rate(disk[0], oldest["disk"][0], secs)
+                row["wr"] = rate(disk[1], oldest["disk"][1], secs)
+            if net and oldest["net"]:
+                row["net_in"] = rate(net[0], oldest["net"][0], secs)
+                row["net_out"] = rate(net[1], oldest["net"][1], secs)
+        past.append(dict(t=now, cpu=cpu_usec, disk=disk, disk_src=disk_src, net=net))
+        readings[cg] = past
+        self.cpu_history.setdefault(cg, collections.deque(maxlen=HISTORY)).append(row["cpu"])
+
+    def pick_series(self, samples):
+        """The busiest containers over the graph window, each with a steady color."""
+        totals = collections.Counter()
+        for sample in samples:
+            for cg, value in sample.items():
+                if cg != HOST:
+                    totals[cg] += value
+        top = {cg for cg, value in totals.most_common(len(SERIES)) if value > 0}
+        for cg in list(self.series_style):
+            if cg not in top:
+                del self.series_style[cg]
+        free = [style for style in SERIES if style not in self.series_style.values()]
+        for cg in sorted(top, key=lambda c: -totals[c]):
+            if cg not in self.series_style:
+                self.series_style[cg] = free.pop(0)
+        return sorted(self.series_style, key=lambda c: -totals[c])
+
+
+# --- Drawing primitives -------------------------------------------------------
+
+class Canvas:
+    """Somewhere to draw: styled text at (row, column), clipped at the edges."""
+
+    def __init__(self, height, width):
+        self.h, self.w = height, width
+
+    def put(self, y, x, text, style="text", right=None):
+        """Write text at (y, x), stopping at column `right`. Returns the column after it."""
+        end = x + len(text)
+        right = self.w if right is None else min(right, self.w)
+        if 0 <= y < self.h and text and x < right:
+            if x < 0:
+                text, x = text[-x:], 0
+            self._write(y, x, text[:right - x], style)
+        return end
+
+
+class CursesCanvas(Canvas):
+    def __init__(self, screen, attrs):
+        super().__init__(*screen.getmaxyx())
+        self.screen, self.attrs = screen, attrs
+
+    def _write(self, y, x, text, style):
+        attr = self.attrs.get(style, 0)
+        try:
+            if y == self.h - 1 and x + len(text) >= self.w:
+                # curses refuses to move the cursor past the bottom-right cell,
+                # so write everything before it, then insert that last character.
+                self.screen.addstr(y, x, text[:-1], attr)
+                self.screen.insstr(y, self.w - 1, text[-1], attr)
+            else:
+                self.screen.addstr(y, x, text, attr)
+        except curses.error:
+            pass
+
+
+class TextCanvas(Canvas):
+    """An off-screen canvas, for --dump."""
+
+    def __init__(self, height, width):
+        super().__init__(height, width)
+        self.cells = [[(" ", None)] * width for _ in range(height)]
+
+    def _write(self, y, x, text, style):
+        for i, ch in enumerate(text):
+            self.cells[y][x + i] = (ch, style)
+
+    def text(self, color=False):
+        lines = []
+        for row in self.cells:
+            if not color:
+                lines.append("".join(ch for ch, _ in row).rstrip())
+                continue
+            out, current = [], None
+            for ch, style in row:
+                if style != current:
+                    color_name, bold = STYLES.get(style, ("white", False))
+                    out.append(f"\x1b[0;{'1;' if bold else ''}{30 + COLORS.index(color_name)}m")
+                    current = style
+                out.append(ch)
+            lines.append("".join(out) + "\x1b[0m")
+        return "\n".join(lines)
+
+
+def put_cells(cv, y, x, cells, right=None):
+    """Write a list of (character, style) pairs, joining runs of the same style."""
+    run, run_style, run_x = [], None, x
+    for i, (ch, style) in enumerate(cells):
+        if run and style != run_style:
+            cv.put(y, run_x, "".join(run), run_style, right)
+            run, run_x = [], x + i
+        run_style = style
+        run.append(ch)
+    if run:
+        cv.put(y, run_x, "".join(run), run_style, right)
+
+
+def put_parts(cv, y, x, parts, right=None):
+    """Write a list of (text, style) pieces one after another. Returns the column after them."""
+    for text, style in parts:
+        x = cv.put(y, x, text, style, right)
+    return x
+
+
+def box(cv, y, x, h, w, style, title=(), right=(), footer=(), footer_right=()):
+    """A panel with rounded corners, labels set into its top and bottom edges.
+
+    Labels sit in little tabs the way btop draws them:  ╭─┐cpu┌────┐43°C┌─╮
+    Each label is a list of (text, style) pieces.
+    """
+    line = G["h"] * (w - 2)
+    cv.put(y, x, G["tl"] + line + G["tr"], style)
+    for row in range(y + 1, y + h - 1):
+        cv.put(row, x, G["v"], style)
+        cv.put(row, x + w - 1, G["v"], style)
+    cv.put(y + h - 1, x, G["bl"] + line + G["br"], style)
+    for row, left_items, right_items, (open_tab, close_tab) in (
+            (y, title, right, (G["tab_l"], G["tab_r"])),
+            (y + h - 1, footer, footer_right, (G["foot_l"], G["foot_r"]))):
+        pos = x + 2
+        for item in left_items:
+            pos = cv.put(row, pos, open_tab, style, x + w - 2)
+            pos = put_parts(cv, row, pos, item, x + w - 2)
+            pos = cv.put(row, pos, close_tab, style, x + w - 2) + 1
+        end = x + w - 3                      # last column a right-hand label may use
+        for item in reversed(right_items):
+            start = end - sum(len(text) for text, _ in item) - 1
+            if start <= pos:
+                break                        # no room left beside the left-hand labels
+            cv.put(row, start, open_tab, style)
+            cv.put(row, put_parts(cv, row, start + 1, item), close_tab, style)
+            end = start - 2
+
+
+def human(n):
+    """Bytes as a short string: 512B, 4.2K, 37M, 2.0G."""
+    if n is None:
+        return ""
+    value, unit = float(n), "B"
+    for bigger in "KMGT":
+        if value < 1000:
+            break
+        value, unit = value / 1024, bigger
+    if unit == "B":
+        return f"{value:.0f}B"
+    return f"{value:.1f}{unit}" if value < 10 else f"{value:.0f}{unit}"
+
+
+def fmt_pct(value):
+    if value is None:
+        return ""
+    return f"{value:.1f}%" if value < 99.95 else f"{value:.0f}%"
+
+
+def fmt_span(secs):
+    return f"{secs:.0f}s" if secs < 120 else f"{secs / 60:.0f} min"
+
+
+def fmt_uptime(secs):
+    days, rest = divmod(int(secs), 86400)
+    hours, rest = divmod(rest, 3600)
+    return f"{days}d {hours}h" if days else f"{hours}h {rest // 60}m" if hours else f"{rest // 60}m"
+
+
+def fmt_age(secs):
+    """A short age for the UP column: 45s, 12m, 3h, 15d."""
+    for unit, size in (("d", 86400), ("h", 3600), ("m", 60)):
+        if secs >= size:
+            return f"{int(secs // size)}{unit}"
+    return f"{int(max(0, secs))}s"
+
+
+def cpu_style(pct):
+    if pct is None:
+        return "dim"
+    return "text" if pct < 1 else "lo" if pct < 50 else "mid" if pct < 90 else "hi"
+
+
+def heat(position):
+    """Color by place along a bar or up a graph: green, then yellow, then red."""
+    return "lo" if position < 0.5 else "mid" if position < 0.8 else "hi"
+
+
+def meter_cells(width, value, scale, color_at):
+    lit = min(width, int(value / scale * width + 0.5)) if value and scale else 0
+    return [(G["cell"], color_at(i / width)) if i < lit else (G["cell_off"], "faint")
+            for i in range(width)]
+
+
+def column_glyph(fill):
+    """How much of one character cell a bar covers: full, medium or light shade, or nothing."""
+    if fill >= 0.75:
+        return G["full"]
+    if fill >= 0.5:
+        return G["mid"]
+    if fill >= 0.25:
+        return G["low"]
+    return None
+
+
+def spark(value):
+    """One history cell: the shading shows roughly how busy the container was."""
+    if value is None:
+        return (" ", "text")
+    if value < 0.5:
+        return (G["idle"], "faint")
+    if value < 2:
+        return (G["low"], "lo")
+    if value < 10:
+        return (G["mid"], "lo")
+    return (G["full"], "lo" if value < 50 else "mid" if value < 90 else "hi")
+
+
+def rate_cell(value, width):
+    """A disk rate: data, so bytes per second."""
+    if value is None:
+        return "", "dim"
+    if value < 1:
+        return "-".rjust(width), "dim"
+    return human(value).rjust(width), "text" if value < 10 * MB else "mid" if value < 100 * MB else "hi"
+
+
+def mbps(bytes_per_sec):
+    """A network rate in megabits per second. Bandwidth is counted in bits, data in
+    bytes, and network gear uses decimal units: 1 Mb/s = 1,000,000 bits a second."""
+    return bytes_per_sec * 8 / 1_000_000
+
+
+def fmt_mbps(value):
+    """Mb/s with the precision that matters: 0, <0.01, 0.42, 10.9, 940, 1240."""
+    if value < 0.01:
+        return "<0.01" if value > 0 else "0"
+    if value < 10:
+        return f"{value:.2f}"
+    return f"{value:.1f}" if value < 100 else f"{value:.0f}"
+
+
+def mbps_cell(bytes_per_sec, width):
+    """A network rate for the table, in Mb/s."""
+    if bytes_per_sec is None:
+        return "", "dim"
+    value = mbps(bytes_per_sec)
+    if value == 0:
+        return "-".rjust(width), "dim"
+    style = "dim" if value < 0.01 else "text" if value < 100 else "mid" if value < 800 else "hi"
+    return fmt_mbps(value).rjust(width), style
+
+
+# --- Panels -------------------------------------------------------------------
+
+def draw_status(cv, y, mon):
+    """Top line: host and versions on the left, the clock centred, counts on the right."""
+    x = cv.put(y, 1, socket.gethostname(), "title")
+    server = mon.server
+    if server.get("version"):
+        x = cv.put(y, x + 2, "LXD " + server["version"], "text")
+    if cv.w >= 130:
+        for part in (server.get("os"), server.get("kernel") and "kernel " + server["kernel"]):
+            if part:
+                x = put_parts(cv, y, x, [(f"  {G['idle']}  ", "dim"), (part, "dim")])
+    running = sum(1 for r in mon.rows if r["live"])
+    right = [(f"{running} running", "lo")]
+    if len(mon.rows) > running:
+        right.append((f" {G['idle']} {len(mon.rows) - running} stopped", "dim"))
+    right.append((f"   up {fmt_uptime(mon.host.get('uptime', 0))}", "text"))
+    right_x = cv.w - 1 - sum(len(t) for t, _ in right)
+    put_parts(cv, y, right_x, right)
+    # The clock goes in the middle if it fits between the two sides, else a shorter one, else none.
+    for clock in (time.strftime("%a %b %-d  %H:%M:%S %Z"), time.strftime("%H:%M %Z")):
+        start = max(x + 2, (cv.w - len(clock)) // 2)
+        if start + len(clock) + 2 <= right_x:
+            cv.put(y, start, clock, "bright")
+            break
+
+
+def draw_cpu_panel(cv, y, x, h, w, mon):
+    host = mon.host
+    right = []
+    if host.get("temp") is not None:
+        temp = host["temp"]
+        right.append([(f"{temp:.0f}{G['deg']}C", "lo" if temp < 70 else "mid" if temp < 85 else "hi")])
+    if host.get("mhz"):
+        right.append([(f"{host['mhz'] / 1000:.1f} GHz", "text")])
+    box(cv, y, x, h, w, "b_cpu", title=[[("cpu", "title")]], right=right)
+    ix, iw, rows = x + 2, w - 4, h - 2
+    pct = host.get("cpu")
+    meter_w = iw - 6 - 5
+    cv.put(y + 1, ix, "total", "text")
+    put_cells(cv, y + 1, ix + 6, meter_cells(meter_w, pct, 100, heat))
+    cv.put(y + 1, ix + 6 + meter_w, f"{pct:4.0f}%" if pct is not None else "", cpu_style(pct))
+
+    # One small bar per CPU thread, like a graphic equaliser: colors climb from
+    # green to red with height, and partly filled cells use the shade glyphs.
+    threads, bar_rows = host.get("threads") or [], rows - 2
+    step = 2 if len(threads) * 2 <= iw else 1
+    for i, value in enumerate(threads[:iw // step]):
+        height = value / 100 * bar_rows
+        for level in range(bar_rows):            # level 0 is the bottom row
+            glyph = column_glyph(height - level)
+            if glyph:
+                style = heat((level + 1) / bar_rows)
+            elif level == 0:
+                glyph, style = G["idle"], "faint"
+            else:
+                continue
+            cv.put(y + 1 + bar_rows - level, ix + i * step, glyph, style)
+    load = put_parts(cv, y + rows, ix, [("load ", "text"), (" ".join(host.get("load", [])), "bright")])
+    label = f"{len(threads)} threads" if threads else ""
+    cv.put(y + rows, max(load + 2, ix + iw - len(label)), label, "dim")
+
+
+def draw_mem_panel(cv, y, x, h, w, mon):
+    host = mon.host
+    total = host.get("mem_total") or 1
+    box(cv, y, x, h, w, "b_mem", title=[[("memory", "title")]],
+        right=[[(human(host.get("mem_total")), "text"), (" total", "dim")]])
+    ix, iw = x + 2, w - 4
+    meters = [("used", host["mem_used"], total, "mem"), ("zfs", host["arc"], total, "arc"),
+              ("free", host["mem_free"], total, "free")]
+    if host.get("swap_total"):
+        meters.append(("swap", host["swap_used"], host["swap_total"], "swap"))
+    meter_w = iw - 17                            # label 6, value 6, percent 5
+    for i, (label, value, scale, style) in enumerate(meters[:h - 3]):
+        row = y + 1 + i
+        cv.put(row, ix, label, "text")
+        put_cells(cv, row, ix + 6, meter_cells(meter_w, value, scale, lambda _, s=style: s))
+        cv.put(row, ix + 6 + meter_w, human(value).rjust(6), style)
+        cv.put(row, ix + 12 + meter_w, f"{value / scale * 100:4.0f}%", "text")
+    # Bottom row: storage pools from LXD, then the root filesystem.
+    disks = list(mon.pools) + ([("root", host["root_used"], host["root_total"])] if host.get("root_total") else [])
+    pos = ix
+    for name, used, size in disks:
+        share = used / size * 100 if size else 0
+        pos = put_parts(cv, y + h - 2, pos, [
+            (name + " ", "text"), (human(used), "bright"), ("/" + human(size), "dim"),
+            (f" {share:.0f}%", "mid" if share >= 80 else "dim"), ("   ", "dim")], ix + iw)
+
+
+def draw_net_panel(cv, y, x, h, w, mon):
+    """Host ports, drawn the way btop does it: traffic in grows up, traffic out grows down."""
+    ins, outs = list(mon.net_in), list(mon.net_out)
+    label_w = 11
+    gw = w - 4 - label_w
+    window_in, window_out = ins[-gw:], outs[-gw:]
+    peak = max(window_in + window_out, default=0)
+    box(cv, y, x, h, w, "b_net", title=[[("network", "title")]],
+        right=[[("peak ", "dim"), (fmt_mbps(mbps(peak)) + " Mb/s", "text")]])
+    ix, rows = x + 2, h - 2
+    half = (rows - 1) // 2                       # graph rows each way; the last row lists the ports
+    scale = max(peak, 1024.0)
+    recent_in = sum(ins[-3:]) / len(ins[-3:]) if ins else None
+    recent_out = sum(outs[-3:]) / len(outs[-3:]) if outs else None
+    cv.put(y + 1, ix, f"{G['down']} in", "net_in")
+    cv.put(y + 2, ix, (fmt_mbps(mbps(recent_in)) + " Mb/s") if recent_in is not None else "", "bright")
+    cv.put(y + 1 + half, ix, f"{G['up']} out", "net_out")
+    cv.put(y + 2 + half, ix, (fmt_mbps(mbps(recent_out)) + " Mb/s") if recent_out is not None else "", "bright")
+    gx = ix + label_w + (gw - len(window_in))
+    for col, (v_in, v_out) in enumerate(zip(window_in, window_out)):
+        for level in range(half):                # level 0 sits on the middle line
+            for value, row, style in ((v_in, y + half - level, "net_in"),
+                                      (v_out, y + 1 + half + level, "net_out")):
+                glyph = column_glyph(value / scale * half - level)
+                if glyph:
+                    cv.put(row, gx + col, glyph, style)
+                elif level == 0:
+                    cv.put(row, gx + col, G["idle"], "faint")
+    # One entry per port in Mb/s, busiest first, so a busy trunk never falls off the end.
+    pos = cv.put(y + rows, ix, "Mb/s  ", "dim", ix + w - 4)
+    for nic, (r_in, r_out) in sorted(mon.nic_rates.items(), key=lambda item: (-sum(item[1]), item[0])):
+        pos = put_parts(cv, y + rows, pos, [
+            (nic + " ", "dim"), (G["down"], "net_in"), (fmt_mbps(mbps(r_in)) + " ", "text"),
+            (G["up"], "net_out"), (fmt_mbps(mbps(r_out)) + "  ", "text")], ix + w - 4)
+
+
+def draw_graph(cv, y0, x0, width, height, mon):
+    """Stacked CPU history: each column is one sample, each color one container."""
+    label_w = 6
+    samples = list(mon.stack)[-(width - label_w):]
+    series = mon.pick_series(samples)
+    peak = max((sum(s.values()) for s in samples), default=0.0)
+    scale = min(next((s for s in GRAPH_SCALES if s >= peak * 1.05), GRAPH_SCALES[-1]), mon.ncpu * 100)
+    for row, value in ((0, scale), (height // 2, scale / 2), (height - 1, 0)):
+        cv.put(y0 + row, x0, f"{value:g}%".rjust(label_w - 1), "dim")
+
+    styles = [mon.series_style[cg] for cg in series] + ["other", "host"]
+    grid = [[(" ", "text")] * len(samples) for _ in range(height)]
+    for col, sample in enumerate(samples):
+        values = [sample.get(cg, 0.0) for cg in series]
+        values.append(sum(v for cg, v in sample.items() if cg != HOST and cg not in series))
+        values.append(sample.get(HOST, 0.0))
+        tops, total = [], 0.0               # where each layer ends, in rows
+        for value in values:
+            total += value / scale * height
+            tops.append(total)
+        for row in range(height):           # row 0 is the bottom
+            glyph = column_glyph(total - row)
+            if not glyph:
+                break
+            # A full cell takes the color of the layer at its middle; a partly
+            # filled top cell takes the color of the topmost layer.
+            probe = row + 0.5 if glyph == G["full"] else total - 1e-9
+            style = next(st for top, st in zip(tops, styles) if top > probe)
+            grid[height - 1 - row][col] = (glyph, style)
+    start = x0 + label_w + (width - label_w - len(samples))
+    for row in range(height):
+        put_cells(cv, y0 + row, start, grid[row], right=x0 + width)
+    return series
+
+
+def instance_noun(mon):
+    """ "containers", or "instances" once there are VMs on the host too."""
+    return "instances" if any(r["vm"] for r in mon.rows) else "containers"
+
+
+def draw_graph_panel(cv, y, x, h, w, mon, ui):
+    span = fmt_span((w - 4 - 6) * ui.interval)
+    noun = instance_noun(mon)
+    box(cv, y, x, h, w, "b_graph", title=[[(f"cpu by {noun[:-1]}", "title")], [(f"last {span}", "dim")]],
+        right=[[("100% = one core", "dim")]])
+    series = draw_graph(cv, y + 1, x + 2, w - 4, h - 3, mon)
+    pos, right = x + 2, x + w - 2
+    for cg in series:
+        pos = put_parts(cv, y + h - 2, pos, [(G["cell"] + " ", mon.series_style[cg]), (cg + "  ", "text")], right)
+    put_parts(cv, y + h - 2, pos, [(G["cell"] + " ", "other"), (f"other {noun}  ", "text"),
+                                   (G["cell"] + " ", "host"), ("host itself", "text")], right)
+
+
+def draw_events_panel(cv, y, x, h, w, mon):
+    feed, status = mon.events.snapshot() if mon.events else ([], "off")
+    box(cv, y, x, h, w, "b_events", title=[[("lxd events", "title")]],
+        right=[[(status, "lo" if status == "live" else "mid")]])
+    ix, right = x + 2, x + w - 2
+    if not feed:
+        cv.put(y + 1, ix, "waiting for LXD activity " + G["more"], "dim", right)
+        cv.put(y + 2, ix, "starts, stops, snapshots, exec and file", "dim", right)
+        cv.put(y + 3, ix, "transfers show up here as they happen", "dim", right)
+        return
+    now = time.time()
+    for i, event in enumerate(feed[:h - 2]):
+        label, style = EVENT_LABELS.get(event["action"], (event["action"].replace("instance-", ""), "text"))
+        age = now - event["t"]
+        clock_style = "bright" if age < 300 else "text" if age < 3600 else "dim"
+        pos = put_parts(cv, y + 1 + i, ix, [
+            (time.strftime("%H:%M:%S", time.localtime(event["t"])), clock_style),
+            ("  " + label[:9].ljust(10), style), (event["name"][:14].ljust(15), "bright")], right)
+        count = f"{G['times']}{event['count']}" if event["count"] > 1 else ""
+        tail = " ".join(part for part in (event["detail"], event["user"]) if part)
+        cv.put(y + 1 + i, pos, tail, "dim", right - len(count) - 1 if count else right)
+        if count:
+            cv.put(y + 1 + i, right - len(count), count, "key")
+
+
+def table_layout(width):
+    """Pick the columns that fit; the CPU history column gets the width left over.
+
+    Returns {column: (x offset, width)}. Narrow screens drop columns in the
+    order listed in `optional`.
+    """
+    optional = ["ip", "tasks", "net", "up", "top", "disk"]
+    for n_drop in range(len(optional) + 1):
+        drop = set(optional[:n_drop])
+        cols = [("dot", 1, 0), ("name", 14, 1)]                  # (column, width, gap before)
+        if "up" not in drop:
+            cols.append(("up", 4, 1))
+        cols += [("cpu", 6, 1), ("hist", 0, 2)]
+        if "top" not in drop:
+            cols.append(("top", 18, 2))
+        cols.append(("mem", 6, 2))
+        if "disk" not in drop:
+            cols += [("rd", 7, 2), ("wr", 7, 1)]
+        if "net" not in drop:
+            cols += [("net_in", 9, 2), ("net_out", 9, 1)]
+        if "tasks" not in drop:
+            cols.append(("tasks", 5, 2))
+        if "ip" not in drop:
+            cols.append(("ip", 15, 2))
+        spare = width - sum(w + gap for _, w, gap in cols)
+        if spare >= 16 or n_drop == len(optional):
+            layout, x = {}, 0
+            for name, w, gap in cols:
+                x += gap
+                if name == "hist":
+                    w = max(0, min(spare, 120))
+                layout[name] = (x, w)
+                x += w
+            return layout
+
+
+HEADERS = (("name", "NAME", "<"), ("up", "UP", ">"), ("cpu", "CPU", ">"), ("top", "BUSIEST PROCESS", "<"),
+           ("mem", "MEM", ">"), ("rd", "DISK R", ">"), ("wr", "DISK W", ">"), ("net_in", "IN Mb/s", ">"),
+           ("net_out", "OUT Mb/s", ">"), ("tasks", "TASKS", ">"), ("ip", "IPV4", "<"))
+
+
+def draw_header(cv, y, x0, layout, ui):
+    for col, label, align in HEADERS:
+        if col in layout:
+            x, w = layout[col]
+            sorted_here = col in SORT_COLUMNS[ui.sort]
+            if sorted_here:
+                label += G["sorted"]
+            text = label.rjust(w) if align == ">" else label.ljust(w)
+            cv.put(y, x0 + x, text[:w], "key" if sorted_here else "bright")
+    x, w = layout["hist"]
+    label = f"CPU HISTORY (last {fmt_span(w * ui.interval)})"
+    cv.put(y, x0 + x, (label if len(label) <= w else "CPU HISTORY")[:w], "bright")
+
+
+def draw_row(cv, y, x0, layout, row, mon):
+    def at(col):
+        return x0 + layout[col][0]
+
+    def width(col):
+        return layout[col][1]
+
+    name = row["name"]
+    if len(name) > width("name"):
+        name = name[:width("name") - 1] + G["more"]
+    marker = G["vm"] if row["vm"] else G["dot"]
+    if not row["live"]:
+        cv.put(y, at("dot"), marker, "dim")
+        cv.put(y, at("name"), name, "dim")
+        cv.put(y, at("up") if "up" in layout else at("cpu"), row["state"].lower(), "dim")
+        return
+    cv.put(y, at("dot"), marker, "mid" if row["state"] == "Frozen" else "lo")
+    cv.put(y, at("name"), name, mon.series_style.get(row["cg"], "bright"))
+    if "up" in layout and row["up"] is not None:
+        # Recently (re)started containers stand out in yellow for their first hour.
+        up = row["up"]
+        cv.put(y, at("up"), fmt_age(up).rjust(width("up")), "mid" if up < 3600 else "text" if up < 86400 else "dim")
+    cv.put(y, at("cpu"), fmt_pct(row["cpu"]).rjust(width("cpu")), cpu_style(row["cpu"]))
+    if width("hist"):
+        history = list(mon.cpu_history.get(row["cg"], ()))[-width("hist"):]
+        cells = [(" ", "text")] * (width("hist") - len(history)) + [spark(v) for v in history]
+        put_cells(cv, y, at("hist"), cells)
+    if "top" in layout and row["vm"]:
+        cv.put(y, at("top"), "virtual machine", "dim")       # its processes are inside the guest
+    elif "top" in layout and row["top"]:
+        process, pct = row["top"]
+        busy = pct >= 0.05
+        cv.put(y, at("top"), process[:12], "text" if busy else "dim")
+        if busy:
+            cv.put(y, at("top") + 12, fmt_pct(pct).rjust(width("top") - 12), cpu_style(pct))
+    cv.put(y, at("mem"), human(row["mem"]).rjust(width("mem")))
+    for col, cell in (("rd", rate_cell), ("wr", rate_cell), ("net_in", mbps_cell), ("net_out", mbps_cell)):
+        if col in layout:
+            text, style = cell(row[col], width(col))
+            cv.put(y, at(col), text, style)
+    if "tasks" in layout and row["tasks"] is not None:
+        cv.put(y, at("tasks"), str(row["tasks"]).rjust(width("tasks")))
+    if "ip" in layout:
+        cv.put(y, at("ip"), row["ip"], "ip")
+
+
+def sort_rows(mon, mode):
+    def recent_cpu(row):              # average of the last few samples, so rows don't jump about
+        values = [v for v in list(mon.cpu_history.get(row["cg"], ()))[-5:] if v is not None]
+        return sum(values) / len(values) if values else 0.0
+
+    keys = {
+        "cpu": lambda r: -recent_cpu(r),
+        "mem": lambda r: -(r["mem"] or 0),
+        "disk": lambda r: -((r["rd"] or 0) + (r["wr"] or 0)),
+        "net": lambda r: -((r["net_in"] or 0) + (r["net_out"] or 0)),
+        "name": lambda r: 0,
+    }
+    live = sorted((r for r in mon.rows if r["live"]), key=lambda r: (keys[mode](r), r["name"].lower()))
+    rest = sorted((r for r in mon.rows if not r["live"]), key=lambda r: r["name"].lower())
+    return live + rest
+
+
+def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
+    sources_ok = mon.api_status == "ok"
+    box(cv, y, x, h, w, "b_table", title=[[(instance_noun(mon), "title")]],
+        right=[[("sorted by ", "dim"), (ui.sort, "key")]],
+        footer=[[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")],
+                [("- +", "key"), (f" every {ui.interval:g}s", "text")]],
+        footer_right=[[("lxd api ", "dim"), (mon.api_status, "lo" if sources_ok else "mid")],
+                      [("disk ", "dim"), ("zfs" if mon.zfs else "io.stat", "dim")]])
+    ix, iw = x + 2, w - 4
+    layout = table_layout(iw)
+    draw_header(cv, y + 1, ix, layout, ui)
+    room = h - 3
+    for i, row in enumerate(rows[:room]):
+        if i == room - 1 and len(rows) > room:
+            cv.put(y + 2 + i, ix, f"{G['more']} {len(rows) - i} more", "dim")
+            break
+        draw_row(cv, y + 2 + i, ix, layout, row, mon)
+
+
+def draw(cv, mon, ui):
+    """Lay the panels out to fit the screen; the container table always gets its rows first."""
+    if cv.w < 70 or cv.h < 12:
+        cv.put(0, 0, f"lxdtop needs at least 70x12 (this is {cv.w}x{cv.h})", "hi")
+        return
+    rows = sort_rows(mon, ui.sort)
+    draw_status(cv, 0, mon)
+    y = 1
+    spare = cv.h - y - (len(rows) + 3)           # rows left after the table's border, header and rows
+    top_h = 7 if cv.w >= 120 and spare >= 15 else 0
+    mid_h = min(14, spare - top_h) if spare - top_h >= 7 else 0
+    if top_h:
+        side = cv.w * 52 // 160
+        draw_cpu_panel(cv, y, 0, top_h, side, mon)
+        draw_mem_panel(cv, y, side, top_h, side, mon)
+        draw_net_panel(cv, y, 2 * side, top_h, cv.w - 2 * side, mon)
+        y += top_h
+    if mid_h:
+        events_w = 54 if cv.w >= 140 else 0
+        draw_graph_panel(cv, y, 0, mid_h, cv.w - events_w, mon, ui)
+        if events_w:
+            draw_events_panel(cv, y, cv.w - events_w, mid_h, events_w, mon)
+        y += mid_h
+    draw_table_panel(cv, y, 0, cv.h - y, cv.w, rows, mon, ui)
+
+
+# --- Running it ---------------------------------------------------------------
+
+def curses_attrs():
+    """Turn STYLES into curses attributes (a color pair, plus bold where asked)."""
+    has_color = curses.has_colors()
+    background = curses.COLOR_BLACK
+    if has_color:
+        curses.start_color()
+        try:
+            curses.use_default_colors()
+            background = -1
+        except curses.error:
+            pass
+    rich = has_color and curses.COLORS >= 256
+    pairs, attrs = {}, {}
+    for name, (color, bold) in STYLES.items():
+        number = COLORS.index(color)
+        if rich and name in STYLES_256:
+            number, bold = STYLES_256[name]
+        attr = curses.A_BOLD if bold else curses.A_NORMAL
+        if has_color:
+            if number not in pairs:
+                pairs[number] = len(pairs) + 1
+                curses.init_pair(pairs[number], number, background)
+            attr |= curses.color_pair(pairs[number])
+        attrs[name] = attr
+    return attrs
+
+
+def run(screen, mon, ui, max_frames=0):
+    try:
+        curses.curs_set(0)
+    except curses.error:
+        pass
+    screen.timeout(250)               # check the keyboard four times a second
+    attrs = curses_attrs()
+    mon.sample()
+    next_sample = time.monotonic() + 0.5   # a quick second reading so rates show at once
+    last_draw, frames = 0.0, 0
+    while True:
+        now = time.monotonic()
+        redraw = now - last_draw >= 1     # at least once a second, for the clock and the event feed
+        if now >= next_sample:
+            mon.sample()
+            next_sample = now + ui.interval
+            redraw = True
+        if redraw:
+            screen.erase()
+            draw(CursesCanvas(screen, attrs), mon, ui)
+            screen.refresh()
+            last_draw, frames = now, frames + 1
+            if max_frames and frames >= max_frames:
+                return
+        key = screen.getch()
+        if key in (ord("q"), ord("Q")):
+            return
+        if key in (ord("s"), ord("S")):
+            ui.sort = SORTS[(SORTS.index(ui.sort) + 1) % len(SORTS)]
+        elif key in (ord("+"), ord("=")):
+            ui.interval = next((i for i in INTERVALS if i > ui.interval), INTERVALS[-1])
+        elif key in (ord("-"), ord("_")):
+            ui.interval = next((i for i in reversed(INTERVALS) if i < ui.interval), INTERVALS[0])
+        elif key != curses.KEY_RESIZE:
+            continue
+        last_draw = 0.0                   # a key was pressed or the screen resized: redraw now
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Live, btop-style view of an LXD host, one row per container or VM. Read-only.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=f"""keys: q quits, s cycles the sort (cpu, mem, disk, net, name), - and + change the refresh interval
+
+notes:
+  CPU is shown as a share of one core: 100% = one core flat out.
+  MEM for a container is its working set (memory.current minus inactive file cache);
+  for a VM it is the resident memory of its QEMU process.
+  DISK figures are reads and writes by the instance (ZFS counts cache hits too).
+  {f"The clock shows {TIMEZONE} time unless TZ is set" if TIMEZONE else "The clock follows the system time zone"}; e.g. TZ=UTC lxdtop.
+  Names, IPs, VMs, stopped instances and the event feed need access to LXD's socket
+  (membership in the lxd group, or root). Exec command lines in the event feed are
+  hidden unless --show-commands is given, because they can contain passwords.
+
+needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3.""")
+    parser.add_argument("-i", "--interval", type=float, default=2, help="seconds between readings (default 2)")
+    parser.add_argument("--show-commands", action="store_true",
+                        help="show the command line of `lxc exec` sessions in the event feed")
+    parser.add_argument("--no-api", action="store_true",
+                        help="skip LXD's API (no IPs, network columns, VMs, stopped instances or events)")
+    parser.add_argument("--socket", help="LXD socket path (default: $LXD_DIR, then the snap's, then /var/lib/lxd)")
+    parser.add_argument("--ascii", action="store_true", help="draw with plain ASCII characters")
+    parser.add_argument("--version", action="version", version=f"lxdtop {VERSION}")
+    parser.add_argument("--dump", action="store_true", help="print one frame as text and exit")
+    parser.add_argument("--color", action="store_true", help="with --dump: keep the colors (ANSI codes)")
+    parser.add_argument("--size", default="160x45", help="with --dump: COLSxROWS (default 160x45)")
+    parser.add_argument("--samples", type=int, default=2, help="with --dump: readings to take first (default 2)")
+    parser.add_argument("--frames", type=int, default=0, help=argparse.SUPPRESS)   # testing: stop after N frames
+    args = parser.parse_args()
+
+    global G
+    if TIMEZONE:
+        os.environ.setdefault("TZ", TIMEZONE)
+    time.tzset()
+    locale.setlocale(locale.LC_ALL, "")
+    if args.ascii or "utf" not in locale.getpreferredencoding(False).lower():
+        G = GLYPHS_ASCII
+
+    api = events = None
+    socket_path = args.socket or next((p for p in LXD_SOCKETS if os.path.exists(p)), None)
+    if not args.no_api and socket_path:
+        api = LxdApi(socket_path)
+        api.fetch()                        # first answer up front, so names show at once
+        api.start()
+        events = LxdEvents(socket_path, show_commands=args.show_commands)
+        events.start()
+    mon = Monitor(api, events)
+    ui = types.SimpleNamespace(interval=args.interval, sort="cpu")
+
+    if args.dump:
+        cols, rows = (int(n) for n in args.size.lower().split("x"))
+        for i in range(max(2, args.samples)):
+            if i:
+                time.sleep(args.interval)
+            mon.sample()
+        canvas = TextCanvas(rows, cols)
+        draw(canvas, mon, ui)
+        print(canvas.text(color=args.color))
+        return
+    try:
+        curses.wrapper(run, mon, ui, args.frames)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()
