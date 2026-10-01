@@ -1,0 +1,84 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT
+# Copyright (c) 2026 BJ Hinkle
+#
+# lxdtop-remote: run lxdtop on an LXD host over SSH, from your own Mac or Linux machine.
+#   lxdtop-remote [host] [lxdtop options]   show it in this terminal (q quits)
+#   lxdtop-remote install <host>            copy lxdtop to <host>:~/bin/lxdtop and print its version
+#   lxdtop-remote screen [host]             flip the host's console between two virtual terminals,
+#                                           e.g. a login on tty1 and lxdtop on tty8 (see examples/)
+#
+# Settings are optional shell variables in ~/.config/lxdtop/remote.conf:
+#   DEFAULT_HOST=myhost       host to use when none is given
+#   SCREEN_HOST=myhost        host for `screen` (default: DEFAULT_HOST)
+#   SCREEN_VTS="1 8"          the two consoles `screen` flips between (default "1 8")
+#   REMOTE_TZ=Europe/Berlin   time zone for lxdtop's clock (default: the host's)
+#   WINDOW=160x45             resize this terminal window while lxdtop runs, then put it back
+#   LXDTOP=/path/to/lxdtop    the copy `install` sends (default: the lxdtop at this repo's root)
+# For a host your SSH config doesn't cover (no alias and no User), it asks for the
+# username, offers the last one you gave for that host, and remembers it in
+# ~/.config/lxdtop/users.
+CONF="$HOME/.config/lxdtop"
+[ -f "$CONF/remote.conf" ] && . "$CONF/remote.conf"
+USERS="$CONF/users"
+SCREEN_VTS=${SCREEN_VTS:-"1 8"}
+
+# Find lxdtop at this repo's root, even when this script is run through a symlink.
+self=$0
+while [ -L "$self" ]; do
+  link=$(readlink "$self")
+  case "$link" in /*) self=$link ;; *) self=$(dirname "$self")/$link ;; esac
+done
+LXDTOP=${LXDTOP:-$(cd "$(dirname "$self")/.." && pwd)/lxdtop}
+
+# Print the user@host to connect to, asking for the username when needed.
+login_for() {
+  case "$1" in *@*) echo "$1"; return 0 ;; esac
+  # If ~/.ssh/config already gives this name a username or turns it into another
+  # address, ssh knows how to log in there: use the name as it is.
+  user=$(ssh -G "$1" 2>/dev/null | awk '$1 == "user" {print $2}')
+  default=$(ssh -G lxdtop-unconfigured.invalid 2>/dev/null | awk '$1 == "user" {print $2}')
+  real=$(ssh -G "$1" 2>/dev/null | awk '$1 == "hostname" {print tolower($2)}')
+  given=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+  if [ "$user" != "$default" ] || [ "$real" != "$given" ]; then echo "$1"; return 0; fi
+  last=$(awk -v h="$1" '$1 == h {u = $2} END {print u}' "$USERS" 2>/dev/null)
+  printf 'username on %s%s: ' "$1" "${last:+ [$last]}" >&2
+  read -r name
+  name=${name:-$last}
+  [ -n "$name" ] || { echo "lxdtop-remote: no username given" >&2; return 1; }
+  mkdir -p "$CONF"
+  { awk -v h="$1" '$1 != h' "$USERS" 2>/dev/null; echo "$1 $name"; } > "$USERS.tmp" && mv "$USERS.tmp" "$USERS"
+  echo "$name@$1"
+}
+
+case "$1" in
+  screen)
+    host=${2:-${SCREEN_HOST:-$DEFAULT_HOST}}
+    [ -n "$host" ] || { echo "usage: lxdtop-remote screen <host> (or set SCREEN_HOST)" >&2; exit 2; }
+    dest=$(login_for "$host") || exit 2
+    set -- $SCREEN_VTS
+    # Needs `sudo chvt` without a password on the host.
+    exec ssh "$dest" "if [ \"\$(cat /sys/class/tty/tty0/active)\" = tty$2 ]; then sudo -n chvt $1 && echo \"console: tty$1\"; else sudo -n chvt $2 && echo \"console: tty$2\"; fi" ;;
+  install)
+    [ -n "$2" ] || { echo "usage: lxdtop-remote install <host>" >&2; exit 2; }
+    [ -f "$LXDTOP" ] || { echo "lxdtop-remote: can't find $LXDTOP" >&2; exit 1; }
+    dest=$(login_for "$2") || exit 2
+    echo "copying $LXDTOP to $dest:~/bin/lxdtop"
+    # One connection, so one login: make ~/bin, write the file, make it runnable, show its version.
+    ssh "$dest" 'mkdir -p ~/bin && cat > ~/bin/lxdtop && chmod 755 ~/bin/lxdtop && ~/bin/lxdtop --version' < "$LXDTOP"
+    exit $? ;;
+  ""|-*) host=$DEFAULT_HOST ;;
+  *) host=$1; shift ;;
+esac
+[ -n "$host" ] || { echo "usage: lxdtop-remote <host> [lxdtop options] (or set DEFAULT_HOST)" >&2; exit 2; }
+dest=$(login_for "$host") || exit 2
+export TERM="${TERM:-xterm-256color}"   # the remote screen needs a terminal type
+if [ -n "$WINDOW" ]; then
+  size=$(stty size 2>/dev/null)        # this window's rows and columns, to put back afterwards
+  printf '\033[8;%s;%st' "${WINDOW#*x}" "${WINDOW%x*}"
+  sleep 0.2
+fi
+ssh -t "$dest" "${REMOTE_TZ:+TZ=$REMOTE_TZ }~/bin/lxdtop" "$@"
+status=$?
+[ -n "$size" ] && printf '\033[8;%s;%st' "${size% *}" "${size#* }"
+exit $status

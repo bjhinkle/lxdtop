@@ -1,0 +1,28 @@
+# Run lxdtop full-time on a console screen (virtual terminal 8), for example a
+# small monitor attached to the LXD host. Replace YOUR_USER, then:
+#   sudo cp lxdtop-console.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now lxdtop-console
+# Show it with Alt+F8 at the keyboard (Alt+F1 goes back), or `sudo chvt 8`, or
+# `contrib/lxdtop-remote screen <host>` from another machine. Pressing q on that
+# console restarts lxdtop 3 seconds later. YOUR_USER needs to be in the lxd group
+# for names, IP addresses, VMs and the event feed.
+[Unit]
+Description=lxdtop on the console (tty8)
+After=snap.lxd.daemon.service
+
+[Service]
+User=YOUR_USER
+Environment=TERM=linux LANG=C.UTF-8
+# Environment=TZ=America/New_York
+ExecStart=/home/YOUR_USER/bin/lxdtop
+StandardInput=tty
+StandardOutput=tty
+TTYPath=/dev/tty8
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

@@ -48,6 +48,22 @@ Keys: `q` quits, `s` cycles the sort (cpu, mem, disk, net, name), and `-` and `+
 
 The clock follows the system time zone. Set `TZ` to change it, for example `TZ=UTC lxdtop`.
 
+## Run it from another machine
+
+`contrib/lxdtop-remote` runs lxdtop on a host over SSH from your own Mac or Linux machine, installs it there, and remembers usernames for hosts your SSH config doesn't cover.
+
+```bash
+ln -s "$PWD/contrib/lxdtop-remote" ~/.local/bin/lxdtop-remote
+lxdtop-remote install myhost    # copy lxdtop to myhost:~/bin/lxdtop
+lxdtop-remote myhost            # run it in this terminal
+```
+
+Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time zone for the clock, and a window size to switch to while it runs. The comments at the top of the script list them.
+
+## Run it full-time on a console screen
+
+`examples/lxdtop-console.service` is a systemd unit that keeps lxdtop running on virtual terminal 8, for a small monitor attached to the host. Switch to it with Alt+F8 at the keyboard, or with `lxdtop-remote screen myhost` from another machine.
+
 ## Where the numbers come from
 
 | What | Source |
@@ -71,6 +87,10 @@ On the Linux console, lxdtop uses 16 colors and only the characters in Ubuntu's 
 ## Status
 
 Early, and provided as is.
+
+## Contributing
+
+Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the few rules that keep lxdtop small and safe.
 
 ## License
 

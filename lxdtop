@@ -48,7 +48,7 @@ import time
 import types
 import urllib.parse
 
-VERSION = "1.3.2 (2026-10-01)"
+VERSION = "1.4.0 (2026-10-01)"
 TIMEZONE = None      # the clock's default (None = the system's); TZ overrides it
 CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
