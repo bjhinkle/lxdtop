@@ -27,12 +27,16 @@ Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12.
 
 ## Install and run
 
-Copy `lxdtop` to the LXD host and make it executable:
+On the LXD host, download `lxdtop` and make it executable:
 
 ```bash
-install -m 755 lxdtop ~/bin/lxdtop
+mkdir -p ~/bin
+curl -fsSL -o ~/bin/lxdtop https://raw.githubusercontent.com/bjhinkle/lxdtop/main/lxdtop
+chmod 755 ~/bin/lxdtop
 ~/bin/lxdtop
 ```
+
+From a clone, `install -m 755 lxdtop ~/bin/lxdtop` does the same.
 
 Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
 
