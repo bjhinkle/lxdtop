@@ -7,6 +7,8 @@
 #   lxdtop-remote install <host>            copy lxdtop to <host>:~/bin/lxdtop and print its version
 #   lxdtop-remote screen [host]             flip the host's console between two virtual terminals,
 #                                           e.g. a login on tty1 and lxdtop on tty8 (see examples/)
+# On the host it runs ~/bin/lxdtop, or the lxdtop on the host's PATH when ~/bin has none
+# (a copy installed once for every user, e.g. in /usr/local/bin).
 #
 # Settings are optional shell variables in ~/.config/lxdtop/remote.conf:
 #   DEFAULT_HOST=myhost       host to use when none is given
@@ -78,7 +80,9 @@ if [ -n "$WINDOW" ]; then
   printf '\033[8;%s;%st' "${WINDOW#*x}" "${WINDOW%x*}"
   sleep 0.2
 fi
-ssh -t "$dest" "${REMOTE_TZ:+TZ=$REMOTE_TZ }~/bin/lxdtop" "$@"
+# Prefer the user's own ~/bin/lxdtop; otherwise use one on the host's PATH.
+run='p="$HOME/bin/lxdtop"; [ -x "$p" ] || p=$(command -v lxdtop) || { echo "lxdtop-remote: lxdtop is not in ~/bin or on the PATH of $(hostname)" >&2; exit 127; }; '
+ssh -t "$dest" "$run${REMOTE_TZ:+TZ=$REMOTE_TZ }\"\$p\"" "$@"
 status=$?
 [ -n "$size" ] && printf '\033[8;%s;%st' "${size% *}" "${size#* }"
 exit $status

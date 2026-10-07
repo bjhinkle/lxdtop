@@ -62,6 +62,8 @@ lxdtop-remote install myhost    # copy lxdtop to myhost:~/bin/lxdtop
 lxdtop-remote myhost            # run it in this terminal
 ```
 
+On the host it runs `~/bin/lxdtop`, or the `lxdtop` on the host's PATH when `~/bin` has none, so a single copy in `/usr/local/bin` serves every user.
+
 Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time zone for the clock, and a window size to switch to while it runs. The comments at the top of the script list them.
 
 ## Run it full-time on a console screen
