@@ -1,0 +1,9 @@
+51 1 0x01 7 2160 5214446052 1101724096685
+name                            type data
+dataset_name                    7    default/virtual-machines/win.block
+writes                          4    90210
+nwritten                        4    1073741824
+reads                           4    45000
+nread                           4    536870912
+nunlinks                        4    0
+nunlinked                       4    0

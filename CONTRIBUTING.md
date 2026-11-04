@@ -10,6 +10,7 @@ Thanks for helping. Issues and pull requests are welcome. A few rules keep lxdto
 
 ## Testing
 
+- `python3 -m unittest` runs the unit tests in `tests/`. They need only the standard library and no LXD host: they read fixture files instead of `/proc` and `/sys`, and talk to a fake LXD socket.
 - `./lxdtop --dump` prints one frame as text; add `--color`, `--size 100x30` or `--samples 10` (readings taken first, so the graphs have history).
 - Run it for real in a terminal at a few sizes, including 80x24, and on the Linux console if you can.
 - In your pull request, say what you tested on: distribution, LXD version, storage driver, and whether there were containers, VMs or both.

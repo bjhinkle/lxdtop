@@ -1,0 +1,9 @@
+{
+  "type": "sync",
+  "status": "Success",
+  "status_code": 200,
+  "metadata": {
+    "space": {"used": 128849018880, "total": 966367641600},
+    "inodes": {"used": 1234567, "total": 1887436800}
+  }
+}

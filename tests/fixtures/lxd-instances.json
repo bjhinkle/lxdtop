@@ -1,0 +1,138 @@
+{
+  "type": "sync",
+  "status": "Success",
+  "status_code": 200,
+  "operation": "",
+  "error_code": 0,
+  "error": "",
+  "metadata": [
+    {
+      "name": "web",
+      "project": "default",
+      "type": "container",
+      "status": "Running",
+      "status_code": 103,
+      "state": {
+        "status": "Running",
+        "status_code": 103,
+        "pid": 4242,
+        "processes": 31,
+        "network": {
+          "eth0": {
+            "addresses": [
+              {"family": "inet6", "address": "fe80::216:3eff:feaa:bb01", "netmask": "64", "scope": "link"},
+              {"family": "inet", "address": "10.10.10.21", "netmask": "24", "scope": "global"},
+              {"family": "inet6", "address": "fd42:7d1a:9c2b:3e4f:216:3eff:feaa:bb01", "netmask": "64", "scope": "global"}
+            ],
+            "counters": {"bytes_received": 500000, "bytes_sent": 250000, "packets_received": 900, "packets_sent": 700},
+            "hwaddr": "00:16:3e:aa:bb:01",
+            "host_name": "veth1a2b3c4d",
+            "mtu": 1500,
+            "state": "up",
+            "type": "broadcast"
+          },
+          "lo": {
+            "addresses": [
+              {"family": "inet", "address": "127.0.0.1", "netmask": "8", "scope": "local"},
+              {"family": "inet6", "address": "::1", "netmask": "128", "scope": "local"}
+            ],
+            "counters": {"bytes_received": 0, "bytes_sent": 0, "packets_received": 0, "packets_sent": 0},
+            "hwaddr": "",
+            "host_name": "",
+            "mtu": 65536,
+            "state": "up",
+            "type": "loopback"
+          }
+        }
+      }
+    },
+    {
+      "name": "db",
+      "project": "default",
+      "type": "container",
+      "status": "Running",
+      "status_code": 103,
+      "state": {
+        "status": "Running",
+        "status_code": 103,
+        "pid": 4300,
+        "processes": 12,
+        "network": {
+          "eth0": {
+            "addresses": [
+              {"family": "inet6", "address": "fe80::216:3eff:feaa:bb02", "netmask": "64", "scope": "link"}
+            ],
+            "hwaddr": "00:16:3e:aa:bb:02",
+            "host_name": "veth22220000",
+            "mtu": 1500,
+            "state": "up",
+            "type": "broadcast"
+          },
+          "eth1": {
+            "addresses": [
+              {"family": "inet", "address": "192.168.50.12", "netmask": "24", "scope": "global"}
+            ],
+            "hwaddr": "00:16:3e:aa:bb:03",
+            "host_name": "veth22221111",
+            "mtu": 1500,
+            "state": "up",
+            "type": "broadcast"
+          }
+        }
+      }
+    },
+    {
+      "name": "api",
+      "project": "dev",
+      "type": "container",
+      "status": "Running",
+      "status_code": 103,
+      "state": {
+        "status": "Running",
+        "status_code": 103,
+        "pid": 4400,
+        "processes": 7,
+        "network": {}
+      }
+    },
+    {
+      "name": "win",
+      "project": "default",
+      "type": "virtual-machine",
+      "status": "Running",
+      "status_code": 103,
+      "state": {
+        "status": "Running",
+        "status_code": 103,
+        "pid": 5151,
+        "processes": -1,
+        "network": {
+          "enp5s0": {
+            "addresses": [
+              {"family": "inet", "address": "10.10.10.30", "netmask": "24", "scope": "global"}
+            ],
+            "hwaddr": "00:16:3e:aa:bb:04",
+            "host_name": "tap0f1e2d3c",
+            "mtu": 1500,
+            "state": "up",
+            "type": "broadcast"
+          }
+        }
+      }
+    },
+    {
+      "name": "old",
+      "project": "default",
+      "type": "container",
+      "status": "Stopped",
+      "status_code": 102,
+      "state": {
+        "status": "Stopped",
+        "status_code": 102,
+        "pid": 0,
+        "processes": 0,
+        "network": null
+      }
+    }
+  ]
+}
