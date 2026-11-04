@@ -172,7 +172,7 @@ def read(path):
     if not path:
         return None
     try:
-        with open(path) as f:
+        with open(path, errors="backslashreplace") as f:    # process names can be any bytes
             return f.read()
     except OSError:
         return None
