@@ -296,18 +296,28 @@ class RecordTest(unittest.TestCase):
         self.events._record({})
         self.assertEqual(self.events.feed[0]["action"], "")
 
-    @unittest.expectedFailure
     def test_a_null_action_does_not_crash_the_screen(self):
-        """SECURITY-REVIEW.md L-5: not fixed.
+        """SECURITY-REVIEW.md L-5: odd values here used to end lxdtop.
 
-        "action": null is stored as None, and draw_events_panel() then calls
-        None.replace() in the main thread, which ends lxdtop. LXD always
-        sends a string here.
+        _record() stored action, name and username as they came, and
+        draw_events_panel() then called None.replace(), sliced a number or
+        joined one, in the main thread. LXD always sends strings here, so
+        this needs something other than LXD on the socket.
         """
-        self.events._record(dict(metadata=dict(action=None, source="/1.0/instances/web")))
-        mon = types.SimpleNamespace(events=self.events)
-        lxdtop.draw_events_panel(lxdtop.TextCanvas(14, 54), 0, 0, 14, 54, mon)
-
+        cases = {"action null": dict(action=None), "action a number": dict(action=5),
+                 "name a number": dict(name=5), "name a list": dict(name=["web"]),
+                 "username a number": dict(requestor=dict(username=7)),
+                 "username null": dict(requestor=dict(username=None))}
+        for label, fields in cases.items():
+            with self.subTest(label):
+                events = lxdtop.LxdEvents("/unused")
+                events._record(dict(metadata=dict(dict(action="instance-exec", source="/1.0/instances/web"),
+                                                  **fields)))
+                entry = events.feed[0]
+                for key in ("action", "name", "detail", "user"):
+                    self.assertIsInstance(entry[key], str, key)
+                lxdtop.draw_events_panel(lxdtop.TextCanvas(14, 54), 0, 0, 14, 54,
+                                         types.SimpleNamespace(events=events))
 
 if __name__ == "__main__":
     unittest.main()
