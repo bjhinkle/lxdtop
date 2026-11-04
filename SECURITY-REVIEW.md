@@ -26,7 +26,7 @@ Nothing reached High. One bug that isn't a security issue was also fixed: lxdtop
 
 **Unfixed findings** are each pinned by a test marked `expectedFailure` that names the finding (`L-4` to `L-8`). If you fix one, its test starts passing, and unittest reports that as a failure until the marker is removed. I applied each suggested fix for L-4, L-5, L-7 and L-8 to a scratch copy: each turned only its own test into an unexpected success, and broke nothing else.
 
-**Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it.
+**Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). CI also runs the suite on Python 3.10, 3.12 and 3.15. No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it.
 
 ## 1. Does lxdtop only read?
 
@@ -135,7 +135,7 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 
 ## 4. The event websocket: slow, closed or malformed
 
-`LxdEvents` runs in its own daemon thread (538–539). The screen only copies the feed under a lock (624–626), so nothing on this side can freeze the display. The table can only cover cases that return to `_loop()`:
+`LxdEvents` runs in its own daemon thread (538–539). The screen only copies the feed under a lock (624–626), so a slow or stuck event stream can't freeze the display. What happens in each case:
 
 | Case | What happens | Panel status |
 |---|---|---|
