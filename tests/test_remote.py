@@ -145,6 +145,27 @@ class RemoteTest(unittest.TestCase):
                          'if [ "$(cat /sys/class/tty/tty0/active)" = tty8 ]; then sudo -n chvt 1 && '
                          'echo "console: tty1"; else sudo -n chvt 8 && echo "console: tty8"; fi')
 
+    def test_a_host_or_user_starting_with_a_dash_is_not_an_ssh_option(self):
+        """SECURITY-REVIEW.md R-1: ssh used to read such a host as an option.
+
+        With `-oProxyCommand=...` as the host, ssh ran that command on this
+        machine. OpenSSH 9.6 and later refuse the connection first, because the
+        next argument (the remote command) then becomes the host name and has
+        spaces in it; older versions, and this stand-in, run it.
+        """
+        marker = os.path.join(self.dir, "ran")
+        for args, stdin in ((("install", f"-oProxyCommand=touch {marker}"), ""),
+                            (("screen", f"-oProxyCommand=touch {marker}"), ""),
+                            (("lxdhost",), f"-oProxyCommand=touch {marker}\n")):    # typed as the username
+            with self.subTest(args=args, stdin=stdin):
+                for path in (marker, marker + "@lxdhost", self.log):
+                    if os.path.exists(path):
+                        os.remove(path)
+                self.remote(*args, stdin=stdin, FAKE_SSH_DRY="1")
+                self.assertFalse(os.path.exists(marker) or os.path.exists(marker + "@lxdhost"))
+                for run in self.ssh_runs():
+                    self.assertNotIn("-o", [name for name, _ in run["options"]], run["argv"])
+
 
 if __name__ == "__main__":
     unittest.main()
