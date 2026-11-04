@@ -3,6 +3,7 @@
 import base64
 import json
 import socket
+import time
 import types
 import unittest
 from unittest import mock
@@ -198,6 +199,37 @@ class LoopTest(unittest.TestCase):
                        dict(script=[ws_frame(8)])):
             with self.subTest(**{k: repr(v)[:40] for k, v in kwargs.items()}), FakeLxd(**kwargs) as lxd:
                 self.assertEqual(run_loop(lxd.path).status, "reconnecting")
+
+    def test_a_silent_stream_reconnects(self):
+        """SECURITY-REVIEW.md L-6: a stream that went quiet used to look "live" forever.
+
+        Nothing on the event socket had a timeout, so if LXD hung with the
+        connection open, lxdtop waited indefinitely and the panel kept saying
+        "live". LXD pings its listeners, so a healthy stream is never silent
+        for long. Here the fake LXD says nothing for 3 s after the handshake,
+        then closes; with the timeout shortened, lxdtop gives up well before.
+        """
+        with FakeLxd(script=[3]) as lxd, mock.patch.object(lxdtop, "EVENT_TIMEOUT", 0.3, create=True):
+            started = time.monotonic()
+            events = run_loop(lxd.path)
+            waited = time.monotonic() - started
+        self.assertIsNone(events.ended)
+        self.assertEqual(events.status, "reconnecting")
+        self.assertLess(waited, 2)                              # the timeout, not the fake closing
+
+    def test_pings_keep_a_quiet_stream_open(self):
+        # The timeout is per read, so pings 0.6 s apart keep a 1 s timeout from firing
+        # although the whole exchange lasts 2.4 s.
+        script = []
+        for _ in range(4):
+            script += [ws_frame(9, b"keepalive"), FakeLxd.READ_FRAME, 0.6]
+        with FakeLxd(script=script) as lxd, mock.patch.object(lxdtop, "EVENT_TIMEOUT", 1.0, create=True):
+            run_loop(lxd.path)
+        self.assertEqual(len(lxd.received), 4)                 # every ping answered: still connected
+
+    def test_the_event_timeout_leaves_room_for_lxds_pings(self):
+        self.assertGreaterEqual(lxdtop.EVENT_TIMEOUT, 30)
+        self.assertLessEqual(lxdtop.EVENT_TIMEOUT, 300)
 
     def test_the_feed_survives_a_reconnect(self):
         with FakeLxd(script=frames(lifecycle_events()[0])) as lxd:

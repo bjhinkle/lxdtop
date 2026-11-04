@@ -1,6 +1,6 @@
 # Security review: lxdtop 1.4.0 and lxdtop-remote
 
-Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** The fixes made since move lines in `lxdtop` after 825 down by 2, and after 1516 by 5; the L-4, L-5 and L-9 fixes change lines in place.
+Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** Fixes made since then have moved later lines in `lxdtop` down by up to 11, and each finding also names its function.
 
 lxdtop runs with access to LXD's socket, which is equivalent to root on the host, and it draws text that people inside containers choose. So this review asks four things: does it only read, can container-chosen text break out of its place on the terminal, can `lxdtop-remote` be made to run something it shouldn't, and what happens when the event stream is slow, closed or malformed.
 
@@ -13,9 +13,9 @@ lxdtop runs with access to LXD's socket, which is equivalent to root on the host
 | [L-3](#l-3-in-the-live-view-r-b-and-n-move-the-cursor) | In the live view, `\r`, `\b` and `\n` in a name move the cursor, and format characters pass through | Low | Fixed in `8726a25` |
 | [L-4](#l-4-unexpected-input-ends-the-event-listener-for-good) | Unexpected input ends the event listener for good, while the panel still says "live" | Low | Fixed in `85b8719` |
 | [L-5](#l-5-a-null-or-non-string-event-field-crashes-lxdtop) | A `null` or non-string event field crashes lxdtop when it is drawn | Low | Fixed in `a93f240` |
-| [L-6](#l-6-no-timeouts-on-the-event-socket) | No timeouts on the event socket, so a stalled LXD still looks "live" | Low | Not fixed |
-| [L-7](#l-7-interface-names-from-lxd-go-into-a-path-unchecked) | Interface names from LXD go into a `/sys` path unchecked | Low | Not fixed |
-| [L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters) | With `zfs.delegate`, a container can take over another instance's disk counters | Low | Not fixed |
+| [L-6](#l-6-no-timeouts-on-the-event-socket) | No timeouts on the event socket, so a stalled LXD still looks "live" | Low | Fixed in `a057527` |
+| [L-7](#l-7-interface-names-from-lxd-go-into-a-path-unchecked) | Interface names from LXD go into a `/sys` path unchecked | Low | Fixed in `c9c129a` |
+| [L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters) | With `zfs.delegate`, a container can take over another instance's disk counters | Low | Fixed in `fe566a4`, one case left |
 | [L-9](#l-9-unexpected-json-from-the-api-stops-lxdtop-or-its-refreshes) | Unexpected JSON from the API ends lxdtop at startup, or stops its refreshes while the footer says "ok" | Low | Fixed in `daa158d` |
 | [R-1](#r-1-a-host-or-username-starting-with---is-read-by-ssh-as-an-option) | `lxdtop-remote`: a host or username starting with `-` is read by ssh as an option | Low | Fixed in `6f8420c` |
 | [R-2](#r-2-lxdtop-options-are-parsed-again-by-the-hosts-shell) | `lxdtop-remote`: lxdtop options are parsed again by the host's shell | Low | Fixed in `12e82db` |
@@ -25,7 +25,7 @@ Nothing reached High. One bug that isn't a security issue was also fixed: lxdtop
 
 **Severity scale.** *High*: someone could change the host, run code as the lxdtop user, or read secrets. *Medium*: an unprivileged process in any container can stop lxdtop or send control sequences to the operator's terminal. *Low*: needs an unusual setup, a non-default option, a second foothold, or input only the operator or root controls, or it only misleads the display. *Info*: no security impact.
 
-**Unfixed findings** L-7 and L-8 are each pinned by a test marked `expectedFailure` that names the finding. If you fix one, its test starts passing, and unittest reports that as a failure until the marker is removed. I applied the suggested fixes for L-7 and L-8 to a scratch copy: each turned only its own test into an unexpected success, and broke nothing else. L-6 has no such test, since what it describes is waiting forever.
+**What's left.** One case of L-8, an instance with no ZFS dataset of its own, is pinned by a test marked `expectedFailure`, `test_a_nested_dataset_cannot_claim_an_instance_without_zfs`. If you fix it, the test starts passing, and unittest reports that as a failure until the marker is removed.
 
 **Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). CI also runs the suite on Python 3.10, 3.12 and 3.15. No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it.
 
@@ -147,7 +147,7 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 | The stream stops mid-frame | A short read gives a JSON error or `ConnectionError`; reconnect | reconnecting |
 | A message that isn't JSON | `ValueError`; reconnect | reconnecting |
 | Bytes arrive slowly | Waits; sampling and drawing carry on | live |
-| Connection open but silent | Waits indefinitely ([L-6](#l-6-no-timeouts-on-the-event-socket)) | live |
+| Connection open but silent | `TimeoutError` after 60 s with no frame, pings included; reconnect. Before the [L-6](#l-6-no-timeouts-on-the-event-socket) fix, it waited indefinitely | reconnecting |
 | Valid JSON that isn't an event object | `AttributeError` or `TypeError`; reconnect. Before the [L-4](#l-4-unexpected-input-ends-the-event-listener-for-good) fix, the thread ended for good | reconnecting |
 | Frame length ≥ 2^63, or too large to allocate | `OverflowError` or `MemoryError`; reconnect (L-4) | reconnecting |
 | Deeply nested JSON | `RecursionError`; reconnect (L-4) | reconnecting |
@@ -176,32 +176,33 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 
 ### L-6 No timeouts on the event socket
 
-**Low. Not fixed.**
+**Low. Fixed in `a057527`.**
 
 - **Where.** The socket made at 543 never gets a timeout, so `connect` (555), the reply `readline()` calls (561, 563) and the frame reads (568–577) can wait forever.
 - **Impact.** If LXD hangs with the connection open, the feed keeps showing "connecting" or "live". The display itself is unaffected, and the table footer's `lxd api` status shows an error within one refresh, because API calls do time out after 5 s (421).
-- **How confirmed.** By reading the code, and by `test_status_is_live_once_upgraded`: after the 101 reply, with nothing more sent, the status is "live" until the server closes.
-- **Smallest fix.** `sock.settimeout(60)` in `_listen()` before `connect`. A timeout raises `TimeoutError`, an `OSError`, so `_loop()` already reconnects. LXD pings its event listeners, which is why lxdtop answers pings, but I couldn't measure the interval without a daemon. Pick a timeout well above it.
+- **How confirmed.** By reading the code, and by `test_status_is_live_once_upgraded`: after the 101 reply, with nothing more sent, the status is "live" until the server closes. `test_a_silent_stream_reconnects` fails on `main` before the fix: with the timeout shortened to 0.3 s, lxdtop still waited the full 3 s until the fake LXD closed. With the fix it gives up after 0.3 s. `test_pings_keep_a_quiet_stream_open` checks that the timeout applies to each read: pings 0.6 s apart keep a 1 s timeout from firing over 2.4 s.
+- **Smallest fix (applied).** A named constant, `EVENT_TIMEOUT = 60`, and `sock.settimeout(EVENT_TIMEOUT)` where `_loop()` makes the socket (543). That's rather than in `_listen()`, as first suggested, so the tests that call `_listen()` directly keep their own timeout. A timeout raises `TimeoutError`, an `OSError`, so `_loop()` reconnects. LXD pings its event listeners and drops ones that don't answer, which is why lxdtop answers pings. I couldn't measure the interval without a daemon, so check once on a real host: on a quiet host the panel should stay "live" for several minutes.
 
 ## 5. Other findings
 
 ### L-7 Interface names from LXD go into a path unchecked
 
-**Low. Not fixed.**
+**Low. Fixed in `c9c129a`.**
 
 - **Where.** `fetch_instances()` keeps each NIC's `host_name` (471–472), and `read_net()` builds `/sys/class/net/{name}/statistics/rx_bytes` from it (322–323).
 - **Impact.** For a container, LXD sets `host_name` itself. For a VM, LXD builds the reported network state from the lxd-agent inside the guest. If LXD passes a guest-chosen `host_name` through, which I couldn't verify without a daemon, a guest could point lxdtop at another interface's counters and so misreport its own traffic. It could also use `../` to read any file whose path ends in `statistics/rx_bytes`. If a second party places a FIFO at such a path (a host user, or a container whose root filesystem lxdtop can reach as root through `/proc/<pid>/root`), `open()` blocks, and the sampling loop, and with it the display, freezes. A NUL or other invalid name is harmless, because `read_int()` catches the error.
-- **How confirmed.** One-off runs against the fake host: `read_net(["../../../srv/x"])` returned the counters stored at `/srv/x/statistics/`, and `read_int()` on a FIFO at such a path was still waiting after 3 s. `test_interface_names_stay_inside_sys_class_net` is an expected failure, and `test_a_name_with_a_nul_is_no_reading` passes.
-- **Smallest fix.** Two lines at the top of `read_net()`'s loop (321): skip any name containing `/` (`if "/" in name: continue`).
+- **How confirmed.** One-off runs against the fake host: `read_net(["../../../srv/x"])` returned the counters stored at `/srv/x/statistics/`, and `read_int()` on a FIFO at such a path was still waiting after 3 s. `test_interface_names_stay_inside_sys_class_net` fails on `main` before the fix and passes with it. It also checks that a bad name beside a good one still counts the good one, and that a numeric name gives no reading without an error. With the fix, a name leading to a FIFO returns at once. `test_a_name_with_a_nul_is_no_reading` passes either way.
+- **Smallest fix (applied).** Two lines at the top of `read_net()`'s loop (321) skip any name containing `/`. The test is `"/" in str(name)`, so a name that isn't text can't raise where the f-string never did.
 
 ### L-8 A delegated ZFS dataset can take another instance's disk counters
 
-**Low. Not fixed.**
+**Low. Fixed in `fe566a4`, except one case.**
 
 - **Where.** `find_zfs_datasets()`, line 243, maps a dataset to an instance by the text after the **last** `/containers/`.
 - **Impact.** With `zfs.delegate` (off by default), a container's root can create `default/containers/c1/containers/victim`. That dataset maps to `victim` and can replace victim's DISK R and DISK W with numbers c1 chooses. Which one wins depends on the order glob returns the kstat files in. Misleading display only.
-- **How confirmed.** `test_a_delegated_child_dataset_cannot_claim_another_instance` (expected failure), with fixture kstat files.
-- **Smallest fix.** Using `partition()` instead of `rpartition()` would fix this but break pools whose source dataset contains `/containers/`. A safe fix is about three lines: when a name is already mapped, keep the dataset with the shorter name, since an instance's own dataset is always shorter than one nested inside another instance's.
+- **How confirmed.** `test_a_delegated_child_dataset_cannot_claim_another_instance`, with fixture kstat files, now tries both orders and a VM. It fails on `main` before the fix, because the nested dataset read last won, and passes with it.
+- **Smallest fix (applied).** For each instance, keep the dataset with the shortest name, since an instance's own dataset is always shorter than one nested inside another instance's. It's three lines. Using `partition()` instead of `rpartition()` would also work, but breaks pools whose source dataset contains `/containers/`.
+- **What's left.** When the instance has no ZFS dataset of its own (its disk is on a dir or LVM pool), there is no shorter name to prefer. A nested dataset named after it still maps to it, and its DISK columns show c1's numbers. Closing that needs each pool's own dataset from LXD's storage-pool config, so that only datasets directly under it count. `test_a_nested_dataset_cannot_claim_an_instance_without_zfs` is an expected failure for it.
 
 ### L-9 Unexpected JSON from the API stops lxdtop or its refreshes
 

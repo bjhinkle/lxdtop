@@ -198,17 +198,19 @@ class InstanceCountersTest(unittest.TestCase):
         with self.host.installed():
             self.assertIsNone(lxdtop.read_net(["veth\x00x"]))
 
-    @unittest.expectedFailure
     def test_interface_names_stay_inside_sys_class_net(self):
-        """SECURITY-REVIEW.md L-7: not fixed.
+        """SECURITY-REVIEW.md L-7: a name with "/" in it used to read outside /sys/class/net.
 
-        read_net() puts the host_name LXD reports into a path unchecked, so
-        "../../../srv/x" reads /srv/x/statistics/rx_bytes, and a FIFO there
-        would block the sampling loop.
+        read_net() put the host_name LXD reports into the path unchecked, so
+        "../../../srv/x" read /srv/x/statistics/rx_bytes, and a FIFO there
+        would have blocked the sampling loop. No interface name contains "/".
         """
         self.host.add_nic("../../../srv/x", rx=111, tx=222)
+        self.host.add_nic("veth22220000", rx=100, tx=2000)
         with self.host.installed():
             self.assertIsNone(lxdtop.read_net(["../../../srv/x"]))
+            self.assertEqual(lxdtop.read_net(["../../../srv/x", "veth22220000"]), (2000, 100))
+            self.assertIsNone(lxdtop.read_net([5]))              # not text: no reading, and no error
 
 
 class ZfsDatasetTest(unittest.TestCase):
@@ -244,21 +246,39 @@ class ZfsDatasetTest(unittest.TestCase):
             stats = lxdtop.read_kstat("/proc/spl/kstat/zfs/default/objset-0x36", ("nread", "nwritten"))
         self.assertEqual(stats, {"nread": "188436480", "nwritten": "286476288"})
 
-    @unittest.expectedFailure
     def test_a_delegated_child_dataset_cannot_claim_another_instance(self):
-        """SECURITY-REVIEW.md L-8: not fixed.
+        """SECURITY-REVIEW.md L-8: a nested dataset used to take over another instance's counters.
 
         With zfs.delegate, a container's root can create datasets under its own,
         such as default/containers/c1/containers/victim. find_zfs_datasets()
-        takes the part after the last "/containers/", so that dataset is mapped
-        to "victim" and its counters can replace victim's DISK R and DISK W.
+        took the part after the last "/containers/", so that dataset was mapped
+        to "victim", and whichever kstat file came last won. An instance's own
+        dataset always has the shorter name, so the shorter one now wins.
         """
-        self.host.add_objset("default", "0x10", "default/containers/victim", 100, 100)
+        for victim_id, nested_id in (("0x10", "0x20"), ("0x30", "0x05")):    # either one read first
+            with self.subTest(victim=victim_id, nested=nested_id):
+                host = FakeHost(self)
+                host.add_objset("default", victim_id, "default/containers/victim", 100, 100)
+                host.add_objset("default", nested_id, "default/containers/c1/containers/victim", 999, 999)
+                host.add_objset("default", "0x40", "default/virtual-machines/vm1.block", 1, 1)
+                host.add_objset("default", "0x41", "default/containers/c1/virtual-machines/vm1.block", 9, 9)
+                with host.installed():
+                    mapping = lxdtop.find_zfs_datasets()
+                self.assertEqual(mapping["victim"], f"/proc/spl/kstat/zfs/default/objset-{victim_id}")
+                self.assertEqual(mapping["vm1"], "/proc/spl/kstat/zfs/default/objset-0x40")
+
+    @unittest.expectedFailure
+    def test_a_nested_dataset_cannot_claim_an_instance_without_zfs(self):
+        """SECURITY-REVIEW.md L-8, the part not fixed.
+
+        When "victim" has no ZFS dataset of its own (its disk is on a dir or
+        LVM pool, say), there is no shorter name to prefer, so c1's nested
+        dataset is still mapped to it. Telling them apart needs each pool's own
+        dataset, from LXD's storage-pool config.
+        """
         self.host.add_objset("default", "0x20", "default/containers/c1/containers/victim", 999, 999)
         with self.host.installed():
-            mapping = lxdtop.find_zfs_datasets()
-        self.assertEqual(mapping["victim"], "/proc/spl/kstat/zfs/default/objset-0x10")
-
+            self.assertNotIn("victim", lxdtop.find_zfs_datasets())
 
 if __name__ == "__main__":
     unittest.main()
