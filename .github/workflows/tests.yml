@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    name: Python ${{ matrix.python }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04        # ships Python 3.10
+            python: "3.10"
+          - os: ubuntu-24.04        # ships Python 3.12
+            python: "3.12"
+          - os: ubuntu-24.04        # the newest Python release, whatever it is today
+            python: "3.x"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+          check-latest: ${{ matrix.python == '3.x' }}
+      - run: python --version
+      - name: Unit tests (fixtures and a fake LXD, nothing from the runner)
+        run: python -m unittest -v
+      - name: One frame from the runner's real /proc and /sys (no LXD on the runner)
+        run: python lxdtop --dump --no-api --samples 2 --interval 1
+
+  shellcheck:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      - run: shellcheck --version
+      - run: shellcheck contrib/lxdtop-remote
