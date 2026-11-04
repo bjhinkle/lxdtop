@@ -176,6 +176,15 @@ class MainTest(unittest.TestCase):
         self.assertRegex(text, r"● old +stopped")
         self.assertEqual({m for m, _, _ in lxd.requests}, {"GET"})
 
+    def test_dump_when_lxd_answers_in_an_unexpected_shape(self):
+        # SECURITY-REVIEW.md L-9: main() asks LXD once before drawing, and an
+        # AttributeError from that first answer used to end lxdtop there.
+        routes = lxd_routes(**{"/1.0/instances?recursion=2&all-projects=true": (200, {"metadata": "x"})})
+        with FakeLxd(routes) as lxd, \
+                mock.patch.object(lxdtop.LxdApi, "start"), mock.patch.object(lxdtop.LxdEvents, "start"):
+            text = self.main("--dump", "--socket", lxd.path)
+        self.assertIn("lxd api error (AttributeError)", text)
+
     def test_no_api_means_no_lxd_socket_at_all(self):
         with FakeLxd(lxd_routes()) as lxd:
             self.main("--dump", "--no-api", "--socket", lxd.path)

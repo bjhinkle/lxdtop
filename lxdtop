@@ -496,7 +496,7 @@ class LxdApi:
             status = "ok"
         except PermissionError:
             instances, status = None, "no access"        # not in the lxd group
-        except (OSError, ValueError, KeyError, http.client.HTTPException) as err:
+        except Exception as err:                         # anything else: keep the last answer, show why
             instances, status = None, f"error ({type(err).__name__})"
         with self.lock:
             if instances is not None:
