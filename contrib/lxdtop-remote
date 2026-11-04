@@ -21,6 +21,7 @@
 # username, offers the last one you gave for that host, and remembers it in
 # ~/.config/lxdtop/users.
 CONF="$HOME/.config/lxdtop"
+# shellcheck source=/dev/null # the user's own settings, if any
 [ -f "$CONF/remote.conf" ] && . "$CONF/remote.conf"
 USERS="$CONF/users"
 SCREEN_VTS=${SCREEN_VTS:-"1 8"}
@@ -58,6 +59,7 @@ case "$1" in
     host=${2:-${SCREEN_HOST:-$DEFAULT_HOST}}
     [ -n "$host" ] || { echo "usage: lxdtop-remote screen <host> (or set SCREEN_HOST)" >&2; exit 2; }
     dest=$(login_for "$host") || exit 2
+    # shellcheck disable=SC2086 # split "1 8" into $1 and $2
     set -- $SCREEN_VTS
     # Needs `sudo chvt` without a password on the host.
     exec ssh -- "$dest" "if [ \"\$(cat /sys/class/tty/tty0/active)\" = tty$2 ]; then sudo -n chvt $1 && echo \"console: tty$1\"; else sudo -n chvt $2 && echo \"console: tty$2\"; fi" ;;
@@ -81,6 +83,7 @@ if [ -n "$WINDOW" ]; then
   sleep 0.2
 fi
 # Prefer the user's own ~/bin/lxdtop; otherwise use one on the host's PATH.
+# shellcheck disable=SC2016 # expanded by the shell on the host, not here
 run='p="$HOME/bin/lxdtop"; [ -x "$p" ] || p=$(command -v lxdtop) || { echo "lxdtop-remote: lxdtop is not in ~/bin or on the PATH of $(hostname)" >&2; exit 127; }; '
 # ssh hands the command to the host's shell as one string: quote each lxdtop option for it.
 args=
