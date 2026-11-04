@@ -1,0 +1,4 @@
+3005 2857 254:1 /var/snap/lxd/common/lxd/storage-pools/scratch/containers/db/rootfs / rw,relatime,idmapped shared:2100 master:1 - ext4 /dev/vda1 rw,discard,errors=remount-ro
+3006 3005 0:112 / /dev rw,relatime shared:2101 - tmpfs none rw,size=492k,mode=755,uid=1000000,gid=1000000,inode64
+3007 3005 0:113 / /proc rw,nosuid,nodev,noexec,relatime shared:2102 - proc proc rw
+3008 3005 0:114 / /sys rw,nosuid,nodev,noexec,relatime shared:2104 - sysfs sysfs rw
