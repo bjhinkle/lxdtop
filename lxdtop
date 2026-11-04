@@ -528,7 +528,10 @@ class LxdApi:
             if pool.get("driver") == "zfs":              # the dataset its volumes live in (zfs.pool_name)
                 server["zfs_roots"].append((pool.get("config") or {}).get("zfs.pool_name") or pool["name"])
             path = f"/1.0/storage-pools/{urllib.parse.quote(pool['name'])}/resources"
-            space = (self.get(path) or {}).get("space") or {}
+            try:
+                space = (self.get(path) or {}).get("space") or {}
+            except ValueError:                           # a pool LXD can't read right now: leave it out
+                continue
             if space.get("total"):
                 pools.append((pool["name"], space.get("used", 0), space["total"]))
         return server, pools
