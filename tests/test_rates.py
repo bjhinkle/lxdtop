@@ -78,6 +78,15 @@ class ProcessTableTest(unittest.TestCase):
         self.sample(10.0)
         self.assertEqual(self.table.top, {})
 
+    def test_the_first_process_of_each_container(self):
+        # Its init: the Monitor reads which dataset it has as "/" (SECURITY-REVIEW.md L-8).
+        self.host.add_process(100, "systemd", "/lxc.payload.web/init.scope", start=5000)
+        self.host.add_process(101, "nginx", "/lxc.payload.web/system.slice/nginx.service", start=7000)
+        self.host.add_process(300, "init", "/lxc.payload.dev_api/init.scope", start=9000)
+        self.host.add_process(200, "sshd", "/system.slice/ssh.service", start=10)        # the host's
+        self.sample(10.0)
+        self.assertEqual(self.table.first, {"web": 100, "dev_api": 300})
+
     def test_exec_sessions_are_found_within_30_rounds(self):
         # `lxc exec` starts its process on the host side, then moves it into the container.
         self.host.add_process(500, "bash", "/system.slice/snap.lxd.daemon.service", utime=1)
@@ -308,6 +317,25 @@ class ZfsPoolTest(unittest.TestCase):
 
     def test_without_the_api_a_nested_dataset_cannot_feed_them_either(self):
         self.assertEqual(self.db_disk_read(None), 2000.0)
+
+    def test_without_the_api_a_stopped_containers_dataset_cannot_feed_them(self):
+        # c1 is stopped (no cgroup), but a volume it made inside its dataset still has a kstat.
+        # db's first process has "/" on a dir pool, so no ZFS dataset is db's disk.
+        h = FakeHost(self)
+        h.set_basics()
+        h.copy_fixture("pid-mountinfo-container-dir.txt", "/proc/700/mountinfo")
+        with h.installed():
+            mon = lxdtop.Monitor(None, None)
+        for n in range(2):
+            h.set_cpu_times((100 + n, 0, 900), [])
+            h.add_container("db", 1000 + n, io=(1000 + 4000 * n, 0))
+            h.add_process(700, "systemd", "/lxc.payload.db/init.scope", start=100)
+            h.add_objset("default", "0x20", "default/containers/c1/containers/db", 5_000_000 * n, 0)
+            with h.installed():
+                mon.sample()
+            h.clock += 2
+        db = next(r for r in mon.rows if r["cg"] == "db")
+        self.assertEqual(db["rd"], 2000.0)                    # from io.stat, not from c1's leftover volume
 
 
 class SeriesTest(unittest.TestCase):

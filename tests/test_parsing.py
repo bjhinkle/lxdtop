@@ -334,18 +334,71 @@ class ZfsDatasetTest(unittest.TestCase):
         self.assertEqual(mapping, {"web": "/proc/spl/kstat/zfs/default/objset-0x1",
                                    "db": "/proc/spl/kstat/zfs/tank/objset-0x5"})
 
-    @unittest.expectedFailure
     def test_even_a_stopped_containers_nested_dataset_cannot_claim_an_instance(self):
-        """SECURITY-REVIEW.md L-8, the part left: a container that has stopped, without LXD's API.
+        """SECURITY-REVIEW.md L-8, a container that has stopped, without LXD's API.
 
-        Without the API, lxdtop can tell a dataset was made inside a container
-        only while that container runs. A nested dataset that still has a
-        kstat after its container stopped (a ZFS volume, say) is still mapped.
+        Without the API, lxdtop could tell a dataset was made inside a container
+        only while that container ran, so a nested dataset that kept a kstat
+        after its container stopped (a ZFS volume, say) was still mapped. Now
+        the Monitor reads which dataset each running container has as "/"
+        (root_dataset()), and find_zfs_datasets() takes that as exact: victim's
+        "/" isn't ZFS, so no dataset is its disk.
         """
         self.host.add_container("victim", 1)                  # running; c1, which made the dataset, is stopped
         self.host.add_objset("default", "0x20", "default/containers/c1/containers/victim", 999, 999)
         with self.host.installed():
-            self.assertNotIn("victim", lxdtop.find_zfs_datasets())
+            self.assertNotIn("victim", lxdtop.find_zfs_datasets(own={"victim": ""}))
+
+    def test_a_running_containers_own_root_is_its_disk(self):
+        # The shortest-name rule alone would pick other/containers/web here: it is shorter.
+        self.host.add_container("web", 1)
+        self.host.add_objset("default", "0x10", "default/containers/web", 1, 1)
+        self.host.add_objset("other", "0x11", "other/containers/web", 1, 1)
+        self.host.add_objset("default", "0x12", "default/containers/db", 1, 1)
+        with self.host.installed():
+            mapping = lxdtop.find_zfs_datasets(own={"web": "default/containers/web", "db": None})
+        self.assertEqual(mapping, {"web": "/proc/spl/kstat/zfs/default/objset-0x10",     # exact
+                                   "db": "/proc/spl/kstat/zfs/default/objset-0x12"})     # unknown: the old rules
+
+    def test_with_lxds_pools_the_mounts_are_not_needed(self):
+        self.host.add_objset("default", "0x10", "default/containers/web", 1, 1)
+        with self.host.installed():
+            self.assertEqual(lxdtop.find_zfs_datasets(["default"], own={"web": ""}),
+                             {"web": "/proc/spl/kstat/zfs/default/objset-0x10"})
+
+
+class RootDatasetTest(unittest.TestCase):
+    """root_dataset(): the ZFS dataset a process has as "/", from /proc/<pid>/mountinfo."""
+
+    def setUp(self):
+        self.host = FakeHost(self)
+
+    def test_a_container_on_zfs(self):
+        self.host.copy_fixture("pid-mountinfo-container-zfs.txt", "/proc/4242/mountinfo")
+        with self.host.installed():
+            self.assertEqual(lxdtop.root_dataset(4242), "default/containers/web")
+
+    def test_a_container_on_a_dir_pool(self):
+        self.host.copy_fixture("pid-mountinfo-container-dir.txt", "/proc/4300/mountinfo")
+        with self.host.installed():
+            self.assertEqual(lxdtop.root_dataset(4300), "")         # known: its "/" isn't ZFS
+
+    def test_a_process_that_is_gone(self):
+        with self.host.installed():
+            self.assertIsNone(lxdtop.root_dataset(4400))            # unknown
+
+    def test_the_last_mount_on_slash_wins_and_spaces_are_unescaped(self):
+        self.host.write("/proc/1/mountinfo",
+                        "20 1 0:30 / / rw - ext4 /dev/vda1 rw\n"
+                        "21 20 0:31 /rootfs / rw shared:7 - zfs tank/lxd\\040pool/containers/web rw\n"
+                        "22 21 0:32 / /proc rw - proc proc rw\n")
+        with self.host.installed():
+            self.assertEqual(lxdtop.root_dataset(1), "tank/lxd pool/containers/web")
+
+    def test_odd_lines_are_ignored(self):
+        self.host.write("/proc/1/mountinfo", "garbage\n\n20 1 0:30 / / rw -\n21 1 0:31\n")
+        with self.host.installed():
+            self.assertEqual(lxdtop.root_dataset(1), "")
 
 
 if __name__ == "__main__":

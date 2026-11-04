@@ -228,7 +228,7 @@ def read_io_stat(path):
     return rd, wr
 
 
-def find_zfs_datasets(roots=None):
+def find_zfs_datasets(roots=None, own=None):
     """Map instance names to the ZFS kstat file for their disk.
 
     ZFS keeps per-dataset totals of bytes read and written. Each container's
@@ -238,8 +238,9 @@ def find_zfs_datasets(roots=None):
     DISK R means "reads by the instance", not only reads that reached the drive.
     `roots` are the datasets LXD's ZFS pools keep their volumes in, when its API
     has said: then only a dataset directly in one of them counts. Without them,
-    a dataset inside a running container's own (made there, with zfs.delegate)
-    doesn't count.
+    `own` says which dataset each running container has as "/" ("" if it isn't
+    ZFS, None if unknown), and a dataset inside a running container's own (made
+    there, with zfs.delegate) doesn't count.
     """
     running = {os.path.basename(p)[len(CGROUP_PREFIX):] for p in glob.glob(CGROUP_GLOB)}
     mapping, lengths = {}, {}
@@ -254,10 +255,13 @@ def find_zfs_datasets(roots=None):
                 if not roots and any(a == "containers" and b in running for a, b in zip(parts, parts[1:])):
                     continue                     # inside a running container's dataset: made in there
                 instance = name[:len(name) - len(suffix)]
+                mounted = (own or {}).get(instance)
+                if not roots and mounted is not None and mounted != dataset:
+                    continue                     # not the dataset this running container has as "/"
                 if len(dataset) < lengths.get(instance, len(dataset) + 1):   # shortest wins: its own, not a nested one
                     mapping[instance], lengths[instance] = path, len(dataset)
     if roots and not mapping:
-        return find_zfs_datasets()                   # LXD's pools match nothing here: the old rule beats no counters
+        return find_zfs_datasets(None, own)          # LXD's pools match nothing here: the old rule beats no counters
     return mapping
 
 
@@ -353,6 +357,25 @@ def container_of(pid):
     return None
 
 
+def root_dataset(pid):
+    """The ZFS dataset a process has mounted as "/": "" if "/" isn't ZFS, None if unknown.
+
+    For a container's first process, that is the container's own disk. Each line
+    of /proc/<pid>/mountinfo is one mount: id, parent, device, root, mount point,
+    options, then " - ", the filesystem type and its source (for ZFS, the dataset).
+    """
+    text = read(f"/proc/{pid}/mountinfo")
+    if text is None:
+        return None
+    dataset = ""
+    for line in text.splitlines():
+        fields, _, fs = line.partition(" - ")
+        if fields.split()[4:5] == ["/"]:            # a later mount on "/" covers an earlier one
+            kind, source = (fs.split() + ["", ""])[:2]
+            dataset = source.replace("\\040", " ") if kind == "zfs" else ""   # the kernel writes a space as \040
+    return dataset
+
+
 def new_row(cg, inst, **fields):
     """One table row; fields not given stay empty until a reading fills them."""
     row = dict(cg=cg, name=inst.get("name", cg), state=inst.get("status", "Running"), live=True,
@@ -390,6 +413,7 @@ class ProcessTable:
         self.busy = {}            # pid -> CPU %, smoothed
         self.top = {}             # container -> (busiest process name, its CPU %)
         self.started = {}         # container -> start of its oldest process, ticks after boot
+        self.first = {}           # container -> its oldest process (its init), for root_dataset()
         self.last = None
         self.rounds = 0
 
@@ -404,7 +428,7 @@ class ProcessTable:
                 del self.owner[pid]
                 self.ticks.pop(pid, None)
                 self.busy.pop(pid, None)
-        top, started = {}, {}
+        top, started, first = {}, {}, {}
         for pid in alive:
             if pid not in self.owner:
                 self.owner[pid] = container_of(pid)
@@ -426,8 +450,9 @@ class ProcessTable:
             busy = self.busy.get(pid, 0.0)
             if cg not in top or busy > top[cg][1]:
                 top[cg] = (name, busy)
-            started[cg] = min(start, started.get(cg, start))
-        self.top, self.started = top, started
+            if start <= started.get(cg, start):
+                started[cg], first[cg] = start, pid
+        self.top, self.started, self.first = top, started, first
 
 
 # --- LXD's API and event stream -------------------------------------------------
@@ -675,10 +700,11 @@ class Monitor:
         instances = {}
         if self.api:
             instances, self.api_status, self.server, self.pools = self.api.snapshot()
-        if now - self.zfs_checked > 30:
-            self.zfs, self.zfs_checked = find_zfs_datasets(self.server.get("zfs_roots")), now
         uptime = float((read("/proc/uptime") or "0").split()[0])
         self.procs.sample(now)
+        if now - self.zfs_checked > 30:          # after the processes: it reads each container's first one
+            own = {cg: root_dataset(pid) for cg, pid in self.procs.first.items()}
+            self.zfs, self.zfs_checked = find_zfs_datasets(self.server.get("zfs_roots"), own), now
         self.sample_host(uptime)
         self.sample_network(now)
         self.sample_instances(now, instances, uptime)
