@@ -75,6 +75,21 @@ class RemoteTest(unittest.TestCase):
         self.assertIn(["-t", ""], run["options"])         # lxdtop needs a terminal
         self.assertEqual(self.lxdtop_ran(), ["TZ=unset", "arg=--ascii", "arg=--interval", "arg=5"])
 
+    def test_options_reach_lxdtop_exactly_as_given(self):
+        """SECURITY-REVIEW.md R-2: the host's shell used to read the options again.
+
+        ssh joins its arguments with spaces and hands them to the login shell on
+        the host, so an option with a space was split in two, and `;`, `$` or `*`
+        in one ran or expanded there.
+        """
+        marker = os.path.join(self.remote_home, "ran")
+        options = ["--socket", "/var/snap/lxd/common/lxd dir/unix.socket", "--interval", f"2;touch {marker}",
+                   "it's", "$HOME", "*", ""]
+        result = self.remote("me@lxdhost", *options)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.lxdtop_ran(), ["TZ=unset"] + [f"arg={o}" for o in options])
+        self.assertFalse(os.path.exists(marker))
+
     def test_the_clock_time_zone_setting(self):
         self.conf("REMOTE_TZ=Europe/Berlin\n")
         self.remote("me@lxdhost")

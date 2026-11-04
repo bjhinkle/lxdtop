@@ -82,7 +82,10 @@ if [ -n "$WINDOW" ]; then
 fi
 # Prefer the user's own ~/bin/lxdtop; otherwise use one on the host's PATH.
 run='p="$HOME/bin/lxdtop"; [ -x "$p" ] || p=$(command -v lxdtop) || { echo "lxdtop-remote: lxdtop is not in ~/bin or on the PATH of $(hostname)" >&2; exit 127; }; '
-ssh -t -- "$dest" "$run${REMOTE_TZ:+TZ=$REMOTE_TZ }\"\$p\"" "$@"
+# ssh hands the command to the host's shell as one string: quote each lxdtop option for it.
+args=
+for arg; do args="$args '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"; done
+ssh -t -- "$dest" "$run${REMOTE_TZ:+TZ=$REMOTE_TZ }\"\$p\"$args"
 status=$?
 [ -n "$size" ] && printf '\033[8;%s;%st' "${size% *}" "${size#* }"
 exit $status
