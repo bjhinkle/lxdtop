@@ -1515,7 +1515,10 @@ needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3."""
     if TIMEZONE:
         os.environ.setdefault("TZ", TIMEZONE)
     time.tzset()
-    locale.setlocale(locale.LC_ALL, "")
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass                               # a locale this host lacks, often LANG passed on by ssh
     if args.ascii or "utf" not in locale.getpreferredencoding(False).lower():
         G = GLYPHS_ASCII
 

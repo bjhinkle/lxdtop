@@ -3,6 +3,7 @@
 import contextlib
 import curses
 import io
+import locale
 import sys
 import types
 import unittest
@@ -152,6 +153,12 @@ class MainTest(unittest.TestCase):
     def test_a_non_utf8_terminal_gets_ascii(self):
         text = self.main("--dump", "--no-api", locale=_Locale(encoding="ANSI_X3.4-1968"))
         self.assertTrue(text.isascii())
+
+    def test_a_locale_the_host_does_not_have(self):
+        # ssh passes LANG along (SendEnv/AcceptEnv LANG LC_* are the defaults on macOS and Ubuntu), so
+        # LANG=de_DE.UTF-8 from a Mac reaches a host that may not have that locale installed.
+        text = self.main("--dump", "--no-api", locale=_Locale(error=locale.Error("unsupported locale setting")))
+        self.assertIn("┐containers┌", text)                   # still UTF-8, so still the Unicode glyphs
 
     def test_samples_take_readings_first(self):
         start = self.host.clock
