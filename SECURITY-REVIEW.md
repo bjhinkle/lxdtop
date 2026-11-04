@@ -1,6 +1,6 @@
 # Security review: lxdtop 1.4.0 and lxdtop-remote
 
-Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** The fixes in this branch move lines in `lxdtop` after 825 down by 2, and after 1516 by 5.
+Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** The fixes made since move lines in `lxdtop` after 825 down by 2, and after 1516 by 5; the L-4 and L-5 fixes change lines in place.
 
 lxdtop runs with access to LXD's socket, which is equivalent to root on the host, and it draws text that people inside containers choose. So this review asks four things: does it only read, can container-chosen text break out of its place on the terminal, can `lxdtop-remote` be made to run something it shouldn't, and what happens when the event stream is slow, closed or malformed.
 
@@ -11,8 +11,8 @@ lxdtop runs with access to LXD's socket, which is equivalent to root on the host
 | [L-1](#l-1-a-process-name-that-isnt-utf-8-ends-lxdtop) | A process name that isn't valid UTF-8 ends lxdtop | Medium | Fixed in `5eb660b` |
 | [L-2](#l-2---dump-prints-escape-sequences-from-containers-unchanged) | `--dump` prints escape sequences from containers unchanged | Medium | Fixed in `8726a25` |
 | [L-3](#l-3-in-the-live-view-r-b-and-n-move-the-cursor) | In the live view, `\r`, `\b` and `\n` in a name move the cursor, and format characters pass through | Low | Fixed in `8726a25` |
-| [L-4](#l-4-unexpected-input-ends-the-event-listener-for-good) | Unexpected input ends the event listener for good, while the panel still says "live" | Low | Not fixed |
-| [L-5](#l-5-a-null-or-non-string-event-field-crashes-lxdtop) | A `null` or non-string event field crashes lxdtop when it is drawn | Low | Not fixed |
+| [L-4](#l-4-unexpected-input-ends-the-event-listener-for-good) | Unexpected input ends the event listener for good, while the panel still says "live" | Low | Fixed in `85b8719` |
+| [L-5](#l-5-a-null-or-non-string-event-field-crashes-lxdtop) | A `null` or non-string event field crashes lxdtop when it is drawn | Low | Fixed in `a93f240` |
 | [L-6](#l-6-no-timeouts-on-the-event-socket) | No timeouts on the event socket, so a stalled LXD still looks "live" | Low | Not fixed |
 | [L-7](#l-7-interface-names-from-lxd-go-into-a-path-unchecked) | Interface names from LXD go into a `/sys` path unchecked | Low | Not fixed |
 | [L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters) | With `zfs.delegate`, a container can take over another instance's disk counters | Low | Not fixed |
@@ -24,7 +24,7 @@ Nothing reached High. One bug that isn't a security issue was also fixed: lxdtop
 
 **Severity scale.** *High*: someone could change the host, run code as the lxdtop user, or read secrets. *Medium*: an unprivileged process in any container can stop lxdtop or send control sequences to the operator's terminal. *Low*: needs an unusual setup, a non-default option, a second foothold, or input only the operator or root controls, or it only misleads the display. *Info*: no security impact.
 
-**Unfixed findings** are each pinned by a test marked `expectedFailure` that names the finding (`L-4` to `L-8`). If you fix one, its test starts passing, and unittest reports that as a failure until the marker is removed. I applied each suggested fix for L-4, L-5, L-7 and L-8 to a scratch copy: each turned only its own test into an unexpected success, and broke nothing else.
+**Unfixed findings** L-7 and L-8 are each pinned by a test marked `expectedFailure` that names the finding. If you fix one, its test starts passing, and unittest reports that as a failure until the marker is removed. I applied the suggested fixes for L-7 and L-8 to a scratch copy: each turned only its own test into an unexpected success, and broke nothing else. L-6 has no such test, since what it describes is waiting forever.
 
 **Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). CI also runs the suite on Python 3.10, 3.12 and 3.15. No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it.
 
@@ -147,31 +147,31 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 | A message that isn't JSON | `ValueError`; reconnect | reconnecting |
 | Bytes arrive slowly | Waits; sampling and drawing carry on | live |
 | Connection open but silent | Waits indefinitely ([L-6](#l-6-no-timeouts-on-the-event-socket)) | live |
-| Valid JSON that isn't an event object | The thread ends ([L-4](#l-4-unexpected-input-ends-the-event-listener-for-good)) | live, for good |
-| Frame length ≥ 2^63, or too large to allocate | The thread ends (L-4) | live, for good |
-| Deeply nested JSON | The thread ends (L-4) | live, for good |
-| `"action": null`, or a non-string name or username | lxdtop exits at the next frame drawn ([L-5](#l-5-a-null-or-non-string-event-field-crashes-lxdtop)) | — |
+| Valid JSON that isn't an event object | `AttributeError` or `TypeError`; reconnect. Before the [L-4](#l-4-unexpected-input-ends-the-event-listener-for-good) fix, the thread ended for good | reconnecting |
+| Frame length ≥ 2^63, or too large to allocate | `OverflowError` or `MemoryError`; reconnect (L-4) | reconnecting |
+| Deeply nested JSON | `RecursionError`; reconnect (L-4) | reconnecting |
+| `"action": null`, or a non-string name or username | Stored as text and drawn. Before the [L-5](#l-5-a-null-or-non-string-event-field-crashes-lxdtop) fix, lxdtop exited at the next frame drawn | live |
 | Ping payload over 125 bytes | A malformed pong, or `ValueError`; reconnect ([N-3](#n-3-websocket-protocol-details)) | reconnecting |
 
-**How confirmed.** `tests/test_events.py` covers each handled row against a scripted fake LXD: the handshake, fragments with a ping in between, 16- and 64-bit lengths, masked frames, close frames, truncation at four points, bad JSON, refused upgrades, no socket, no access, and keeping the feed across a reconnect. The unhandled rows were reproduced with a one-off probe against the same fake server, and L-4 and L-5 are pinned by expected-failure tests.
+**How confirmed.** `tests/test_events.py` covers each handled row against a scripted fake LXD: the handshake, fragments with a ping in between, 16- and 64-bit lengths, masked frames, close frames, truncation at four points, bad JSON, refused upgrades, no socket, no access, and keeping the feed across a reconnect. The L-4 and L-5 rows were reproduced with a one-off probe against the same fake server before they were fixed, and their tests now check the behaviour above.
 
 ### L-4 Unexpected input ends the event listener for good
 
-**Low. Not fixed.**
+**Low. Fixed in `85b8719`.**
 
 - **Where.** `_loop()`, line 548, catches only `(OSError, ValueError, ConnectionError)`. `_record()` assumes the event, its metadata, context and requestor are objects (593, 599–600, 608), and that `source` is a string (594). `stream.read(size)` (577) allocates the whole declared size up front.
 - **Impact.** JSON that is valid but not an event object (`[]`, `{"metadata": "x"}`, `"source": null`) raises `AttributeError` or `TypeError`. A 64-bit length ≥ 2^63 raises `OverflowError`, one of 2^40 raises `MemoryError`, and deep nesting raises `RecursionError`. None of these is caught, so the thread ends. Python prints the traceback to stderr, over the curses screen, and the panel keeps saying "live" with no more events. LXD itself always sends event objects with RFC-sized frames, so this needs another program listening on LXD's socket, and putting one there takes root.
-- **How confirmed.** One-off probe against the fake server: each input above ended `_listen()` with the exception named, outside `_loop()`'s `except`. `test_unexpected_json_shapes_reconnect` and `test_an_impossible_frame_length_reconnects` are expected failures.
-- **Smallest fix.** One line: make 548 `except Exception:`, so any failure reconnects after 5 s. Bounding the frame size (for example, refusing `size > 16 * 1024 * 1024` before line 577) would also avoid the large allocation.
+- **How confirmed.** One-off probe against the fake server: each input above ended `_listen()` with the exception named, outside `_loop()`'s `except`. `test_unexpected_json_shapes_reconnect` and `test_an_impossible_frame_length_reconnects` cover all six inputs: on `main` before the fix they failed six times, each naming the exception that ended the thread, and they pass with it. With the real thread, fed `[]` on every connection, it now stays alive and reconnects after 5 s.
+- **Smallest fix (applied).** One line: 548 is now `except Exception:`, so any failure reconnects after 5 s. Bounding the frame size (for example, refusing `size > 16 * 1024 * 1024` before line 577) would also avoid allocating a huge declared length up front. That isn't done: a length too large to allocate now just costs a reconnect, and filling a merely large one needs a peer that really sends that much.
 
 ### L-5 A null or non-string event field crashes lxdtop
 
-**Low. Not fixed.**
+**Low. Fixed in `a93f240`.**
 
 - **Where.** `_record()` stores `action`, `name` and `user` as they come (595, 608, 609). `draw_events_panel()` calls `event["action"].replace(...)` (1237), and slices and joins name and user (1242, 1244), in the main thread.
 - **Impact.** `{"metadata": {"action": null}}` is stored, then ends lxdtop with `AttributeError` when the panel is drawn. LXD's schema types these fields as strings, so this has the same precondition as L-4.
-- **How confirmed.** One-off probe: the event was recorded, then `draw_events_panel()` raised `'NoneType' object has no attribute 'replace'`. `test_a_null_action_does_not_crash_the_screen` is an expected failure.
-- **Smallest fix.** Wrap the three values in `str(... or "")` at 595, 608 and 609.
+- **How confirmed.** One-off probe: the event was recorded, then `draw_events_panel()` raised `'NoneType' object has no attribute 'replace'`. `test_a_null_action_does_not_crash_the_screen` now covers a null or numeric action, a numeric or list name, and a numeric or null username: it failed on `main` before the fix (six failures) and passes with it. End to end, `lxdtop --dump` against a fake LXD sending `{"action": null, "name": 5, ...}` exited with `AttributeError` on `main`, and draws the frame with the fix.
+- **Smallest fix (applied).** The three values are wrapped in `str(... or "")` at 595, 608 and 609, so a missing or null value is `""` and anything else is shown as text.
 
 ### L-6 No timeouts on the event socket
 
