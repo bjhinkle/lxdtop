@@ -823,6 +823,8 @@ class Canvas:
 
     def put(self, y, x, text, style="text", right=None):
         """Write text at (y, x), stopping at column `right`. Returns the column after it."""
+        if not text.isprintable():           # names from inside containers can hold escape sequences
+            text = "".join(ch if ch.isprintable() else "?" for ch in text)
         end = x + len(text)
         right = self.w if right is None else min(right, self.w)
         if 0 <= y < self.h and text and x < right:
