@@ -35,6 +35,18 @@ class _Time:
         return getattr(time, name)
 
 
+def forget_tracebacks(err):
+    """Drop the tracebacks of err and of the exceptions it was raised while handling.
+
+    They hold the frames of lxdtop's event listener, and with them the file it
+    made from its socket. That keeps the socket open after close() until the
+    garbage collector runs, and Python then warns about an unclosed socket.
+    """
+    while err is not None:
+        err.__traceback__ = None
+        err = err.__context__
+
+
 def listen(lxd, show_commands=False):
     """Run LxdEvents._listen() against a FakeLxd until the stream ends. Returns (events, error)."""
     events = lxdtop.LxdEvents(lxd.path, show_commands=show_commands)
@@ -45,19 +57,28 @@ def listen(lxd, show_commands=False):
         error = None
     except Exception as err:                # noqa: BLE001 - the test looks at which one
         error = err
+        forget_tracebacks(err)
     finally:
         sock.close()
     return events, error
 
 
 def run_loop(lxd_path, connections=1):
-    """Run LxdEvents._loop() for this many connection attempts. Returns the LxdEvents."""
+    """Run LxdEvents._loop() for this many connection attempts.
+
+    Returns the LxdEvents, with `ended` set to the exception that ended _loop()
+    itself, if any: in lxdtop, that would end the listener thread for good.
+    """
     events = lxdtop.LxdEvents(lxd_path)
+    events.ended = None
     with mock.patch.object(lxdtop, "time", _Time(sleeps=connections - 1)):
         try:
             events._loop()
         except StopLoop:
             pass
+        except Exception as err:            # noqa: BLE001 - see SECURITY-REVIEW.md L-4
+            events.ended = err
+            forget_tracebacks(err)
     return events
 
 
@@ -201,13 +222,17 @@ class LoopTest(unittest.TestCase):
         """
         for payload in (b"[]", b'{"metadata": "x"}', b'{"metadata": {"source": null}}'):
             with self.subTest(payload=payload), FakeLxd(script=[ws_frame(1, payload)]) as lxd:
-                self.assertEqual(run_loop(lxd.path).status, "reconnecting")
+                events = run_loop(lxd.path)
+                self.assertIsNone(events.ended)                # the listener is still running
+                self.assertEqual(events.status, "reconnecting")
 
     @unittest.expectedFailure
     def test_an_impossible_frame_length_reconnects(self):
         """SECURITY-REVIEW.md L-4: not fixed. A 64-bit length of 2**63 raises OverflowError."""
         with FakeLxd(script=[bytes([0x81, 127]) + (1 << 63).to_bytes(8, "big")]) as lxd:
-            self.assertEqual(run_loop(lxd.path).status, "reconnecting")
+            events = run_loop(lxd.path)
+        self.assertIsNone(events.ended)
+        self.assertEqual(events.status, "reconnecting")
 
 
 class RecordTest(unittest.TestCase):
