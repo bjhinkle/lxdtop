@@ -303,16 +303,46 @@ class ZfsDatasetTest(unittest.TestCase):
             self.assertEqual(lxdtop.find_zfs_datasets(["not/this/host"]),
                              {"web": "/proc/spl/kstat/zfs/default/objset-0x1"})
 
-    @unittest.expectedFailure
     def test_even_without_lxds_api_a_nested_dataset_cannot_claim_an_instance(self):
-        """SECURITY-REVIEW.md L-8, the part left: without LXD's API.
+        """SECURITY-REVIEW.md L-8 without LXD's API: datasets inside a running container's don't count.
 
         With --no-api, or for a user outside the lxd group, lxdtop doesn't know
-        where LXD's pools keep their datasets, so it falls back to the shortest
-        name, and an instance with no ZFS dataset of its own can still be given
-        a nested one.
+        where LXD's pools keep their datasets. It does know which containers are
+        running (their cgroups), and a container can only make datasets inside
+        its own (zfs.delegate). So a dataset whose path runs through
+        containers/<a running container>/ is nobody's disk.
         """
+        self.host.add_container("c1", 1)                      # running, with zfs.delegate
+        self.host.add_container("victim", 1)                  # running, its disk on a dir pool
         self.host.add_objset("default", "0x10", "default/containers/c1", 1, 1)
+        self.host.add_objset("default", "0x20", "default/containers/c1/containers/victim", 999, 999)
+        with self.host.installed():
+            self.assertEqual(lxdtop.find_zfs_datasets(), {"c1": "/proc/spl/kstat/zfs/default/objset-0x10"})
+
+    def test_without_lxds_api_nesting_at_any_depth_or_project_is_skipped(self):
+        for cg in ("c1", "dev_c2", "web", "db"):
+            self.host.add_container(cg, 1)
+        datasets = {"0x1": "default/containers/web",
+                    "0x2": "default/containers/c1/a/b/containers/victim",      # deeper inside c1
+                    "0x3": "default/containers/dev_c2/containers/victim2",      # c2, in project "dev"
+                    "0x4": "default/containers/c1/virtual-machines/vm1.block",  # a volume named like a VM's
+                    "0x5": "tank/containers/lxd/containers/db"}                # a pool kept under containers/lxd
+        for objset, dataset in datasets.items():
+            self.host.add_objset(dataset.split("/")[0], objset, dataset, 1, 1)
+        with self.host.installed():
+            mapping = lxdtop.find_zfs_datasets()
+        self.assertEqual(mapping, {"web": "/proc/spl/kstat/zfs/default/objset-0x1",
+                                   "db": "/proc/spl/kstat/zfs/tank/objset-0x5"})
+
+    @unittest.expectedFailure
+    def test_even_a_stopped_containers_nested_dataset_cannot_claim_an_instance(self):
+        """SECURITY-REVIEW.md L-8, the part left: a container that has stopped, without LXD's API.
+
+        Without the API, lxdtop can tell a dataset was made inside a container
+        only while that container runs. A nested dataset that still has a
+        kstat after its container stopped (a ZFS volume, say) is still mapped.
+        """
+        self.host.add_container("victim", 1)                  # running; c1, which made the dataset, is stopped
         self.host.add_objset("default", "0x20", "default/containers/c1/containers/victim", 999, 999)
         with self.host.installed():
             self.assertNotIn("victim", lxdtop.find_zfs_datasets())

@@ -278,27 +278,36 @@ def lxdtop_stat_qemu(utime, stime):
 
 
 class ZfsPoolTest(unittest.TestCase):
-    """SECURITY-REVIEW.md L-8: the Monitor passes LXD's ZFS pool datasets to find_zfs_datasets()."""
+    """SECURITY-REVIEW.md L-8: a container's nested dataset can't feed another instance's DISK columns.
 
-    def test_a_nested_dataset_cannot_feed_another_instances_disk_columns(self):
+    db's disk isn't on ZFS (it reads io.stat). With zfs.delegate, web's root
+    makes default/containers/web/containers/db, whose counters run far faster.
+    """
+
+    def db_disk_read(self, api):
         h = FakeHost(self)
         h.set_basics()
-        found = {cg: dict(name=cg, status="Running", veths=[], ipv4="", type="container", pid=0)
-                 for cg in ("web", "db")}
-        api = FakeApi(found, server=dict(version="6.9", zfs_roots=["default"]))
         with h.installed():
             mon = lxdtop.Monitor(api, None)
         for n in range(2):
             h.set_cpu_times((100 + n, 0, 900), [])
             h.add_container("web", 1000 + n)
-            h.add_container("db", 1000 + n, io=(1000 + 4000 * n, 0))          # db's disk isn't on ZFS
+            h.add_container("db", 1000 + n, io=(1000 + 4000 * n, 0))
             h.add_objset("default", "0x10", "default/containers/web", 0, 0)
-            h.add_objset("default", "0x20", "default/containers/web/containers/db", 5_000_000 * n, 0)  # made in web
+            h.add_objset("default", "0x20", "default/containers/web/containers/db", 5_000_000 * n, 0)
             with h.installed():
                 mon.sample()
             h.clock += 2
-        db = next(r for r in mon.rows if r["cg"] == "db")
-        self.assertEqual(db["rd"], 2000.0)                    # from io.stat, not from web's nested dataset
+        return next(r for r in mon.rows if r["cg"] == "db")["rd"]
+
+    def test_a_nested_dataset_cannot_feed_another_instances_disk_columns(self):
+        found = {cg: dict(name=cg, status="Running", veths=[], ipv4="", type="container", pid=0)
+                 for cg in ("web", "db")}
+        api = FakeApi(found, server=dict(version="6.9", zfs_roots=["default"]))
+        self.assertEqual(self.db_disk_read(api), 2000.0)       # from io.stat, not from web's nested dataset
+
+    def test_without_the_api_a_nested_dataset_cannot_feed_them_either(self):
+        self.assertEqual(self.db_disk_read(None), 2000.0)
 
 
 class SeriesTest(unittest.TestCase):
