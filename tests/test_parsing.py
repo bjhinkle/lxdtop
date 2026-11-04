@@ -194,6 +194,22 @@ class InstanceCountersTest(unittest.TestCase):
             self.assertIsNone(lxdtop.read_net([]))
             self.assertIsNone(lxdtop.read_net(["gone0"]))
 
+    def test_a_name_with_a_nul_is_no_reading(self):
+        with self.host.installed():
+            self.assertIsNone(lxdtop.read_net(["veth\x00x"]))
+
+    @unittest.expectedFailure
+    def test_interface_names_stay_inside_sys_class_net(self):
+        """SECURITY-REVIEW.md L-7: not fixed.
+
+        read_net() puts the host_name LXD reports into a path unchecked, so
+        "../../../srv/x" reads /srv/x/statistics/rx_bytes, and a FIFO there
+        would block the sampling loop.
+        """
+        self.host.add_nic("../../../srv/x", rx=111, tx=222)
+        with self.host.installed():
+            self.assertIsNone(lxdtop.read_net(["../../../srv/x"]))
+
 
 class ZfsDatasetTest(unittest.TestCase):
     def setUp(self):
