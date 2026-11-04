@@ -602,7 +602,8 @@ class LxdEvents:
     def _listen(self, sock):
         sock.connect(self.socket_path)
         key = base64.b64encode(os.urandom(16)).decode()
-        sock.sendall(("GET /1.0/events?type=lifecycle HTTP/1.1\r\nHost: lxd\r\n"
+        # Every project's events, as the table lists every project's instances (LXD's default is one project).
+        sock.sendall(("GET /1.0/events?type=lifecycle&all-projects=true HTTP/1.1\r\nHost: lxd\r\n"
                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                       f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
         stream = sock.makefile("rb")
@@ -639,7 +640,8 @@ class LxdEvents:
 
     def _record(self, event):
         meta = event.get("metadata") or {}
-        parts = urllib.parse.unquote(meta.get("source", "")).split("/")   # /1.0/instances/<name>/...
+        # Outside the default project, LXD adds "?project=<name>" to the source: leave it off.
+        parts = urllib.parse.unquote(meta.get("source", "").partition("?")[0]).split("/")   # /1.0/instances/<name>/...
         name = str(meta.get("name") or (parts[3] if len(parts) > 3 else ""))
         detail = ""
         if len(parts) > 5 and parts[4] == "snapshots":

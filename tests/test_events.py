@@ -6,6 +6,7 @@ import socket
 import time
 import types
 import unittest
+import urllib.parse
 from unittest import mock
 
 from tests.support import FakeLxd, lifecycle_events, lxdtop, ws_frame
@@ -88,7 +89,7 @@ class HandshakeTest(unittest.TestCase):
         with FakeLxd() as lxd:
             listen(lxd)
         ((method, target, headers),) = lxd.requests
-        self.assertEqual((method, target), ("GET", "/1.0/events?type=lifecycle"))
+        self.assertEqual((method, target), ("GET", "/1.0/events?type=lifecycle&all-projects=true"))
         self.assertEqual(headers["upgrade"], "websocket")
         self.assertEqual(headers["connection"], "Upgrade")
         self.assertEqual(headers["sec-websocket-version"], "13")
@@ -120,6 +121,29 @@ class FrameTest(unittest.TestCase):
             ("instance-started", "web", "", "bj"),
         ])
         self.assertNotIn("S3cret", repr(feed))
+
+    def test_events_from_every_project(self):
+        """SECURITY-REVIEW.md N-1: the feed used to show the default project's events only.
+
+        LXD 5.21 and 6 send only the default project's events unless asked for
+        all of them. Outside the default project, an event's source ends in
+        "?project=<name>", which belongs in neither the name nor the snapshot.
+        """
+        started = {"type": "lifecycle", "project": "dev", "metadata": {
+            "action": "instance-started", "source": "/1.0/instances/api?project=dev", "context": {},
+            "requestor": {"username": "bj"}, "name": "api", "project": "dev"}}
+        snapshot = {"type": "lifecycle", "project": "dev", "metadata": {     # snapshot events have no "name"
+            "action": "instance-snapshot-created", "source": "/1.0/instances/api/snapshots/nightly?project=dev",
+            "context": {}, "requestor": {"username": "bj"}}}
+        with FakeLxd(script=frames(started, snapshot)) as lxd:
+            events, _ = listen(lxd)
+        ((_, target, _),) = lxd.requests
+        self.assertEqual(urllib.parse.parse_qs(urllib.parse.urlsplit(target).query),
+                         {"type": ["lifecycle"], "all-projects": ["true"]})
+        self.assertEqual([(e["action"], e["name"], e["detail"]) for e in events.snapshot()[0]], [
+            ("instance-snapshot-created", "api", "nightly"),
+            ("instance-started", "api", ""),
+        ])
 
     def test_exec_commands_show_only_when_asked(self):
         with FakeLxd(script=frames(*lifecycle_events())) as lxd:
@@ -318,6 +342,11 @@ class RecordTest(unittest.TestCase):
         self.record(source="")
         self.assertEqual([(e["name"], e["detail"]) for e in self.events.feed],
                          [("", ""), ("db", ""), ("web", "snap 1")])
+
+    def test_the_project_after_the_source_is_left_off(self):
+        self.record(source="/1.0/instances/api?project=dev")
+        self.record(source="/1.0/instances/web/snapshots/snap%3F1?project=dev")   # a "?" in a name stays
+        self.assertEqual([(e["name"], e["detail"]) for e in self.events.feed], [("web", "snap?1"), ("api", "")])
 
     def test_a_name_field_wins_over_the_source(self):
         self.events._record(dict(metadata=dict(action="instance-renamed", source="/1.0/instances/new",
