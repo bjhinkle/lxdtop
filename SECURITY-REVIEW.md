@@ -24,7 +24,7 @@ Nothing reached High. One bug that isn't a security issue was also fixed: lxdtop
 
 **Severity scale.** *High*: someone could change the host, run code as the lxdtop user, or read secrets. *Medium*: an unprivileged process in any container can stop lxdtop or send control sequences to the operator's terminal. *Low*: needs an unusual setup, a non-default option, a second foothold, or input only the operator or root controls, or it only misleads the display. *Info*: no security impact.
 
-**Unfixed findings** are each pinned by a test marked `expectedFailure` that names the finding (`L-4` to `L-8`). If you fix one, its test starts passing, and unittest reports that as a failure until the marker is removed.
+**Unfixed findings** are each pinned by a test marked `expectedFailure` that names the finding (`L-4` to `L-8`). If you fix one, its test starts passing, and unittest reports that as a failure until the marker is removed. I applied each suggested fix for L-4, L-5, L-7 and L-8 to a scratch copy: each turned only its own test into an unexpected success, and broke nothing else.
 
 **Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it.
 
@@ -191,7 +191,7 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 - **Where.** `fetch_instances()` keeps each NIC's `host_name` (471–472), and `read_net()` builds `/sys/class/net/{name}/statistics/rx_bytes` from it (322–323).
 - **Impact.** For a container, LXD sets `host_name` itself. For a VM, LXD builds the reported network state from the lxd-agent inside the guest. If LXD passes a guest-chosen `host_name` through, which I couldn't verify without a daemon, a guest could point lxdtop at another interface's counters and so misreport its own traffic. It could also use `../` to read any file whose path ends in `statistics/rx_bytes`. If a second party places a FIFO at such a path (a host user, or a container whose root filesystem lxdtop can reach as root through `/proc/<pid>/root`), `open()` blocks, and the sampling loop, and with it the display, freezes. A NUL or other invalid name is harmless, because `read_int()` catches the error.
 - **How confirmed.** One-off runs against the fake host: `read_net(["../../../srv/x"])` returned the counters stored at `/srv/x/statistics/`, and `read_int()` on a FIFO at such a path was still waiting after 3 s. `test_interface_names_stay_inside_sys_class_net` is an expected failure, and `test_a_name_with_a_nul_is_no_reading` passes.
-- **Smallest fix.** At 471: `if nic.get("host_name") and "/" not in nic["host_name"]:`.
+- **Smallest fix.** Two lines at the top of `read_net()`'s loop (321): skip any name containing `/` (`if "/" in name: continue`).
 
 ### L-8 A delegated ZFS dataset can take another instance's disk counters
 
