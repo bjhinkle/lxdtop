@@ -237,13 +237,15 @@ def find_zfs_datasets():
     per-instance disk view. Reads served from ZFS's memory cache count too, so
     DISK R means "reads by the instance", not only reads that reached the drive.
     """
-    mapping = {}
+    mapping, lengths = {}, {}
     for path in glob.glob(ZFS_KSTAT_GLOB):
         dataset = (read_kstat(path, ("dataset_name",)) or {}).get("dataset_name", "")
         for marker, suffix in (("/containers/", ""), ("/virtual-machines/", ".block")):
             _, sep, name = dataset.rpartition(marker)
             if sep and name.endswith(suffix) and "/" not in name and "@" not in name:
-                mapping[name[:len(name) - len(suffix)]] = path
+                instance = name[:len(name) - len(suffix)]
+                if len(dataset) < lengths.get(instance, len(dataset) + 1):   # shortest wins: its own, not a nested one
+                    mapping[instance], lengths[instance] = path, len(dataset)
     return mapping
 
 
