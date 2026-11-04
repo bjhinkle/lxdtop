@@ -1,0 +1,24 @@
+{
+  "type": "sync",
+  "status": "Success",
+  "status_code": 200,
+  "metadata": {
+    "api_version": "1.0",
+    "auth": "trusted",
+    "environment": {
+      "architectures": ["x86_64", "i686"],
+      "driver": "lxc | qemu",
+      "driver_version": "6.0.4 | 8.2.2",
+      "firewall": "nftables",
+      "kernel": "Linux",
+      "kernel_architecture": "x86_64",
+      "kernel_version": "6.8.0-45-generic",
+      "os_name": "Ubuntu",
+      "os_version": "24.04",
+      "server": "lxd",
+      "server_name": "lxdhost",
+      "server_version": "6.9",
+      "storage": "zfs"
+    }
+  }
+}

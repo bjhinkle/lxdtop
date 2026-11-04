@@ -172,7 +172,7 @@ def read(path):
     if not path:
         return None
     try:
-        with open(path) as f:
+        with open(path, errors="backslashreplace") as f:    # process names can be any bytes
             return f.read()
     except OSError:
         return None
@@ -823,6 +823,8 @@ class Canvas:
 
     def put(self, y, x, text, style="text", right=None):
         """Write text at (y, x), stopping at column `right`. Returns the column after it."""
+        if not text.isprintable():           # names from inside containers can hold escape sequences
+            text = "".join(ch if ch.isprintable() else "?" for ch in text)
         end = x + len(text)
         right = self.w if right is None else min(right, self.w)
         if 0 <= y < self.h and text and x < right:
@@ -1513,7 +1515,10 @@ needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3."""
     if TIMEZONE:
         os.environ.setdefault("TZ", TIMEZONE)
     time.tzset()
-    locale.setlocale(locale.LC_ALL, "")
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass                               # a locale this host lacks, often LANG passed on by ssh
     if args.ascii or "utf" not in locale.getpreferredencoding(False).lower():
         G = GLYPHS_ASCII
 

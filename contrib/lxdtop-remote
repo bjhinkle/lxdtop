@@ -21,6 +21,7 @@
 # username, offers the last one you gave for that host, and remembers it in
 # ~/.config/lxdtop/users.
 CONF="$HOME/.config/lxdtop"
+# shellcheck source=/dev/null # the user's own settings, if any
 [ -f "$CONF/remote.conf" ] && . "$CONF/remote.conf"
 USERS="$CONF/users"
 SCREEN_VTS=${SCREEN_VTS:-"1 8"}
@@ -38,9 +39,9 @@ login_for() {
   case "$1" in *@*) echo "$1"; return 0 ;; esac
   # If ~/.ssh/config already gives this name a username or turns it into another
   # address, ssh knows how to log in there: use the name as it is.
-  user=$(ssh -G "$1" 2>/dev/null | awk '$1 == "user" {print $2}')
+  user=$(ssh -G -- "$1" 2>/dev/null | awk '$1 == "user" {print $2}')
   default=$(ssh -G lxdtop-unconfigured.invalid 2>/dev/null | awk '$1 == "user" {print $2}')
-  real=$(ssh -G "$1" 2>/dev/null | awk '$1 == "hostname" {print tolower($2)}')
+  real=$(ssh -G -- "$1" 2>/dev/null | awk '$1 == "hostname" {print tolower($2)}')
   given=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
   if [ "$user" != "$default" ] || [ "$real" != "$given" ]; then echo "$1"; return 0; fi
   last=$(awk -v h="$1" '$1 == h {u = $2} END {print u}' "$USERS" 2>/dev/null)
@@ -58,16 +59,17 @@ case "$1" in
     host=${2:-${SCREEN_HOST:-$DEFAULT_HOST}}
     [ -n "$host" ] || { echo "usage: lxdtop-remote screen <host> (or set SCREEN_HOST)" >&2; exit 2; }
     dest=$(login_for "$host") || exit 2
+    # shellcheck disable=SC2086 # split "1 8" into $1 and $2
     set -- $SCREEN_VTS
     # Needs `sudo chvt` without a password on the host.
-    exec ssh "$dest" "if [ \"\$(cat /sys/class/tty/tty0/active)\" = tty$2 ]; then sudo -n chvt $1 && echo \"console: tty$1\"; else sudo -n chvt $2 && echo \"console: tty$2\"; fi" ;;
+    exec ssh -- "$dest" "if [ \"\$(cat /sys/class/tty/tty0/active)\" = tty$2 ]; then sudo -n chvt $1 && echo \"console: tty$1\"; else sudo -n chvt $2 && echo \"console: tty$2\"; fi" ;;
   install)
     [ -n "$2" ] || { echo "usage: lxdtop-remote install <host>" >&2; exit 2; }
     [ -f "$LXDTOP" ] || { echo "lxdtop-remote: can't find $LXDTOP" >&2; exit 1; }
     dest=$(login_for "$2") || exit 2
     echo "copying $LXDTOP to $dest:~/bin/lxdtop"
     # One connection, so one login: make ~/bin, write the file, make it runnable, show its version.
-    ssh "$dest" 'mkdir -p ~/bin && cat > ~/bin/lxdtop && chmod 755 ~/bin/lxdtop && ~/bin/lxdtop --version' < "$LXDTOP"
+    ssh -- "$dest" 'mkdir -p ~/bin && cat > ~/bin/lxdtop && chmod 755 ~/bin/lxdtop && ~/bin/lxdtop --version' < "$LXDTOP"
     exit $? ;;
   ""|-*) host=$DEFAULT_HOST ;;
   *) host=$1; shift ;;
@@ -81,8 +83,12 @@ if [ -n "$WINDOW" ]; then
   sleep 0.2
 fi
 # Prefer the user's own ~/bin/lxdtop; otherwise use one on the host's PATH.
+# shellcheck disable=SC2016 # expanded by the shell on the host, not here
 run='p="$HOME/bin/lxdtop"; [ -x "$p" ] || p=$(command -v lxdtop) || { echo "lxdtop-remote: lxdtop is not in ~/bin or on the PATH of $(hostname)" >&2; exit 127; }; '
-ssh -t "$dest" "$run${REMOTE_TZ:+TZ=$REMOTE_TZ }\"\$p\"" "$@"
+# ssh hands the command to the host's shell as one string: quote each lxdtop option for it.
+args=
+for arg; do args="$args '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"; done
+ssh -t -- "$dest" "$run${REMOTE_TZ:+TZ=$REMOTE_TZ }\"\$p\"$args"
 status=$?
 [ -n "$size" ] && printf '\033[8;%s;%st' "${size% *}" "${size#* }"
 exit $status

@@ -1,0 +1,12 @@
+Name:	qemu-system-x86
+Umask:	0027
+State:	S (sleeping)
+Tgid:	5151
+Pid:	5151
+PPid:	1
+VmPeak:	 6291456 kB
+VmSize:	 6291456 kB
+VmHWM:	 2101248 kB
+VmRSS:	 2097152 kB
+RssAnon:	 2088960 kB
+Threads:	9
