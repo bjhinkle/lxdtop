@@ -267,18 +267,56 @@ class ZfsDatasetTest(unittest.TestCase):
                 self.assertEqual(mapping["victim"], f"/proc/spl/kstat/zfs/default/objset-{victim_id}")
                 self.assertEqual(mapping["vm1"], "/proc/spl/kstat/zfs/default/objset-0x40")
 
-    @unittest.expectedFailure
     def test_a_nested_dataset_cannot_claim_an_instance_without_zfs(self):
-        """SECURITY-REVIEW.md L-8, the part not fixed.
+        """SECURITY-REVIEW.md L-8: with LXD's pools known, only datasets directly in them count.
 
         When "victim" has no ZFS dataset of its own (its disk is on a dir or
         LVM pool, say), there is no shorter name to prefer, so c1's nested
-        dataset is still mapped to it. Telling them apart needs each pool's own
-        dataset, from LXD's storage-pool config.
+        dataset used to be mapped to it. LXD's API says where each ZFS pool
+        keeps its datasets (zfs.pool_name), and the nested one isn't directly
+        in a pool.
         """
+        self.host.add_objset("default", "0x10", "default/containers/c1", 1, 1)
+        self.host.add_objset("default", "0x20", "default/containers/c1/containers/victim", 999, 999)
+        with self.host.installed():
+            mapping = lxdtop.find_zfs_datasets(["default"])
+        self.assertEqual(mapping, {"c1": "/proc/spl/kstat/zfs/default/objset-0x10"})
+
+    def test_with_lxds_pools_only_datasets_directly_in_them_count(self):
+        datasets = {"0x1": "default/containers/web", "0x2": "default/virtual-machines/vm1.block",
+                    "0x3": "tank/containers/lxd/containers/db",       # a pool kept in a dataset with /containers/ in it
+                    "0x4": "default/containers/web/containers/db",    # made inside web, with zfs.delegate
+                    "0x5": "default/containers/web/virtual-machines/vm1.block",
+                    "0x6": "other/containers/api"}                    # not one of LXD's pools
+        for objset, dataset in datasets.items():
+            self.host.add_objset(dataset.split("/")[0], objset, dataset, 1, 1)
+        with self.host.installed():
+            mapping = lxdtop.find_zfs_datasets(["default", "tank/containers/lxd"])
+        self.assertEqual(mapping, {"web": "/proc/spl/kstat/zfs/default/objset-0x1",
+                                   "vm1": "/proc/spl/kstat/zfs/default/objset-0x2",
+                                   "db": "/proc/spl/kstat/zfs/tank/objset-0x3"})
+
+    def test_when_lxds_pools_match_nothing_the_shortest_name_rule_stays(self):
+        # If what LXD reports matches none of this host's datasets, keep the counters rather than show none.
+        self.host.add_objset("default", "0x1", "default/containers/web", 1, 1)
+        with self.host.installed():
+            self.assertEqual(lxdtop.find_zfs_datasets(["not/this/host"]),
+                             {"web": "/proc/spl/kstat/zfs/default/objset-0x1"})
+
+    @unittest.expectedFailure
+    def test_even_without_lxds_api_a_nested_dataset_cannot_claim_an_instance(self):
+        """SECURITY-REVIEW.md L-8, the part left: without LXD's API.
+
+        With --no-api, or for a user outside the lxd group, lxdtop doesn't know
+        where LXD's pools keep their datasets, so it falls back to the shortest
+        name, and an instance with no ZFS dataset of its own can still be given
+        a nested one.
+        """
+        self.host.add_objset("default", "0x10", "default/containers/c1", 1, 1)
         self.host.add_objset("default", "0x20", "default/containers/c1/containers/victim", 999, 999)
         with self.host.installed():
             self.assertNotIn("victim", lxdtop.find_zfs_datasets())
+
 
 if __name__ == "__main__":
     unittest.main()

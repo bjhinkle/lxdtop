@@ -3,7 +3,7 @@
   "status": "Success",
   "status_code": 200,
   "metadata": [
-    {"name": "default", "driver": "zfs", "status": "Created", "config": {"source": "default"}},
+    {"name": "default", "driver": "zfs", "status": "Created", "config": {"source": "default", "zfs.pool_name": "default"}},
     {"name": "scratch", "driver": "dir", "status": "Created", "config": {"source": "/var/lib/scratch"}}
   ]
 }

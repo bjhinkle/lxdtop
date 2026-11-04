@@ -30,7 +30,8 @@ class FetchTest(unittest.TestCase):
                         type="virtual-machine", pid=5151),
             "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0),
         })
-        self.assertEqual(server, dict(version="6.9", kernel="6.8.0-45-generic", os="Ubuntu 24.04"))
+        self.assertEqual(server, dict(version="6.9", kernel="6.8.0-45-generic", os="Ubuntu 24.04",
+                                      zfs_roots=["default"]))          # where the ZFS pool keeps its datasets
         self.assertEqual(pools, [("default", 128849018880, 966367641600)])   # "scratch" reports no size
 
     def test_only_get_requests_to_these_paths(self):
@@ -50,6 +51,18 @@ class FetchTest(unittest.TestCase):
                 api.fetch()
                 counts.append(sum(1 for _, target, _ in lxd.requests if target == "/1.0"))
         self.assertEqual(counts, [1, 1, 1, 1, 2])
+
+    def test_where_each_zfs_pool_keeps_its_datasets(self):
+        routes = lxd_routes()
+        routes["/1.0/storage-pools?recursion=1"] = (200, {"metadata": [
+            {"name": "default", "driver": "zfs", "config": {"source": "tank/lxd", "zfs.pool_name": "tank/lxd"}},
+            {"name": "fast", "driver": "zfs", "config": {}},            # LXD's default: the pool's own name
+            {"name": "scratch", "driver": "dir", "config": {"source": "/var/lib/scratch"}}]})
+        routes["/1.0/storage-pools/fast/resources"] = routes["/1.0/storage-pools/default/resources"]
+        with FakeLxd(routes) as lxd:
+            api = lxdtop.LxdApi(lxd.path)
+            api.fetch()
+        self.assertEqual(api.snapshot()[2]["zfs_roots"], ["tank/lxd", "fast"])
 
     def test_pool_names_are_quoted_in_the_path(self):
         routes = lxd_routes()

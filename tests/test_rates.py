@@ -105,12 +105,13 @@ def instances():
 
 
 class FakeApi:
-    def __init__(self, found):
+    def __init__(self, found, server=None):
         self.found = found
+        self.server = server or dict(version="6.9")
         self.wake = threading.Event()
 
     def snapshot(self):
-        return dict(self.found), "ok", dict(version="6.9"), [("default", 1, 2)]
+        return dict(self.found), "ok", dict(self.server), [("default", 1, 2)]
 
 
 class MonitorTest(unittest.TestCase):
@@ -274,6 +275,30 @@ class MonitorTest(unittest.TestCase):
 def lxdtop_stat_qemu(utime, stime):
     from tests.support import pid_stat
     return pid_stat(5151, "qemu-system-x86", utime=utime, stime=stime, start=1234500)
+
+
+class ZfsPoolTest(unittest.TestCase):
+    """SECURITY-REVIEW.md L-8: the Monitor passes LXD's ZFS pool datasets to find_zfs_datasets()."""
+
+    def test_a_nested_dataset_cannot_feed_another_instances_disk_columns(self):
+        h = FakeHost(self)
+        h.set_basics()
+        found = {cg: dict(name=cg, status="Running", veths=[], ipv4="", type="container", pid=0)
+                 for cg in ("web", "db")}
+        api = FakeApi(found, server=dict(version="6.9", zfs_roots=["default"]))
+        with h.installed():
+            mon = lxdtop.Monitor(api, None)
+        for n in range(2):
+            h.set_cpu_times((100 + n, 0, 900), [])
+            h.add_container("web", 1000 + n)
+            h.add_container("db", 1000 + n, io=(1000 + 4000 * n, 0))          # db's disk isn't on ZFS
+            h.add_objset("default", "0x10", "default/containers/web", 0, 0)
+            h.add_objset("default", "0x20", "default/containers/web/containers/db", 5_000_000 * n, 0)  # made in web
+            with h.installed():
+                mon.sample()
+            h.clock += 2
+        db = next(r for r in mon.rows if r["cg"] == "db")
+        self.assertEqual(db["rd"], 2000.0)                    # from io.stat, not from web's nested dataset
 
 
 class SeriesTest(unittest.TestCase):
