@@ -1,6 +1,6 @@
 # Security review: lxdtop 1.4.0 and lxdtop-remote
 
-Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** Fixes made since then have moved later lines in `lxdtop` down by up to 11, and each finding also names its function.
+Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** Fixes made since then have moved later lines in `lxdtop` down by up to 19, and each finding also names its function.
 
 lxdtop runs with access to LXD's socket, which is equivalent to root on the host, and it draws text that people inside containers choose. So this review asks four things: does it only read, can container-chosen text break out of its place on the terminal, can `lxdtop-remote` be made to run something it shouldn't, and what happens when the event stream is slow, closed or malformed.
 
@@ -15,7 +15,7 @@ lxdtop runs with access to LXD's socket, which is equivalent to root on the host
 | [L-5](#l-5-a-null-or-non-string-event-field-crashes-lxdtop) | A `null` or non-string event field crashes lxdtop when it is drawn | Low | Fixed in `a93f240` |
 | [L-6](#l-6-no-timeouts-on-the-event-socket) | No timeouts on the event socket, so a stalled LXD still looks "live" | Low | Fixed in `a057527` |
 | [L-7](#l-7-interface-names-from-lxd-go-into-a-path-unchecked) | Interface names from LXD go into a `/sys` path unchecked | Low | Fixed in `c9c129a` |
-| [L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters) | With `zfs.delegate`, a container can take over another instance's disk counters | Low | Fixed in `fe566a4`, one case left |
+| [L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters) | With `zfs.delegate`, a container can take over another instance's disk counters | Low | Fixed in `fe566a4` and `6bd38d7`; one case left without LXD's API |
 | [L-9](#l-9-unexpected-json-from-the-api-stops-lxdtop-or-its-refreshes) | Unexpected JSON from the API ends lxdtop at startup, or stops its refreshes while the footer says "ok" | Low | Fixed in `daa158d` |
 | [R-1](#r-1-a-host-or-username-starting-with---is-read-by-ssh-as-an-option) | `lxdtop-remote`: a host or username starting with `-` is read by ssh as an option | Low | Fixed in `6f8420c` |
 | [R-2](#r-2-lxdtop-options-are-parsed-again-by-the-hosts-shell) | `lxdtop-remote`: lxdtop options are parsed again by the host's shell | Low | Fixed in `12e82db` |
@@ -25,7 +25,7 @@ Nothing reached High. One bug that isn't a security issue was also fixed: lxdtop
 
 **Severity scale.** *High*: someone could change the host, run code as the lxdtop user, or read secrets. *Medium*: an unprivileged process in any container can stop lxdtop or send control sequences to the operator's terminal. *Low*: needs an unusual setup, a non-default option, a second foothold, or input only the operator or root controls, or it only misleads the display. *Info*: no security impact.
 
-**What's left.** One case of L-8, an instance with no ZFS dataset of its own, is pinned by a test marked `expectedFailure`, `test_a_nested_dataset_cannot_claim_an_instance_without_zfs`. If you fix it, the test starts passing, and unittest reports that as a failure until the marker is removed.
+**What's left.** One case of L-8 remains when lxdtop runs without LXD's API: an instance with no ZFS dataset of its own can still be given a nested one. It's pinned by a test marked `expectedFailure`, `test_even_without_lxds_api_a_nested_dataset_cannot_claim_an_instance`. If you fix it, the test starts passing, and unittest reports that as a failure until the marker is removed.
 
 **Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). CI also runs the suite on Python 3.10, 3.12 and 3.15. No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it.
 
@@ -196,13 +196,13 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 
 ### L-8 A delegated ZFS dataset can take another instance's disk counters
 
-**Low. Fixed in `fe566a4`, except one case.**
+**Low. Fixed in `fe566a4` and `6bd38d7`, except without LXD's API.**
 
 - **Where.** `find_zfs_datasets()`, line 243, maps a dataset to an instance by the text after the **last** `/containers/`.
 - **Impact.** With `zfs.delegate` (off by default), a container's root can create `default/containers/c1/containers/victim`. That dataset maps to `victim` and can replace victim's DISK R and DISK W with numbers c1 chooses. Which one wins depends on the order glob returns the kstat files in. Misleading display only.
-- **How confirmed.** `test_a_delegated_child_dataset_cannot_claim_another_instance`, with fixture kstat files, now tries both orders and a VM. It fails on `main` before the fix, because the nested dataset read last won, and passes with it.
-- **Smallest fix (applied).** For each instance, keep the dataset with the shortest name, since an instance's own dataset is always shorter than one nested inside another instance's. It's three lines. Using `partition()` instead of `rpartition()` would also work, but breaks pools whose source dataset contains `/containers/`.
-- **What's left.** When the instance has no ZFS dataset of its own (its disk is on a dir or LVM pool), there is no shorter name to prefer. A nested dataset named after it still maps to it, and its DISK columns show c1's numbers. Closing that needs each pool's own dataset from LXD's storage-pool config, so that only datasets directly under it count. `test_a_nested_dataset_cannot_claim_an_instance_without_zfs` is an expected failure for it.
+- **How confirmed.** `test_a_delegated_child_dataset_cannot_claim_another_instance`, with fixture kstat files, now tries both orders and a VM. It fails before `fe566a4`, because the nested dataset read last won, and passes with it. For the case of an instance with no ZFS dataset, `test_a_nested_dataset_cannot_claim_an_instance_without_zfs` and `test_with_lxds_pools_only_datasets_directly_in_them_count` fail before `6bd38d7`, as do `test_where_each_zfs_pool_keeps_its_datasets` and the end-to-end `test_a_nested_dataset_cannot_feed_another_instances_disk_columns`. In that last one, an instance on io.stat showed 2,500,000 B/s read from a nested dataset instead of its own 2,000 B/s.
+- **Fix (applied, in two steps).** `fe566a4`: for each instance, keep the dataset with the shortest name, since an instance's own dataset is always shorter than one nested inside another instance's. It's three lines. `6bd38d7`: `fetch_server()` already reads every storage pool, and now records where each ZFS pool keeps its volumes: `zfs.pool_name` in the pool's config, which defaults to the pool's name. `find_zfs_datasets()` then counts a dataset only when it sits directly in one of those. That excludes datasets nested in a container and datasets outside LXD's pools, and still works for a pool whose dataset has `/containers/` in its path, which `partition()` would have broken. If what LXD reports matches none of this host's datasets, the shortest-name rule stays rather than blank the DISK columns. That can't reopen the gap: a nested dataset lives under a container's own dataset, which matches whenever the roots are right.
+- **What's left.** Without LXD's API (`--no-api`, or a user outside the `lxd` group), lxdtop can't know where the pools keep their datasets, so the shortest-name rule is all it has. There, an instance with no ZFS dataset of its own can still be given a nested one, and `test_even_without_lxds_api_a_nested_dataset_cannot_claim_an_instance` is an expected failure for it. Please also check once on a real host: `lxc storage show <pool>` should list `zfs.pool_name` as the dataset holding the pool's `containers/` and `virtual-machines/`, and DISK R and DISK W should still show for instances on it.
 
 ### L-9 Unexpected JSON from the API stops lxdtop or its refreshes
 
@@ -252,7 +252,7 @@ None of these matters with LXD, which follows RFC 6455. A pong for a ping payloa
 
 ## Limits
 
-- **No real LXD.** No LXD daemon was available. LXD's naming rules, its default-project behaviour for events (N-1), and how much of a VM's state its agent controls (L-7) come from LXD's documentation, and are marked where unverified.
+- **No real LXD.** No LXD daemon was available. LXD's naming rules, its default-project behaviour for events (N-1), how much of a VM's state its agent controls (L-7), and that `zfs.pool_name` names the dataset a ZFS pool's volumes live in (L-8) come from LXD's documentation, and are marked where unverified.
 - **One ncurses version.** curses behaviour was checked with ncurses 6.5 (Ubuntu 24.04). Since the fix, control characters are replaced before curses sees them, so other versions no longer matter for L-3.
 - **One OpenSSH version.** R-1 was checked with OpenSSH 9.6p1. Older clients were modelled with `tests/fake_ssh.py`, not run.
 - **No terminal emulators.** What an escape sequence can do depends on the terminal, and none was tested. The fix removes them whatever the terminal.
