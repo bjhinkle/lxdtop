@@ -198,17 +198,19 @@ class InstanceCountersTest(unittest.TestCase):
         with self.host.installed():
             self.assertIsNone(lxdtop.read_net(["veth\x00x"]))
 
-    @unittest.expectedFailure
     def test_interface_names_stay_inside_sys_class_net(self):
-        """SECURITY-REVIEW.md L-7: not fixed.
+        """SECURITY-REVIEW.md L-7: a name with "/" in it used to read outside /sys/class/net.
 
-        read_net() puts the host_name LXD reports into a path unchecked, so
-        "../../../srv/x" reads /srv/x/statistics/rx_bytes, and a FIFO there
-        would block the sampling loop.
+        read_net() put the host_name LXD reports into the path unchecked, so
+        "../../../srv/x" read /srv/x/statistics/rx_bytes, and a FIFO there
+        would have blocked the sampling loop. No interface name contains "/".
         """
         self.host.add_nic("../../../srv/x", rx=111, tx=222)
+        self.host.add_nic("veth22220000", rx=100, tx=2000)
         with self.host.installed():
             self.assertIsNone(lxdtop.read_net(["../../../srv/x"]))
+            self.assertEqual(lxdtop.read_net(["../../../srv/x", "veth22220000"]), (2000, 100))
+            self.assertIsNone(lxdtop.read_net([5]))              # not text: no reading, and no error
 
 
 class ZfsDatasetTest(unittest.TestCase):

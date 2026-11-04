@@ -320,6 +320,8 @@ def read_net(host_ends):
     """
     net = None
     for name in host_ends:
+        if "/" in str(name):
+            continue                                 # not an interface name: never leave /sys/class/net
         host_rx = read_int(f"/sys/class/net/{name}/statistics/rx_bytes")
         host_tx = read_int(f"/sys/class/net/{name}/statistics/tx_bytes")
         if host_rx is not None and host_tx is not None:
