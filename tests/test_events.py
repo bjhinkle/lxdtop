@@ -211,28 +211,30 @@ class LoopTest(unittest.TestCase):
         # The same event on each connection: one line, counted twice.
         self.assertEqual([(e["action"], e["count"]) for e in events.feed], [("instance-started", 2)])
 
-    @unittest.expectedFailure
     def test_unexpected_json_shapes_reconnect(self):
-        """SECURITY-REVIEW.md L-4: not fixed.
+        """SECURITY-REVIEW.md L-4: these used to end the listener thread for good.
 
-        Valid JSON that isn't an event object raises AttributeError or
-        TypeError, which _loop() doesn't catch: the listener thread ends for
-        good and the panel keeps saying "live". LXD itself always sends
-        objects, so this needs something other than LXD on the socket.
+        Valid JSON that isn't an event object raised AttributeError or
+        TypeError, and deeply nested JSON RecursionError. _loop() caught none
+        of them, so the panel kept saying "live" and no more events came. LXD
+        itself always sends event objects, so this needs something other than
+        LXD on the socket.
         """
-        for payload in (b"[]", b'{"metadata": "x"}', b'{"metadata": {"source": null}}'):
-            with self.subTest(payload=payload), FakeLxd(script=[ws_frame(1, payload)]) as lxd:
+        for payload in (b"[]", b'{"metadata": "x"}', b'{"metadata": {"source": null}}',
+                        b"[" * 100000 + b"]" * 100000):
+            with self.subTest(payload=payload[:30]), FakeLxd(script=[ws_frame(1, payload)]) as lxd:
                 events = run_loop(lxd.path)
                 self.assertIsNone(events.ended)                # the listener is still running
                 self.assertEqual(events.status, "reconnecting")
 
-    @unittest.expectedFailure
     def test_an_impossible_frame_length_reconnects(self):
-        """SECURITY-REVIEW.md L-4: not fixed. A 64-bit length of 2**63 raises OverflowError."""
-        with FakeLxd(script=[bytes([0x81, 127]) + (1 << 63).to_bytes(8, "big")]) as lxd:
-            events = run_loop(lxd.path)
-        self.assertIsNone(events.ended)
-        self.assertEqual(events.status, "reconnecting")
+        """SECURITY-REVIEW.md L-4: a length of 2**63 raised OverflowError, and 2**40 MemoryError."""
+        for length in (1 << 63, 1 << 40):
+            with self.subTest(length=length), \
+                    FakeLxd(script=[bytes([0x81, 127]) + length.to_bytes(8, "big")]) as lxd:
+                events = run_loop(lxd.path)
+                self.assertIsNone(events.ended)
+                self.assertEqual(events.status, "reconnecting")
 
 
 class RecordTest(unittest.TestCase):
@@ -294,18 +296,28 @@ class RecordTest(unittest.TestCase):
         self.events._record({})
         self.assertEqual(self.events.feed[0]["action"], "")
 
-    @unittest.expectedFailure
     def test_a_null_action_does_not_crash_the_screen(self):
-        """SECURITY-REVIEW.md L-5: not fixed.
+        """SECURITY-REVIEW.md L-5: odd values here used to end lxdtop.
 
-        "action": null is stored as None, and draw_events_panel() then calls
-        None.replace() in the main thread, which ends lxdtop. LXD always
-        sends a string here.
+        _record() stored action, name and username as they came, and
+        draw_events_panel() then called None.replace(), sliced a number or
+        joined one, in the main thread. LXD always sends strings here, so
+        this needs something other than LXD on the socket.
         """
-        self.events._record(dict(metadata=dict(action=None, source="/1.0/instances/web")))
-        mon = types.SimpleNamespace(events=self.events)
-        lxdtop.draw_events_panel(lxdtop.TextCanvas(14, 54), 0, 0, 14, 54, mon)
-
+        cases = {"action null": dict(action=None), "action a number": dict(action=5),
+                 "name a number": dict(name=5), "name a list": dict(name=["web"]),
+                 "username a number": dict(requestor=dict(username=7)),
+                 "username null": dict(requestor=dict(username=None))}
+        for label, fields in cases.items():
+            with self.subTest(label):
+                events = lxdtop.LxdEvents("/unused")
+                events._record(dict(metadata=dict(dict(action="instance-exec", source="/1.0/instances/web"),
+                                                  **fields)))
+                entry = events.feed[0]
+                for key in ("action", "name", "detail", "user"):
+                    self.assertIsInstance(entry[key], str, key)
+                lxdtop.draw_events_panel(lxdtop.TextCanvas(14, 54), 0, 0, 14, 54,
+                                         types.SimpleNamespace(events=events))
 
 if __name__ == "__main__":
     unittest.main()

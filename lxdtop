@@ -496,7 +496,7 @@ class LxdApi:
             status = "ok"
         except PermissionError:
             instances, status = None, "no access"        # not in the lxd group
-        except (OSError, ValueError, KeyError, http.client.HTTPException) as err:
+        except Exception as err:                         # anything else: keep the last answer, show why
             instances, status = None, f"error ({type(err).__name__})"
         with self.lock:
             if instances is not None:
@@ -545,7 +545,7 @@ class LxdEvents:
                 self._listen(sock)
             except PermissionError:
                 self.status = "no access"
-            except (OSError, ValueError, ConnectionError):
+            except Exception:                        # whatever went wrong, try again in 5 seconds
                 self.status = "reconnecting"
             finally:
                 sock.close()
@@ -592,7 +592,7 @@ class LxdEvents:
     def _record(self, event):
         meta = event.get("metadata") or {}
         parts = urllib.parse.unquote(meta.get("source", "")).split("/")   # /1.0/instances/<name>/...
-        name = meta.get("name") or (parts[3] if len(parts) > 3 else "")
+        name = str(meta.get("name") or (parts[3] if len(parts) > 3 else ""))
         detail = ""
         if len(parts) > 5 and parts[4] == "snapshots":
             name, detail = parts[3], parts[5]
@@ -605,8 +605,8 @@ class LxdEvents:
                 detail = " ".join(command)
             else:
                 detail = str(context.get("path") or "")
-        user = (meta.get("requestor") or {}).get("username", "")
-        action, now = meta.get("action", ""), time.time()
+        user = str((meta.get("requestor") or {}).get("username") or "")
+        action, now = str(meta.get("action") or ""), time.time()      # as text, so odd values can't crash the screen
         key = (action, name, detail, user)
         with self.lock:
             # Something that repeats (a monitoring script running `lxc exec` every

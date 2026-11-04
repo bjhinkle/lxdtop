@@ -83,6 +83,29 @@ class FailureTest(unittest.TestCase):
         api = self.fetch(lxd_routes(**{INSTANCES: (200, b"<html>bad gateway</html>")}))
         self.assertEqual(api.snapshot()[1], "error (JSONDecodeError)")
 
+    def test_a_reply_in_an_unexpected_shape(self):
+        """SECURITY-REVIEW.md L-9: JSON in a shape LXD never sends used to escape fetch().
+
+        fetch() caught only OSError, ValueError, KeyError and HTTPException,
+        so an AttributeError or TypeError got out: at startup it ended
+        lxdtop, and in the background thread it ended the refreshes for good.
+        """
+        cases = {"metadata a string": ({"metadata": "x"}, "AttributeError"),
+                 "an instance that is a string": ({"metadata": ["x"]}, "AttributeError"),
+                 "state a string": ({"metadata": [{"name": "web", "state": "Running"}]}, "AttributeError"),
+                 "network a list": ({"metadata": [{"name": "web", "state": {"network": ["eth0"]}}]},
+                                    "AttributeError"),
+                 "a name that is a list": ({"metadata": [{"name": ["web"]}]}, "TypeError")}
+        for label, (body, error) in cases.items():
+            with self.subTest(label), FakeLxd(lxd_routes()) as lxd:
+                api = lxdtop.LxdApi(lxd.path)
+                api.fetch()                                     # a good answer first
+                lxd.routes[INSTANCES] = (200, body)
+                api.fetch()
+                found, status, _, _ = api.snapshot()
+                self.assertEqual(status, f"error ({error})")
+                self.assertIn("web", found)                     # the last good answer is kept
+
     def test_an_instance_without_a_name(self):
         api = self.fetch(lxd_routes(**{INSTANCES: (200, {"metadata": [{"status": "Running"}]})}))
         self.assertEqual(api.snapshot()[1], "error (KeyError)")
