@@ -57,6 +57,7 @@ ZFS_ARCSTATS = "/proc/spl/kstat/zfs/arcstats"
 LXD_SOCKETS = ([os.path.join(os.environ["LXD_DIR"], "unix.socket")] if os.environ.get("LXD_DIR") else []) + [
     "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/lxd/unix.socket"]
 API_EVERY = 15                     # seconds between LXD API refreshes
+EVENT_TIMEOUT = 60                 # seconds without a frame, pings included, before the event stream reconnects
 REPEAT_WINDOW = 600                # an event seen again within 10 minutes joins its earlier line
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")   # unit of the CPU times in /proc/<pid>/stat (100 a second)
 
@@ -541,6 +542,7 @@ class LxdEvents:
     def _loop(self):
         while True:
             sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(EVENT_TIMEOUT)          # so a stuck LXD shows "reconnecting", not "live"
             try:
                 self._listen(sock)
             except PermissionError:
