@@ -1,6 +1,6 @@
 # Security review: lxdtop 1.4.0 and lxdtop-remote
 
-Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** Fixes made since then have moved later lines in `lxdtop` down by up to 51, and each finding also names its function.
+Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** Fixes made since then have moved later lines in `lxdtop` down by up to 56, and each finding also names its function.
 
 lxdtop runs with access to LXD's socket, which is equivalent to root on the host, and it draws text that people inside containers choose. So this review asks four things: does it only read, can container-chosen text break out of its place on the terminal, can `lxdtop-remote` be made to run something it shouldn't, and what happens when the event stream is slow, closed or malformed.
 
@@ -19,15 +19,15 @@ lxdtop runs with access to LXD's socket, which is equivalent to root on the host
 | [L-9](#l-9-unexpected-json-from-the-api-stops-lxdtop-or-its-refreshes) | Unexpected JSON from the API ends lxdtop at startup, or stops its refreshes while the footer says "ok" | Low | Fixed in `daa158d` |
 | [R-1](#r-1-a-host-or-username-starting-with---is-read-by-ssh-as-an-option) | `lxdtop-remote`: a host or username starting with `-` is read by ssh as an option | Low | Fixed in `6f8420c` |
 | [R-2](#r-2-lxdtop-options-are-parsed-again-by-the-hosts-shell) | `lxdtop-remote`: lxdtop options are parsed again by the host's shell | Low | Fixed in `12e82db` |
-| [N-1 to N-8](#notes) | Notes with no security impact | Info | No change |
+| [N-1 to N-9](#notes) | Notes with no security impact | Info | N-1 fixed in `1bba705`, N-8 in `41f69d2`, N-9 in `2013f92`. No change for the rest |
 
-Nothing reached High. One bug that isn't a security issue was also fixed: lxdtop exited at startup when `LANG` named a locale the host doesn't have ([N-8](#n-8-not-security-lxdtop-exited-when-the-locale-wasnt-installed), `41f69d2`).
+Nothing reached High. Three bugs that aren't security issues were also fixed: lxdtop exited at startup when `LANG` named a locale the host doesn't have ([N-8](#n-8-not-security-lxdtop-exited-when-the-locale-wasnt-installed), `41f69d2`), the event feed left out every project but the default one ([N-1](#n-1-not-security-events-came-from-the-default-project-only), `1bba705`), and one storage pool LXD couldn't read stopped every refresh of LXD's data ([N-9](#n-9-not-security-one-storage-pool-lxd-couldnt-read-stopped-every-refresh), `2013f92`).
 
 **Severity scale.** *High*: someone could change the host, run code as the lxdtop user, or read secrets. *Medium*: an unprivileged process in any container can stop lxdtop or send control sequences to the operator's terminal. *Low*: needs an unusual setup, a non-default option, a second foothold, or input only the operator or root controls, or it only misleads the display. *Info*: no security impact.
 
-**Nothing is left open.** Every finding here is fixed, and the test suite has no expected failures left. Two fixes still need checking once on a real LXD host, because no daemon was available here: the event timeout ([L-6](#l-6-no-timeouts-on-the-event-socket)) and the ZFS disk mapping ([L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters)).
+**Nothing is left open.** Every finding here is fixed, and the test suite has no expected failures left. Three fixes still need checking once on a real LXD host, because no daemon was available here: the event timeout ([L-6](#l-6-no-timeouts-on-the-event-socket)), the ZFS disk mapping ([L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters)) and events from other projects ([N-1](#n-1-not-security-events-came-from-the-default-project-only)).
 
-**Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). CI also runs the suite on Python 3.10, 3.12 and 3.15. No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it.
+**Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). CI also runs the suite on Python 3.10, 3.12 and 3.15. No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it. For N-1 and N-9, I read LXD's source on its `stable-5.21` and `main` branches, which cover LXD 5.21 and 6.
 
 ## 1. Does lxdtop only read?
 
@@ -40,8 +40,8 @@ Nothing reached High. One bug that isn't a security issue was also fixed: lxdtop
 | 1 | GET | `/1.0/instances?recursion=2&all-projects=true` | 463 | At startup (1524), every 15 s, and once early when a container appears that LXD hasn't described yet (722) |
 | 2 | GET | `/1.0` | 481 | Every fourth refresh, so once a minute |
 | 3 | GET | `/1.0/storage-pools?recursion=1` | 485 | With 2 |
-| 4 | GET | `/1.0/storage-pools/<pool>/resources` | 486–487 | With 2, once per pool. The name is URL-quoted |
-| 5 | GET with `Upgrade: websocket` | `/1.0/events?type=lifecycle` | 557 | At startup, and 5 s after any disconnect (552) |
+| 4 | GET | `/1.0/storage-pools/<pool>/resources` | 486–487 | With 2, once per pool. The name is URL-quoted. A pool LXD can't read is left out since `2013f92` ([N-9](#n-9-not-security-one-storage-pool-lxd-couldnt-read-stopped-every-refresh)) |
+| 5 | GET with `Upgrade: websocket` | `/1.0/events?type=lifecycle&all-projects=true` | 557 | At startup, and 5 s after any disconnect (552). `&all-projects=true` since `1bba705` ([N-1](#n-1-not-security-events-came-from-the-default-project-only)) |
 
 Calls 1–4 all go through `LxdApi.get()`, whose only request is `conn.request("GET", path)` (452). Call 5 is written by hand on the unix socket (557–559). After the upgrade, the only thing lxdtop sends is pong frames answering LXD's pings (582–585), which are part of the websocket protocol rather than API calls.
 
@@ -49,7 +49,7 @@ Calls 1–4 all go through `LxdApi.get()`, whose only request is `conn.request("
 
 **How confirmed.**
 - `tests/test_lxd_api.py`, `test_only_get_requests_to_these_paths`: runs `LxdApi.fetch()` five times against a fake LXD on a unix socket that records every request line. Every request was a GET, to exactly the paths above.
-- `tests/test_events.py`, `test_the_upgrade_request` and `test_pongs_are_the_only_thing_sent_after_the_handshake`: the upgrade is `GET /1.0/events?type=lifecycle`, and with events and pings interleaved, lxdtop sent exactly two masked pongs and nothing else.
+- `tests/test_events.py`, `test_the_upgrade_request` and `test_pongs_are_the_only_thing_sent_after_the_handshake`: the upgrade is `GET /1.0/events?type=lifecycle&all-projects=true`, and with events and pings interleaved, lxdtop sent exactly two masked pongs and nothing else.
 - `tests/test_readonly.py` walks lxdtop's syntax tree, so any future change that breaks this has to change that test too. It checks that every `.request()` is a GET, that the only HTTP request line in the source is the events one, that `sendall` appears only in `LxdEvents._listen`, and that every socket is `AF_UNIX`.
 
 ### Files, processes, everything else
@@ -215,9 +215,11 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 
 ## Notes
 
-### N-1 Events come from the default project only
+### N-1 Not security: events came from the default project only
 
-Line 557 asks for `/1.0/events?type=lifecycle` with no `project` or `all-projects=true`. LXD's REST API documents that as the default project's events, so events for instances in other projects don't appear, while the table does list them (463). This is a feature gap rather than a security issue. Adding `&all-projects=true` would widen which API users' text reaches the screen, which is safe now that L-2/L-3 are fixed. Not checked against a live LXD.
+Line 557 asked for `/1.0/events?type=lifecycle` with no `project` or `all-projects=true`, and LXD then sends only the default project's events. So on a host with more than one project, nothing that happened in the others reached the feed, though the table lists their instances (463). Fixed in `1bba705` by asking for `&all-projects=true`, which LXD 5.21 and 6 both accept. Outside the default project, LXD also adds `?project=<name>` to each event's source, and snapshot events have no name field, so `_record()` now leaves the query off before splitting the path (594). Otherwise a snapshot would show as `nightly?project=dev`.
+
+Checked in LXD's source on its `stable-5.21` and `main` branches: `request.ProjectParams()` treats a request with no project as `default`, the events server skips other projects' events for such a listener, and `api.URL.Project()` adds the query. `test_events_from_every_project` and `test_the_project_after_the_source_is_left_off` fail before the fix. This widens which API users' text reaches the screen, which is safe now that L-2 and L-3 are fixed. Still to check once on a real host: start or snapshot an instance in another project, and it should appear in the feed.
 
 ### N-2 Secrets stay off the screen
 
@@ -250,9 +252,13 @@ None of these matters with LXD, which follows RFC 6455. A pong for a ping payloa
 
 `locale.setlocale(locale.LC_ALL, "")` (1516) raises `locale.Error` when `LANG` names a locale the host lacks. That is common over ssh, because macOS sends `LANG` and Ubuntu's sshd accepts it, so `LANG=de_DE.UTF-8` from a Mac stopped lxdtop before it drew anything. Fixed in `41f69d2` by ignoring that error: Python has already set the character type at startup, so curses still gets UTF-8. Checked with `LANG=de_DE.UTF-8` on a host without that locale. `test_a_locale_the_host_does_not_have` fails on `cf50ad6`.
 
+### N-9 Not security: one storage pool LXD couldn't read stopped every refresh
+
+`fetch_server()` asks for each pool's usage (486–487). LXD 5.21 and 6 answer with an error (HTTP 500) when they can't read the pool: `storagePoolResourcesGet` passes on the driver's error, and for ZFS that comes from `zfs get` on the pool, which fails when the pool wasn't imported or its disk is missing. The error left `fetch_server()`, so `fetch()` threw the whole answer away (499). A failed fetch doesn't advance the once-a-minute round, so every later refresh asked for the pools again and failed again. For as long as the pool was down, names, addresses, VMs, stopped instances and the network columns froze, or never showed if lxdtop started that way, and the footer said `lxd api error (ValueError)`. Fixed in `2013f92`: a pool whose usage call returns an error is left out of the memory panel, and its ZFS dataset still counts for the DISK columns. `test_a_pool_lxd_cannot_read_is_left_out` fails before the fix. A usage call that hangs past the 5-second timeout instead of failing still costs that refresh, as before.
+
 ## Limits
 
-- **No real LXD.** No LXD daemon was available. LXD's naming rules, its default-project behaviour for events (N-1), how much of a VM's state its agent controls (L-7), and that `zfs.pool_name` names the dataset a ZFS pool's volumes live in (L-8) come from LXD's documentation, and are marked where unverified.
+- **No real LXD.** No LXD daemon was available. LXD's naming rules, how much of a VM's state its agent controls (L-7), and that `zfs.pool_name` names the dataset a ZFS pool's volumes live in (L-8) come from LXD's documentation, and are marked where unverified. What N-1 and N-9 rely on was read in LXD's source for 5.21 and 6, but not seen from a running daemon.
 - **One ncurses version.** curses behaviour was checked with ncurses 6.5 (Ubuntu 24.04). Since the fix, control characters are replaced before curses sees them, so other versions no longer matter for L-3.
 - **One OpenSSH version.** R-1 was checked with OpenSSH 9.6p1. Older clients were modelled with `tests/fake_ssh.py`, not run.
 - **No terminal emulators.** What an escape sequence can do depends on the terminal, and none was tested. The fix removes them whatever the terminal.
