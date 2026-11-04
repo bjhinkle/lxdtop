@@ -1,6 +1,6 @@
 # Security review: lxdtop 1.4.0 and lxdtop-remote
 
-Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** The fixes made since move lines in `lxdtop` after 825 down by 2, and after 1516 by 5; the L-4 and L-5 fixes change lines in place.
+Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** The fixes made since move lines in `lxdtop` after 825 down by 2, and after 1516 by 5; the L-4, L-5 and L-9 fixes change lines in place.
 
 lxdtop runs with access to LXD's socket, which is equivalent to root on the host, and it draws text that people inside containers choose. So this review asks four things: does it only read, can container-chosen text break out of its place on the terminal, can `lxdtop-remote` be made to run something it shouldn't, and what happens when the event stream is slow, closed or malformed.
 
@@ -16,6 +16,7 @@ lxdtop runs with access to LXD's socket, which is equivalent to root on the host
 | [L-6](#l-6-no-timeouts-on-the-event-socket) | No timeouts on the event socket, so a stalled LXD still looks "live" | Low | Not fixed |
 | [L-7](#l-7-interface-names-from-lxd-go-into-a-path-unchecked) | Interface names from LXD go into a `/sys` path unchecked | Low | Not fixed |
 | [L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters) | With `zfs.delegate`, a container can take over another instance's disk counters | Low | Not fixed |
+| [L-9](#l-9-unexpected-json-from-the-api-stops-lxdtop-or-its-refreshes) | Unexpected JSON from the API ends lxdtop at startup, or stops its refreshes while the footer says "ok" | Low | Fixed in `daa158d` |
 | [R-1](#r-1-a-host-or-username-starting-with---is-read-by-ssh-as-an-option) | `lxdtop-remote`: a host or username starting with `-` is read by ssh as an option | Low | Fixed in `6f8420c` |
 | [R-2](#r-2-lxdtop-options-are-parsed-again-by-the-hosts-shell) | `lxdtop-remote`: lxdtop options are parsed again by the host's shell | Low | Fixed in `12e82db` |
 | [N-1 to N-8](#notes) | Notes with no security impact | Info | No change |
@@ -201,6 +202,15 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 - **Impact.** With `zfs.delegate` (off by default), a container's root can create `default/containers/c1/containers/victim`. That dataset maps to `victim` and can replace victim's DISK R and DISK W with numbers c1 chooses. Which one wins depends on the order glob returns the kstat files in. Misleading display only.
 - **How confirmed.** `test_a_delegated_child_dataset_cannot_claim_another_instance` (expected failure), with fixture kstat files.
 - **Smallest fix.** Using `partition()` instead of `rpartition()` would fix this but break pools whose source dataset contains `/containers/`. A safe fix is about three lines: when a name is already mapped, keep the dataset with the shorter name, since an instance's own dataset is always shorter than one nested inside another instance's.
+
+### L-9 Unexpected JSON from the API stops lxdtop or its refreshes
+
+**Low. Fixed in `daa158d`. Found after the first version of this review, while fixing L-4.**
+
+- **Where.** `LxdApi.fetch()`, line 499, caught only `(OSError, ValueError, KeyError, http.client.HTTPException)`. `fetch_instances()` assumes the reply's metadata is a list of objects, each with an object `state` and `network` (463–477), and uses the name as a dict key (466, 476).
+- **Impact.** An answer in a shape LXD never sends (`"metadata": "x"`, an instance that is a string, `state` or `network` of the wrong type) raises `AttributeError`, and a name that is a list raises `TypeError`. Neither was caught. `main()` calls `fetch()` once before drawing (1524), so at startup lxdtop exited with a traceback. In the background thread (510–514), refreshes ended for good while the footer kept saying `lxd api ok`, so names, addresses and stopped instances froze at the last answer and looked current. This has the same precondition as L-4: something other than LXD on its socket.
+- **How confirmed.** `test_a_reply_in_an_unexpected_shape` (five shapes) and `test_dump_when_lxd_answers_in_an_unexpected_shape` fail on `main` and pass with the fix. With the real thread on `main`, one malformed answer killed it and the footer stayed "ok"; with the fix, the footer showed `error (AttributeError)` and went back to "ok" at the next good answer.
+- **Smallest fix (applied).** One line: 499 is now `except Exception as err:`. The last good answer stays on screen, and the footer shows the error's name.
 
 ## Notes
 
