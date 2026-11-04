@@ -545,7 +545,7 @@ class LxdEvents:
                 self._listen(sock)
             except PermissionError:
                 self.status = "no access"
-            except (OSError, ValueError, ConnectionError):
+            except Exception:                        # whatever went wrong, try again in 5 seconds
                 self.status = "reconnecting"
             finally:
                 sock.close()

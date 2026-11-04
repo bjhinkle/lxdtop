@@ -211,28 +211,30 @@ class LoopTest(unittest.TestCase):
         # The same event on each connection: one line, counted twice.
         self.assertEqual([(e["action"], e["count"]) for e in events.feed], [("instance-started", 2)])
 
-    @unittest.expectedFailure
     def test_unexpected_json_shapes_reconnect(self):
-        """SECURITY-REVIEW.md L-4: not fixed.
+        """SECURITY-REVIEW.md L-4: these used to end the listener thread for good.
 
-        Valid JSON that isn't an event object raises AttributeError or
-        TypeError, which _loop() doesn't catch: the listener thread ends for
-        good and the panel keeps saying "live". LXD itself always sends
-        objects, so this needs something other than LXD on the socket.
+        Valid JSON that isn't an event object raised AttributeError or
+        TypeError, and deeply nested JSON RecursionError. _loop() caught none
+        of them, so the panel kept saying "live" and no more events came. LXD
+        itself always sends event objects, so this needs something other than
+        LXD on the socket.
         """
-        for payload in (b"[]", b'{"metadata": "x"}', b'{"metadata": {"source": null}}'):
-            with self.subTest(payload=payload), FakeLxd(script=[ws_frame(1, payload)]) as lxd:
+        for payload in (b"[]", b'{"metadata": "x"}', b'{"metadata": {"source": null}}',
+                        b"[" * 100000 + b"]" * 100000):
+            with self.subTest(payload=payload[:30]), FakeLxd(script=[ws_frame(1, payload)]) as lxd:
                 events = run_loop(lxd.path)
                 self.assertIsNone(events.ended)                # the listener is still running
                 self.assertEqual(events.status, "reconnecting")
 
-    @unittest.expectedFailure
     def test_an_impossible_frame_length_reconnects(self):
-        """SECURITY-REVIEW.md L-4: not fixed. A 64-bit length of 2**63 raises OverflowError."""
-        with FakeLxd(script=[bytes([0x81, 127]) + (1 << 63).to_bytes(8, "big")]) as lxd:
-            events = run_loop(lxd.path)
-        self.assertIsNone(events.ended)
-        self.assertEqual(events.status, "reconnecting")
+        """SECURITY-REVIEW.md L-4: a length of 2**63 raised OverflowError, and 2**40 MemoryError."""
+        for length in (1 << 63, 1 << 40):
+            with self.subTest(length=length), \
+                    FakeLxd(script=[bytes([0x81, 127]) + length.to_bytes(8, "big")]) as lxd:
+                events = run_loop(lxd.path)
+                self.assertIsNone(events.ended)
+                self.assertEqual(events.status, "reconnecting")
 
 
 class RecordTest(unittest.TestCase):
