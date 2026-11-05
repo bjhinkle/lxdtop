@@ -46,6 +46,10 @@ These come from a running container's cgroup, so stopped instances and VMs leave
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.8.1
+
+- **LXD's API errors show at 80 columns.** When LXD's socket is missing or refuses connections, the instance table's bottom edge now says so, for example `lxd api error (ConnectionRefusedError)`. Where there isn't room for it beside the disk label, the disk label gives way, and on a narrower screen the error's name is shortened.
+
 ## What's new in 1.8.0
 
 - **A finer drawing for terminal windows.** In a terminal with 256 colors and a UTF-8 locale, the CPU graph and the CPU history column are drawn in braille dots, meters move in eighths of a character, and the CPU, memory and swap meters shade from green through yellow to red. The Linux console and `--ascii` look exactly as before, and `--drawing classic` keeps the old look anywhere. See [Terminals](#terminals).
