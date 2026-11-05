@@ -13,6 +13,7 @@ and run it.
 
     lxdtop            run it (q quits, s changes the sort, - and + change speed)
     lxdtop --dump     print one frame as plain text and exit (for testing)
+    lxdtop --dump --json    print one reading as a JSON document, for scripts
 
 Top to bottom: a status line (LXD version, clock, counts); host panels for
 CPU, memory and network; CPU use stacked by instance beside a live feed of
@@ -54,7 +55,7 @@ import types
 import unicodedata
 import urllib.parse
 
-VERSION = "1.5.0 (2026-11-04)"
+VERSION = "1.6.0 (2026-11-05)"
 TIMEZONE = None      # the clock's default (None = the system's); TZ overrides it
 CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
@@ -1724,6 +1725,154 @@ def draw(cv, mon, ui):
     draw_table_panel(cv, y, 0, cv.h - y, cv.w, rows, mon, ui, shown, fold)
 
 
+# --- One reading as JSON (--dump --json) ----------------------------------------
+#
+# The same readings the screen draws, as data for scripts: numbers stay numbers, in base units
+# (bytes, seconds, bits per second for networks, % for CPU as the screen means it), and a value
+# lxdtop has no reading for is None (null), never 0. The README has a table of the fields.
+
+WARNING_KINDS = {5: "pool", 4: "memory_kill", 3: "pool", 2: "pressure", 1: "throttled"}   # see warnings()
+
+
+def iso_utc(when):
+    """Seconds since 1970 as an ISO 8601 time in UTC, e.g. 2026-11-05T14:03:07Z."""
+    if when is None:
+        return None
+    return datetime.datetime.fromtimestamp(when, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def rounded(value, places):
+    return None if value is None else round(value, places)
+
+
+def bits_per_s(bytes_per_sec):
+    """A network rate in bits per second (as network gear counts), from bytes per second."""
+    return None if bytes_per_sec is None else round(bytes_per_sec * 8, 1)
+
+
+def share_of(used, limit):
+    """used as a % of limit, the way the MEM/LIMIT and PROCS/LIMIT columns work it out."""
+    if used is None or limit is None:
+        return None
+    return round(used / limit * 100, 2) if limit else 100.0
+
+
+def number(text):
+    try:
+        return float(text)
+    except (TypeError, ValueError):
+        return None
+
+
+def instance_json(row, mon, now, wall):
+    """One instance with every field the table can show; None where there's no reading.
+
+    VMs and stopped instances have no container cgroup here, so no limits, throttling, pressure
+    or memory kills; a VM's processes are inside its guest, so no busiest process either.
+    """
+    past, kills, waiting = mon.past.get(row["cg"]), mon.kills.get(row["cg"]), row["waiting"]
+    top, taken = (None if row["vm"] else row["top"]), row["snapshot"]
+    return {
+        "name": row["name"],
+        "type": "virtual-machine" if row["vm"] else "container",
+        "state": row["state"],
+        "ipv4": row["ip"] or None,
+        "uptime_s": rounded(row["up"], 1),
+        "cpu_pct": rounded(row["cpu"], 2),                        # 100 = one core
+        "cpu_history_pct": [rounded(value, 2) for value in mon.cpu_history.get(row["cg"], ())],
+        "busiest_process": dict(name=top[0], cpu_pct=round(top[1], 2)) if top else None,
+        "mem_bytes": row["mem"],
+        "disk_read_bytes_per_s": rounded(row["rd"], 1),
+        "disk_write_bytes_per_s": rounded(row["wr"], 1),
+        "disk_source": {"zfs": "zfs", "io": "io.stat"}.get(past[-1]["disk_src"]) if past and past[-1]["disk"] else None,
+        "net_in_bits_per_s": bits_per_s(row["net_in"]),
+        "net_out_bits_per_s": bits_per_s(row["net_out"]),
+        "tasks": row["tasks"],
+        "tasks_limit": row["tasks_max"],
+        "tasks_of_limit_pct": share_of(row["tasks"], row["tasks_max"]),
+        "cpu_limit_cores": rounded(row["cpu_max"], 3),
+        "cpu_throttled_pct": rounded(row["throttled"], 2),
+        "mem_limit_bytes": row["mem_max"],
+        "mem_of_limit_pct": share_of(row["mem"], row["mem_max"]),
+        "waiting_on": waiting[0] if waiting else None,
+        "waiting_pct": round(waiting[1], 2) if waiting else None,
+        "mem_kills": kills[1] if kills else None,                 # seen since lxdtop started
+        "mem_kills_total": kills[0] if kills else None,           # the kernel's count since the instance started
+        "last_mem_kill_ago_s": round(now - kills[2], 1) if kills and kills[2] is not None else None,
+        "newest_snapshot_at": iso_utc(taken),
+        "newest_snapshot_age_s": round(wall - taken, 1) if taken else None,
+    }
+
+
+def reading_json(mon, interval):
+    """Everything the screen shows, as one JSON-ready dict (schema 1)."""
+    now, wall, host, server = time.monotonic(), time.time(), mon.host, mon.server
+    rows = sort_rows(mon, "cpu")                                  # in the table's order: busiest first
+    names = {row["cg"]: row["name"] for row in rows}
+    feed, events_status = mon.events.snapshot() if mon.events else ([], "off")
+    read_mem = bool(host.get("mem_total"))                        # /proc/meminfo could be read
+    load = [number(value) for value in host.get("load", [])] + [None] * 3
+    ins, outs = list(mon.net_in), list(mon.net_out)
+    zpools = host.get("zpools", {})
+    pools = [dict(name=name, used_bytes=used, total_bytes=total, health=zpools.get(name))
+             for name, used, total in mon.pools]
+    pools += [dict(name=name, used_bytes=None, total_bytes=None, health=state)    # ZFS pools LXD didn't list
+              for name, state in sorted(zpools.items()) if name not in {pool["name"] for pool in pools}]
+    running = sum(1 for row in rows if row["live"])
+    return {
+        "schema": 1,
+        "lxdtop_version": VERSION,
+        "taken_at": iso_utc(wall),
+        "interval_s": interval,
+        "lxd_api": mon.api_status,
+        "host": {
+            "name": socket.gethostname(),
+            "lxd_version": server.get("version") or None,
+            "os": server.get("os") or None,
+            "kernel": server.get("kernel") or None,
+            "cluster_member": server.get("member") or None,
+            "uptime_s": rounded(host.get("uptime") or None, 1),
+            "cpu": {
+                "busy_pct": rounded(host.get("cpu"), 2),          # the whole host: 100 = every thread busy
+                "threads_busy_pct": [round(value, 2) for value in host.get("threads", [])],
+                "outside_instances_pct": rounded(mon.stack[-1].get(HOST) if mon.stack else None, 2),   # 100 = one core
+                "temp_c": rounded(host.get("temp"), 1),
+                "clock_mhz": rounded(host.get("mhz"), 1),
+                "load_1m": load[0], "load_5m": load[1], "load_15m": load[2],
+            },
+            "memory": {
+                "total_bytes": host.get("mem_total") if read_mem else None,
+                "used_bytes": host.get("mem_used") if read_mem else None,       # without the ZFS ARC
+                "zfs_arc_bytes": host.get("arc") if os.path.exists(ZFS_ARCSTATS) else None,
+                "available_bytes": host.get("mem_free") if read_mem else None,
+                "swap_total_bytes": host.get("swap_total") if read_mem else None,
+                "swap_used_bytes": host.get("swap_used") if read_mem else None,
+            },
+            "root_fs": dict(used_bytes=host["root_used"], total_bytes=host["root_total"])
+            if host.get("root_total") else None,
+        },
+        "network": {
+            "in_bits_per_s": bits_per_s(sum(ins[-3:]) / len(ins[-3:]) if ins else None),   # as the panel: the
+            "out_bits_per_s": bits_per_s(sum(outs[-3:]) / len(outs[-3:]) if outs else None),   # last 3 readings
+            "peak_bits_per_s": bits_per_s(max(ins + outs, default=None)),
+            "ports": [dict(name=nic, in_bits_per_s=bits_per_s(r_in), out_bits_per_s=bits_per_s(r_out))
+                      for nic, (r_in, r_out) in sorted(mon.nic_rates.items())],
+        },
+        "pools": pools,
+        "warnings": [dict(severity=serious, kind=WARNING_KINDS[serious], instance=names.get(cg, cg) if cg else None,
+                          pool=None if cg else text.split()[0], text=text)
+                     for serious, _, text, cg in warnings(mon)],
+        "events": {
+            "status": events_status,
+            "feed": [dict(time=iso_utc(event["t"]), action=event["action"], instance=event["name"] or None,
+                          detail=event["detail"] or None, user=event["user"] or None, count=event["count"])
+                     for event in feed],
+        },
+        "instance_counts": {"running": running, "stopped": len(rows) - running},
+        "instances": [instance_json(row, mon, now, wall) for row in rows],
+    }
+
+
 # --- Running it ---------------------------------------------------------------
 
 def curses_attrs():
@@ -1817,11 +1966,15 @@ needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3."""
     parser.add_argument("--ascii", action="store_true", help="draw with plain ASCII characters")
     parser.add_argument("--version", action="version", version=f"lxdtop {VERSION}")
     parser.add_argument("--dump", action="store_true", help="print one frame as text and exit")
+    parser.add_argument("--json", action="store_true",
+                        help="with --dump: print the reading as one JSON document instead (fields: see the README)")
     parser.add_argument("--color", action="store_true", help="with --dump: keep the colors (ANSI codes)")
     parser.add_argument("--size", default="160x45", help="with --dump: COLSxROWS (default 160x45)")
     parser.add_argument("--samples", type=int, default=2, help="with --dump: readings to take first (default 2)")
     parser.add_argument("--frames", type=int, default=0, help=argparse.SUPPRESS)   # testing: stop after N frames
     args = parser.parse_args()
+    if args.json and not args.dump:
+        parser.error("--json works only with --dump")
 
     global G
     if TIMEZONE:
@@ -1851,6 +2004,9 @@ needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3."""
             if i:
                 time.sleep(args.interval)
             mon.sample()
+        if args.json:
+            print(json.dumps(reading_json(mon, args.interval), indent=2))   # ensure_ascii: no raw control bytes
+            return
         canvas = TextCanvas(rows, cols)
         draw(canvas, mon, ui)
         print(canvas.text(color=args.color))
