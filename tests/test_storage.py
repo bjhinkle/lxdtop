@@ -114,6 +114,77 @@ class StoppedTest(unittest.TestCase):
         self.assertEqual([i["name"] for i in doc["instances"]], ["web0", "win", "old"])
 
 
+class UnreadVmTest(unittest.TestCase):
+    """#16: a running VM whose QEMU process lxdtop can't read showed a grey "running" row with no numbers,
+    and nothing said why. lxdtop reads a VM's CPU, memory and uptime from that process (read_vm_process())."""
+
+    def setUp(self):
+        self.host = FakeHost(self)
+        self.host.set_basics()
+        self.host.set_cpu_times((100, 0, 900), [(25, 0, 225)] * 4)
+        for cg in ("web", "db", "dev_api"):
+            self.host.add_container(cg, 1_000_000)
+        self.routes = lxd_routes()
+
+    def readings(self, **state):
+        """Two readings, 2 s apart, with LXD's word on win's state changed as given."""
+        for inst in self.routes["/1.0/instances?recursion=2&all-projects=true"][1]["metadata"]:
+            if inst["name"] == "win":
+                inst["state"].update(state)
+        with FakeLxd(self.routes) as lxd, self.host.installed():
+            api = lxdtop.LxdApi(lxd.path)
+            api.fetch()
+            mon = lxdtop.Monitor(api, None)
+            mon.sample()
+            self.host.clock += 2
+            mon.sample()
+        return mon
+
+    def draw(self, mon, width=160, height=45, detail=None):
+        ui = lxdtop.new_ui(2)
+        if detail:
+            ui.view, ui.detail = "detail", detail
+        canvas = lxdtop.TextCanvas(height, width)
+        with glyphs(lxdtop.GLYPHS_UNICODE), mock.patch.object(lxdtop.socket, "gethostname", return_value="lxdhost"):
+            lxdtop.draw(canvas, mon, ui)
+        return canvas.text()
+
+    def says(self, mon, why):
+        """win's row and its detail view say why it has no readings, at 80x24, 160x45 and 240x60."""
+        for width, height in ((80, 24), (160, 45), (240, 60)):
+            with self.subTest(size=f"{width}x{height}"):
+                line = next(line for line in self.draw(mon, width, height).splitlines() if " win " in line)
+                self.assertRegex(line, r"win +running   no readings: " + why)
+                self.assertRegex(self.draw(mon, width, height, detail="win"), r"\n│ readings    none: " + why)
+
+    def test_its_process_is_not_there(self):
+        self.says(self.readings(), "QEMU process 5151 not found")              # this fake host has no /proc/5151
+
+    def test_its_process_cannot_be_read(self):
+        self.host.mkdir("/proc/5151")                                          # there, but not its stat
+        mon = self.readings()
+        self.says(mon, "no access to QEMU process 5151")
+        self.assertIn("readings    none: no access to QEMU process 5151                             │\n"
+                      "│             /proc may hide other users' processes (hidepid)", self.draw(mon, 80, 24, "win"))
+
+    def test_its_process_is_something_else(self):
+        self.host.add_process(5151, "bash")
+        self.says(self.readings(), "process 5151 is not QEMU")
+
+    def test_lxd_gave_no_process_id(self):
+        self.says(self.readings(pid=0), "LXD gave no QEMU process ID")
+
+    def test_a_vm_it_reads_or_one_that_is_stopped_says_nothing_more(self):
+        self.host.copy_fixture("pid-stat-qemu.txt", "/proc/5151/stat")
+        self.host.copy_fixture("pid-status-qemu.txt", "/proc/5151/status")
+        text = self.draw(self.readings())
+        self.assertNotIn("no readings", text)
+        self.routes["/1.0/instances?recursion=2&all-projects=true"][1]["metadata"][3]["status"] = "Stopped"
+        text = self.draw(self.readings())
+        self.assertRegex(text, r"win +stopped\b")
+        self.assertNotIn("no readings", text)
+
+
 METRICS = """\
 # HELP lxd_disk_read_bytes_total The total number of bytes read.
 # TYPE lxd_disk_read_bytes_total counter

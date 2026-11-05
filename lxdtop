@@ -447,6 +447,17 @@ def read_vm_process(pid):
     return (int(fields[11]) + int(fields[12])) * 1_000_000 // CLOCK_TICKS, rss, int(fields[19])
 
 
+def vm_unread(pid):
+    """Why read_vm_process() had nothing for a VM that LXD says is running: (in a few words, a hint)."""
+    if not pid:
+        return "LXD gave no QEMU process ID", ""
+    if not os.path.exists(f"/proc/{pid}"):
+        return f"QEMU process {pid} not found", "it may have just stopped, or /proc may hide it"
+    if read(f"/proc/{pid}/stat") is None:
+        return f"no access to QEMU process {pid}", "/proc may hide other users' processes (hidepid)"
+    return f"process {pid} is not QEMU", "it may have just stopped, and its ID been reused"
+
+
 def read_net(host_ends):
     """Bytes in and out so far over an instance's host-side network interfaces.
 
@@ -507,12 +518,15 @@ def name_of(cg):
 
 def new_row(cg, inst, **fields):
     """One table row; fields not given stay empty until a reading fills them. Its label is its name
-    as the screen shows it: see Monitor.set_labels()."""
-    row = dict(cg=cg, name=inst.get("name", cg), label=inst.get("name", cg),
+    as the screen shows it: see Monitor.set_labels(). Without LXD's word, its name and project come
+    from its cgroup name."""
+    name = inst.get("name") or name_of(cg)
+    row = dict(cg=cg, name=name, label=name,
                project=inst.get("project") or project_of(cg), state=inst.get("status", "Running"), live=True,
                vm=False, ip=inst.get("ipv4", ""), mem=None, tasks=None, top=None, up=None,
                cpu=None, rd=None, wr=None, net_in=None, net_out=None, snapshot=inst.get("snapshot"),
-               throttled=None, cpu_max=None, cpu_quota=None, mem_max=None, tasks_max=None, waiting=None)
+               throttled=None, cpu_max=None, cpu_quota=None, mem_max=None, tasks_max=None, waiting=None,
+               unread=None)
     row.update(fields)
     return row
 
@@ -731,7 +745,7 @@ class LxdApi:
 
     def get_text(self, path):
         """A GET whose answer is text rather than JSON: LXD's metrics."""
-        conn = UnixHTTPConnection(self.socket_path)
+        conn = UnixHTTPConnection(self.socket_path, self.timeout)
         try:
             conn.request("GET", path)
             reply = conn.getresponse()
@@ -1172,10 +1186,12 @@ class Monitor:
             self.api.vm_disks_wanted = frozenset(wanted)
 
         # Anything else LXD knows about is stopped (or a VM whose process couldn't be read, which
-        # is_stopped() counts as running).
+        # is_stopped() counts as running, and whose row says why: see vm_unread()).
         for cg, inst in instances.items():
             if cg not in readings:
-                rows.append(new_row(cg, inst, live=False, vm=inst.get("type") == "virtual-machine"))
+                vm = inst.get("type") == "virtual-machine"
+                unread = vm_unread(inst.get("pid")) if vm and inst.get("status") == "Running" else None
+                rows.append(new_row(cg, inst, live=False, vm=vm, unread=unread))
         for cg in list(self.cpu_history):
             if cg not in readings:
                 del self.cpu_history[cg]
@@ -1879,6 +1895,28 @@ def draw_graph_panel(cv, y, x, h, w, mon, ui):
     put_parts(cv, y + h - 2, x + 2, parts, x + w - 2)
 
 
+def event_words(event, mon):
+    """What a line of the event panel says happened, in which style, and what it happened to, as parts.
+
+    An instance's event has its label from EVENT_LABELS and the instance's name as the table shows it.
+    LXD also announces a network's, a profile's or a storage pool's changes, and names the kind of
+    thing in the action, as in "network-updated". Such a line gets the label of the same change to an
+    instance ("config" for updated), then the kind, dim, and the name, not bright, so that it isn't
+    taken for an instance's.
+    """
+    if event["instance"]:
+        label, style = EVENT_LABELS.get(event["action"], (event["action"].replace("instance-", ""), "text"))
+        return label, style, [(mon.label(event["project"], event["name"])[:14].ljust(15), "bright")]
+    kind, _, change = event["action"].rpartition("-")
+    label, style = EVENT_LABELS.get("instance-" + change, (change, "text"))
+    # "config-updated" is the server's own config; "storage-pool" and "storage-volume" say pool and volume
+    kind = "server" if kind == "config" else kind.removeprefix("storage-").replace("-", " ")
+    name = event["name"][:14] + " "
+    if not kind:
+        return label, style, [(name.ljust(15), "text")]
+    return label, style, [(kind + " ", "dim"), (name.ljust(14 - len(kind)), "text")]
+
+
 def draw_events_panel(cv, y, x, h, w, mon):
     feed, status = mon.events.snapshot() if mon.events else ([], "off")
     if len(status) > w - 20:                         # too long to fit beside the title: shorten the error's name
@@ -1893,14 +1931,12 @@ def draw_events_panel(cv, y, x, h, w, mon):
         return
     now = time.time()
     for i, event in enumerate(feed[:h - 2]):
-        label, style = EVENT_LABELS.get(event["action"], (event["action"].replace("instance-", ""), "text"))
+        label, style, what = event_words(event, mon)
         age = now - event["t"]
         clock_style = "bright" if age < 300 else "text" if age < 3600 else "dim"
         pos = put_parts(cv, y + 1 + i, ix, [
             (time.strftime("%H:%M:%S", time.localtime(event["t"])), clock_style),
-            ("  " + label[:9].ljust(10), style),
-            ((mon.label(event["project"], event["name"]) if event["instance"] else event["name"])[:14].ljust(15),
-             "bright")], right)
+            ("  " + label[:9].ljust(10), style)] + what, right)
         count = f"{G['times']}{event['count']}" if event["count"] > 1 else ""
         tail = " ".join(part for part in (event["detail"], event["user"]) if part)
         cv.put(y + 1 + i, pos, tail, "dim", right - len(count) - 1 if count else right)
@@ -2045,7 +2081,13 @@ def draw_row(cv, y, x0, layout, row, mon, marked=()):
     if not row["live"]:
         cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "dim")      # red: see the warning
         cv.put(y, at("name"), name, "dim")
-        cv.put(y, at("up") if "up" in layout else at("cpu"), row["state"].lower(), "dim")
+        state = row["state"].lower()
+        if row["unread"]:                    # a running VM lxdtop can't read: why its row has no numbers
+            state += "   no readings: " + row["unread"][0]
+        # up to the extra columns, which still show for it, or else the table's edge
+        ops = [at(col) - 2 for col, _ in OPS_COLUMNS if col in layout]
+        end = min(ops) if ops else max(at(col) + width(col) for col in layout)
+        cv.put(y, at("up") if "up" in layout else at("cpu"), state, "dim", end)
         return
     cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "mid" if row["state"] == "Frozen" else "lo")
     cv.put(y, at("name"), name, mon.series_style.get(row["cg"], "bright"))
@@ -2335,9 +2377,13 @@ def detail_lines(row, mon, gone):
         state = [("gone", "hi"), (": no longer on this host, last seen " + row["state"].lower(), "text")]
     else:
         state = [(row["state"].lower(), "lo" if live else "dim")]
-    lines = [("state", state + [(f"   {'virtual machine' if vm else 'container'} on {where}", "dim")]),
-             ("address", [(row["ip"], "ip")] if row["ip"] else dash),
-             ("up", [(fmt_uptime(row["up"]), "text")] if row["up"] is not None else dash)]
+    lines = [("state", state + [(f"   {'virtual machine' if vm else 'container'} on {where}", "dim")])]
+    if row["unread"] and not gone:                   # a running VM lxdtop can't read: why, and what may cause it
+        why, hint = row["unread"]
+        lines.append(("readings", [("none", "mid"), (": " + why, "text")]))
+        lines += [("", [(hint, "dim")])] if hint else []
+    lines += [("address", [(row["ip"], "ip")] if row["ip"] else dash),
+              ("up", [(fmt_uptime(row["up"]), "text")] if row["up"] is not None else dash)]
     cpu = [(fmt_pct(row["cpu"]), cpu_style(row["cpu"])), (" of one core", "dim")] if row["cpu"] is not None else dash
     if row["cpu_max"] is not None:
         cpu = cpu + [("   limit ", "dim"), (f"{row['cpu_max']:.3g} cores", "text")]
@@ -2572,7 +2618,10 @@ def reading_json(mon, interval):
                      for serious, _, text, cg in warnings(mon)],
         "events": {
             "status": events_status,
-            "feed": [dict(time=iso_utc(event["t"]), action=event["action"], instance=event["name"] or None,
+            # instance: an instance's event's; subject: any other's, a network's, say, as its action names
+            "feed": [dict(time=iso_utc(event["t"]), action=event["action"],
+                          instance=(event["name"] or None) if event["instance"] else None,
+                          subject=None if event["instance"] else event["name"] or None,
                           project=event["project"] or None, detail=event["detail"] or None,
                           user=event["user"] or None, count=event["count"])
                      for event in feed],
@@ -2655,8 +2704,9 @@ KEYS = (
 KEY_ACTIONS = {code: action for _, codes, _, action in KEYS for code in codes}
 BACKSPACE = (curses.KEY_BACKSPACE, 127, 8)      # while typing a filter
 ESC_DELAY_MS = 25                  # how long curses waits after Esc for more of a key's code (default 1000)
-SPLIT_KEY_SECS = 0.5               # how long after an Esc the rest of an arrow key's code may still come
-ARROWS = {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN}     # Esc, [ or O, then this letter
+SPLIT_KEY_SECS = 0.5               # how long after an Esc the rest of a key's code may still come
+SPLIT_KEYS = {"[A": curses.KEY_UP, "OA": curses.KEY_UP, "[B": curses.KEY_DOWN, "OB": curses.KEY_DOWN}   # after Esc
+OTHER_KEY = curses.KEY_MAX         # any other key whose code starts with Esc: Left, Home, Page Up, F1...
 QUIT = "quit"
 
 
@@ -2699,22 +2749,24 @@ def type_filter(key, ui):
 
 
 def split_key(key, ui):
-    """An arrow key sends Esc, "[" (or "O"), then a letter, and curses waits ESC_DELAY_MS for all of it.
-    On a slow link the rest can come later, after the Esc has acted on its own: then this undoes the
-    Esc, and gives the arrow key's code. "wait" means the rest is still coming; None, that key isn't it.
-    Esc acts at once, as before: only a split arrow key waits for its own rest.
+    """A key such as Up, Left or Page Up sends Esc, "[" or "O", perhaps some digits and ";", then one
+    last character from "@" to "~" (the Linux console's F1 to F5: Esc, "[[", then a letter). curses
+    waits ESC_DELAY_MS for all of it. On a slow link the rest can come later, after the Esc has acted
+    on its own: then this undoes the Esc, and gives the key's own code, Up's or Down's, or OTHER_KEY
+    for one lxdtop has no use for. "wait" means more of it is still coming; None, that key isn't part
+    of it. Esc acts at once, as before: only a split key waits for the rest of its own code.
     """
-    when, before, opened = ui.split
-    if time.monotonic() - when > SPLIT_KEY_SECS:
-        ui.split = None
-    elif not opened and key in (ord("["), ord("O")):
-        ui.split = (when, before, True)
-        return "wait"
-    elif opened and key in ARROWS:
-        vars(ui).update(before)                      # as if the Esc never came
-        return ARROWS[key]
-    else:
-        ui.split = None
+    when, before, code = ui.split                    # code: what has come since the Esc
+    char = chr(key) if 32 <= key < 127 else ""
+    if char and time.monotonic() - when <= SPLIT_KEY_SECS:
+        code += char
+        if code in ("[", "O", "[[") or (code[0] in "[O" and code[:2] != "[[" and " " <= char <= "?"):
+            ui.split = (when, before, code)          # its start, or a digit or ";" in it: more to come
+            return "wait"
+        if code[0] in "[O" and len(code) > 1 and "@" <= char <= "~":
+            vars(ui).update(before)                  # its last character: as if the Esc never came
+            return SPLIT_KEYS.get(code, OTHER_KEY)
+    ui.split = None
     return None
 
 
@@ -2726,13 +2778,13 @@ def handle_key(key, mon, ui):
     if key == curses.KEY_RESIZE:
         return True
     if ui.split:
-        arrow = split_key(key, ui)
-        if arrow == "wait":
+        whole = split_key(key, ui)
+        if whole == "wait":
             return False
-        if arrow is not None:
-            return handle_key(arrow, mon, ui) or True        # the Esc's undoing needs drawing too
-    if KEY_ACTIONS.get(key) == "escape":             # it may be the start of a split arrow key
-        ui.split = (time.monotonic(), dict(vars(ui), split=None), False)
+        if whole is not None:
+            return handle_key(whole, mon, ui) or True        # the Esc's undoing needs drawing too
+    if KEY_ACTIONS.get(key) == "escape":             # it may be the start of a split key's code
+        ui.split = (time.monotonic(), dict(vars(ui), split=None), "")
     if ui.view == "help":                            # any key closes the help
         ui.view = ui.back
         return True

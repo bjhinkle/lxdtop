@@ -16,6 +16,8 @@ from tests.support import LXDTOP_PATH, REMOTE_PATH, ROOT, lxdtop
 
 FAKE_SSH = os.path.join(ROOT, "tests", "fake_ssh.py")
 SH = shutil.which("sh")
+KEEPALIVE = [("-o", "ServerAliveInterval=15"), ("-o", "ServerAliveCountMax=3")]     # install's: see the script
+OWN_OPTIONS = {("-G", ""), ("-t", ""), *KEEPALIVE}       # every option lxdtop-remote gives ssh
 
 STUB_LXDTOP = """#!/bin/sh
 # Stands in for lxdtop on the host: write down how it was started.
@@ -163,11 +165,16 @@ class RemoteTest(RemoteCase):
         machine. OpenSSH 9.6 and later refuse the connection first, because the
         next argument (the remote command) then becomes the host name and has
         spaces in it; older versions, and this stand-in, run it.
+
+        The only options ssh gets are lxdtop-remote's own, the same whatever the
+        host and user: -G to read the SSH config, -t for lxdtop's screen, and
+        install's two keepalive options (#16).
         """
         marker = os.path.join(self.dir, "ran")
-        for args, stdin in ((("install", f"-oProxyCommand=touch {marker}"), ""),
-                            (("screen", f"-oProxyCommand=touch {marker}"), ""),
-                            (("lxdhost",), f"-oProxyCommand=touch {marker}\n")):    # typed as the username
+        option = f"-oProxyCommand=touch {marker}"
+        for args, stdin, destination in ((("install", option), "", option),
+                                         (("screen", option), "", option),
+                                         (("lxdhost",), option + "\n", f"{option}@lxdhost")):   # typed as the username
             with self.subTest(args=args, stdin=stdin):
                 for path in (marker, marker + "@lxdhost", self.log):
                     if os.path.exists(path):
@@ -175,7 +182,8 @@ class RemoteTest(RemoteCase):
                 self.remote(*args, stdin=stdin, FAKE_SSH_DRY="1")
                 self.assertFalse(os.path.exists(marker) or os.path.exists(marker + "@lxdhost"))
                 for run in self.ssh_runs():
-                    self.assertNotIn("-o", [name for name, _ in run["options"]], run["argv"])
+                    self.assertLessEqual({tuple(given) for given in run["options"]}, OWN_OPTIONS, run["argv"])
+                self.assertEqual([run["destination"] for run in self.connections()], [destination])
 
 
 with open(LXDTOP_PATH, "rb") as _f:
@@ -458,6 +466,18 @@ class InstallTest(RemoteCase):
         self.assertEqual(self.leftovers(), [])
         self.assertEqual(result.returncode, 255)
         self.assertIn("ssh failed before me@lxdhost confirmed the install", result.stderr)
+
+    def test_ssh_on_this_machine_gives_up_on_a_quiet_connection_within_a_minute_too(self):
+        """#16: after a drop without a word, this machine's ssh waited until Ctrl-C or TCP gave up.
+
+        With these options, OpenSSH asks the host's sshd for an answer once 15 seconds pass with
+        nothing from it, then every 15 seconds, and gives up when a fourth ask is due with none of
+        the three answered (server_alive_check() in its clientloop.c): 60 seconds. This stand-in
+        doesn't act them out, so this checks that install gives them, and only them.
+        """
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual([[tuple(given) for given in run["options"]] for run in self.connections()], [KEEPALIVE])
 
     def test_what_an_install_killed_outright_left_is_removed(self):
         """kill -9 or a power cut leaves an install's new file. The next removes those two days old, and lxdtop.new.

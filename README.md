@@ -109,21 +109,21 @@ On the LXD host, download `lxdtop` beside where it goes, check that it runs, and
 mkdir -p ~/bin
 curl -fsSL -o ~/bin/lxdtop.new https://raw.githubusercontent.com/bjhinkle/lxdtop/main/lxdtop
 chmod 755 ~/bin/lxdtop.new
-~/bin/lxdtop.new --version | grep '^lxdtop ' && mv ~/bin/lxdtop.new ~/bin/lxdtop
+~/bin/lxdtop.new --version | grep '^lxdtop ' && sync ~/bin/lxdtop.new && mv ~/bin/lxdtop.new ~/bin/lxdtop
 ~/bin/lxdtop
 ```
 
-The fourth line prints the version, and only if the download runs and says it is lxdtop does `mv` replace `~/bin/lxdtop`, in one step. A download cut partway never becomes `~/bin/lxdtop`, so the console service never restarts into a half-downloaded file.
+The fourth line prints the version. Only if the download runs and says it is lxdtop does it go on: `sync` flushes the copy to disk, so that a power cut just after can't leave an empty file, and `mv` replaces `~/bin/lxdtop` with it in one step. A download cut partway never becomes `~/bin/lxdtop`, so the console service never restarts into a half-downloaded file.
 
 From a clone, copy it the same way, beside where it goes, and rename it into place:
 
 ```bash
 mkdir -p ~/bin
 install -m 755 lxdtop ~/bin/lxdtop.new
-~/bin/lxdtop.new --version | grep '^lxdtop ' && mv ~/bin/lxdtop.new ~/bin/lxdtop
+~/bin/lxdtop.new --version | grep '^lxdtop ' && sync ~/bin/lxdtop.new && mv ~/bin/lxdtop.new ~/bin/lxdtop
 ```
 
-`install` straight onto `~/bin/lxdtop` would remove the old file before copying the new one, so for a moment there'd be no lxdtop there, or only part of one.
+`install` straight onto `~/bin/lxdtop` would remove the old file before copying the new one, so for a moment there'd be no lxdtop there, or only part of one. As above, `sync` flushes the copy to disk before `mv` renames it into place.
 
 Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
 
@@ -151,7 +151,7 @@ lxdtop-remote install myhost    # copy lxdtop to myhost:~/bin/lxdtop
 lxdtop-remote myhost            # run it in this terminal
 ```
 
-`install` copies lxdtop over one SSH connection to a new file of its own in `~/bin` on the host, `lxdtop.new.` and six random characters, so that two installs at once never share one. It checks the copy there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and its `--version` must print lxdtop's version. Only then is it flushed to disk and renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was and the new file is removed, so the console service never restarts into a half-copied file. A connection that drops without a word, which sshd can take hours to notice, ends the install once nothing more has arrived for a minute. On success it prints the version and the SHA-256 it checked.
+`install` copies lxdtop over one SSH connection to a new file of its own in `~/bin` on the host, `lxdtop.new.` and six random characters, so that two installs at once never share one. It checks the copy there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and its `--version` must print lxdtop's version. Only then is it flushed to disk and renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was and the new file is removed, so the console service never restarts into a half-copied file. A connection that drops without a word, which sshd can take hours to notice, ends the install on the host once nothing more has arrived for a minute, and ssh on your machine gives up a minute after it last heard from the host. On success it prints the version and the SHA-256 it checked.
 
 An lxdtop that's already running keeps running the version it started with. `install` doesn't restart anything, but when the console service below is running, it says so, with the command that restarts it.
 
@@ -180,7 +180,7 @@ Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_
 | `network` | The host's physical ports: `in_bits_per_s` and `out_bits_per_s` (all ports, over the last three readings), `peak_bits_per_s`, and `ports`, each with `name`, `in_bits_per_s` and `out_bits_per_s` |
 | `pools` | `name`, `used_bytes`, `total_bytes` (from LXD) and `health` (a ZFS pool's state: `ONLINE`, `DEGRADED`, …) |
 | `warnings` | Most serious first: `severity` (5 a pool down, 4 a memory kill, 3 a degraded pool, 2 high pressure, 1 throttling), `kind`, `instance` or `pool`, and `text` as the screen shows it |
-| `events` | `status`, and the `feed`, newest first: `time`, `action` (LXD's, such as `instance-started`), `instance`, `detail`, `user`, `count` |
+| `events` | `status`, and the `feed`, newest first. Each line has `time`; `action`, LXD's, such as `instance-started` or `network-updated`; `instance`, the instance's name, for an instance's event only; `subject`, for any other event, the name of what it's about, such as a network, a profile or a storage pool, whose kind `action` names; `project`, `null` for a storage pool's, which belongs to none; `detail`, a snapshot's name, a file's path, or with `--show-commands` an exec's command line; `user`, who asked LXD for it; and `count`, how many times it happened, as repeats within ten minutes share one line |
 | `instance_counts` | `running`, `stopped` |
 | `instances` | In the table's order: `name`, `type`, `state`, `ipv4`, `uptime_s`, `cpu_pct`, `cpu_history_pct`, `busiest_process` (`name`, `cpu_pct`), `mem_bytes`, `disk_read_bytes_per_s`, `disk_write_bytes_per_s`, `disk_source` (`zfs`, `io.stat`, or `lxd` for a VM's from LXD's metrics), `net_in_bits_per_s`, `net_out_bits_per_s`, `tasks`. Limits and ops signals: `cpu_limit_cores`, `cpu_throttled_pct`, `mem_limit_bytes`, `mem_of_limit_pct`, `tasks_limit`, `tasks_of_limit_pct`, `waiting_on`, `waiting_pct`, `mem_kills` (since lxdtop started), `mem_kills_total` (the kernel's count since the instance started), `last_mem_kill_ago_s`, `newest_snapshot_at`, `newest_snapshot_age_s` |
 
@@ -190,7 +190,7 @@ Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_
 |---|---|
 | Container CPU, history and graph | `/sys/fs/cgroup/lxc.payload.<name>/cpu.stat`. 100% means one CPU core fully busy |
 | Container memory | `memory.current` minus inactive file cache from `memory.stat`: the working set, as `docker stats` reports it |
-| VM CPU and memory | The VM's QEMU process (`/proc/<pid>/stat` and `VmRSS`). LXD's API reports zero for VMs that do not run its guest agent, so lxdtop reads the process instead |
+| VM CPU and memory | The VM's QEMU process (`/proc/<pid>/stat` and `VmRSS`). LXD's API reports zero for VMs that do not run its guest agent, so lxdtop reads the process instead. When it can't, the VM's row and its detail view say why |
 | Busiest process and uptime | `/proc/<pid>/cgroup` (which container a process belongs to) and `/proc/<pid>/stat` |
 | Disk reads and writes | ZFS per-dataset counters (`/proc/spl/kstat/zfs/<pool>/objset-*`), which include reads served from cache; cgroup `io.stat` on other storage. A VM whose disk isn't on ZFS has no counter lxdtop's user can read on the host, so its numbers come from LXD's metrics (`GET /1.0/metrics`, read every 15 seconds while there's such a VM), which LXD takes from the VM's agent or from QEMU: they show after half a minute, and change every 15 seconds |
 | Network in and out | Host-side veth and tap interface counters, in megabits per second |

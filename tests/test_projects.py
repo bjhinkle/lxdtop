@@ -44,19 +44,22 @@ class ProjectsTest(unittest.TestCase):
         api["project"], api["state"]["pid"] = "default", 4500
         answer.append(api)
 
-    def readings(self, events=(), drop=()):
-        """A Monitor after two readings 2 s apart, with LXD's answers (less the instances in drop) and events."""
+    def readings(self, events=(), drop=(), with_api=True):
+        """A Monitor after two readings 2 s apart, with LXD's answers (less the instances in drop) and events,
+        or with_api=False, as with --no-api: from the cgroups alone."""
         self.routes[INSTANCES][1]["metadata"] = [inst for inst in self.routes[INSTANCES][1]["metadata"]
                                                  if (inst.get("project"), inst["name"]) not in drop]
         gone = {name if project == "default" else f"{project}_{name}" for project, name in drop}
         for cg in gone:
             self.host.remove(f"/sys/fs/cgroup/lxc.payload.{cg}")
         with FakeLxd(self.routes) as lxd, self.host.installed():
-            api = lxdtop.LxdApi(lxd.path)
-            api.fetch()
-            feed = lxdtop.LxdEvents("/unused")
-            for each in events:
-                feed._record(each)
+            api = feed = None
+            if with_api:
+                api = lxdtop.LxdApi(lxd.path)
+                api.fetch()
+                feed = lxdtop.LxdEvents("/unused")
+                for each in events:
+                    feed._record(each)
             mon = lxdtop.Monitor(api, feed)
             mon.sample()
             self.host.clock += 2
@@ -133,6 +136,24 @@ class ProjectsTest(unittest.TestCase):
         legend = next(line for line in text.splitlines() if "host itself" in line)
         self.assertIn("■ api  ", legend)
         self.assertNotIn("dev_api", text)
+
+    def test_without_the_api_a_container_in_a_project_shows_as_with_it(self):
+        """#16: without LXD's API, dev's api showed by its cgroup name, dev_api, in the table and the legend."""
+        text = self.draw(self.readings(with_api=False))
+        self.assertEqual(self.names(text), ["dev/api", "api", "db", "web"])  # as with the API, less the stopped one
+        legend = next(line for line in text.splitlines() if "host itself" in line)
+        self.assertIn("■ dev/api  ■ api  ", legend)
+        self.assertIn("dev/api: throttled 50% @2c", text)
+        self.assertNotIn("dev_api", text)
+
+    def test_without_the_api_and_with_one_project_its_name_alone(self):
+        mon = self.readings(drop=[("default", "api")], with_api=False)
+        text = self.draw(mon)
+        self.assertEqual(self.names(text), ["api", "db", "web"])
+        self.assertIn("■ api  ", next(line for line in text.splitlines() if "host itself" in line))
+        self.assertNotIn("dev_api", text)
+        self.assertEqual([(i["name"], i["project"]) for i in lxdtop.reading_json(mon, 2)["instances"]],
+                         [("api", "dev"), ("db", "default"), ("web", "default")])
 
     def test_with_one_project_names_stay_as_they_are(self):
         """Whichever project it is: here, the dev project's api is the only instance outside the default one."""

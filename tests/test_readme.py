@@ -1,5 +1,6 @@
 """The README's install commands, run as written, with a stand-in curl or install."""
 
+import hashlib
 import os
 import re
 import shutil
@@ -26,6 +27,31 @@ sys.exit(int(os.environ.get("FAKE_CURL_EXIT", "0")))
 '''
 
 OLD = "#!/bin/sh\necho 'lxdtop 1.4.0 (the old copy)'\n"
+
+SYNC = f'''#!{sys.executable}
+"""Stands in for sync FILE: writes down what it was asked to flush, and the SHA-256 of that file and of
+~/bin/lxdtop at that moment, then exits with $SYNC_EXIT (default 0)."""
+import hashlib, os, sys
+def held(path):
+    with open(path, "rb") as f:
+        return hashlib.sha256(f.read()).hexdigest()
+with open(os.environ["SYNC_LOG"], "a") as log:
+    log.write(" ".join(["sync"] + sys.argv[1:]) + "\\n")
+    log.write(held(sys.argv[1]) + "\\n" + held(os.path.join(os.environ["HOME"], "bin", "lxdtop")) + "\\n")
+sys.exit(int(os.environ.get("SYNC_EXIT", "0")))
+'''
+
+
+def sha256(data):
+    return hashlib.sha256(data.encode() if isinstance(data, str) else data).hexdigest()
+
+
+def add_tool(directory, name, text):
+    """A script in this directory, which comes first on the PATH, standing in for one of the host's tools."""
+    path = os.path.join(directory, name)
+    with open(path, "w") as f:
+        f.write(text)
+    os.chmod(path, 0o755)
 
 
 def install_commands():
@@ -68,13 +94,12 @@ class ReadmeInstallTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory(prefix="lxdtop-readme-")
         self.addCleanup(tmp.cleanup)
         self.home = os.path.join(tmp.name, "home")
-        tools = os.path.join(tmp.name, "tools")
+        self.tools = os.path.join(tmp.name, "tools")
+        self.sync_log = os.path.join(tmp.name, "sync-log")
         os.makedirs(self.home)
-        os.makedirs(tools)
-        with open(os.path.join(tools, "curl"), "w") as f:
-            f.write(FAKE_CURL)
-        os.chmod(os.path.join(tools, "curl"), 0o755)
-        self.path = tools + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
+        os.makedirs(self.tools)
+        add_tool(self.tools, "curl", FAKE_CURL)
+        self.path = self.tools + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
         self.installed = os.path.join(self.home, "bin", "lxdtop")
 
     def old_copy(self):
@@ -130,6 +155,26 @@ class ReadmeInstallTest(unittest.TestCase):
                                  env=dict(PATH=self.path), timeout=60)
         self.assertEqual((cut_off.returncode, cut_off.stdout), (0, ""))        # why the check needs grep
 
+    def test_the_download_is_flushed_to_disk_before_the_rename(self):
+        """#16: the README renamed the download into place unflushed, where `lxdtop-remote install` flushes it.
+
+        A power cut just after the rename could then leave an empty ~/bin/lxdtop.
+        """
+        self.old_copy()
+        add_tool(self.tools, "sync", SYNC)
+        self.assert_installed(self.run_readme(SYNC_LOG=self.sync_log))
+        with open(self.sync_log) as f, open(LXDTOP_PATH, "rb") as original:
+            # once, for the download alone, when it was whole and ~/bin/lxdtop was still the old copy
+            self.assertEqual(f.read().splitlines(),
+                             [f"sync {self.installed}.new", sha256(original.read()), sha256(OLD)])
+
+    def test_a_download_that_cannot_be_flushed_leaves_the_old_copy(self):
+        self.old_copy()
+        add_tool(self.tools, "sync", SYNC)
+        result = self.run_readme(SYNC_LOG=self.sync_log, SYNC_EXIT="1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assert_old_copy()
+
 
 @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
 class ReadmeCloneInstallTest(unittest.TestCase):
@@ -144,16 +189,15 @@ class ReadmeCloneInstallTest(unittest.TestCase):
         self.midway = os.path.join(tmp.name, "midway")
         for path in (self.home, self.clone, self.tools):
             os.makedirs(path)
-        with open(os.path.join(self.tools, "install"), "w") as f:
-            f.write(GNU_INSTALL)
-        os.chmod(os.path.join(self.tools, "install"), 0o755)
+        add_tool(self.tools, "install", GNU_INSTALL)
+        self.sync_log = os.path.join(tmp.name, "sync-log")
         self.installed = os.path.join(self.home, "bin", "lxdtop")
         os.makedirs(os.path.dirname(self.installed))
         with open(self.installed, "w") as f:
             f.write(OLD)
         os.chmod(self.installed, 0o755)
 
-    def run_readme(self, text=None, stand_in=True):
+    def run_readme(self, text=None, stand_in=True, **env):
         with open(LXDTOP_PATH) as f:
             text = text or f.read()
         with open(os.path.join(self.clone, "lxdtop"), "w") as f:
@@ -161,8 +205,8 @@ class ReadmeCloneInstallTest(unittest.TestCase):
         os.chmod(os.path.join(self.clone, "lxdtop"), 0o755)
         path = (self.tools + os.pathsep if stand_in else "") + os.environ.get("PATH", "/usr/bin:/bin")
         return subprocess.run([shutil.which("sh"), "-c", clone_commands()], capture_output=True, text=True,
-                              cwd=self.clone, env=dict(PATH=path, HOME=self.home, LANG="C.UTF-8", MIDWAY=self.midway),
-                              timeout=60)
+                              cwd=self.clone, timeout=60,
+                              env=dict(PATH=path, HOME=self.home, LANG="C.UTF-8", MIDWAY=self.midway, **env))
 
     def assert_installed(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -192,6 +236,21 @@ class ReadmeCloneInstallTest(unittest.TestCase):
 
     def test_with_this_computers_own_install(self):
         self.assert_installed(self.run_readme(stand_in=False))
+
+    def test_the_copy_is_flushed_to_disk_before_the_rename(self):
+        """#16: as the download is, and as `lxdtop-remote install` does."""
+        add_tool(self.tools, "sync", SYNC)
+        self.assert_installed(self.run_readme(SYNC_LOG=self.sync_log))
+        with open(self.sync_log) as f, open(LXDTOP_PATH, "rb") as original:
+            self.assertEqual(f.read().splitlines(),
+                             [f"sync {self.installed}.new", sha256(original.read()), sha256(OLD)])
+
+    def test_a_copy_that_cannot_be_flushed_leaves_the_old_copy(self):
+        add_tool(self.tools, "sync", SYNC)
+        result = self.run_readme(SYNC_LOG=self.sync_log, SYNC_EXIT="1")
+        self.assertNotEqual(result.returncode, 0)
+        with open(self.installed) as f:
+            self.assertEqual(f.read(), OLD)
 
 
 if __name__ == "__main__":
