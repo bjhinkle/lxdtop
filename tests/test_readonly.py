@@ -70,7 +70,7 @@ class ReadOnlyTest(unittest.TestCase):
         methods = re.compile(r"^(GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS|CONNECT|TRACE) /")
         found = [node.value.split("\r\n")[0] for node in ast.walk(TREE)
                  if isinstance(node, ast.Constant) and isinstance(node.value, str) and methods.match(node.value)]
-        self.assertEqual(found, ["GET /1.0/events?type=lifecycle HTTP/1.1"])
+        self.assertEqual(found, ["GET /1.0/events?type=lifecycle&all-projects=true HTTP/1.1"])
 
     def test_nothing_writes_files_or_starts_programs(self):
         allowed = {"os.path.join", "os.path.exists", "os.path.basename", "os.listdir", "os.statvfs",

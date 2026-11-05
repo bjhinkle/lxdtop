@@ -119,6 +119,25 @@ class FailureTest(unittest.TestCase):
                 self.assertEqual(status, f"error ({error})")
                 self.assertIn("web", found)                     # the last good answer is kept
 
+    def test_a_pool_lxd_cannot_read_is_left_out(self):
+        """SECURITY-REVIEW.md N-9: one unreadable storage pool used to stop every refresh.
+
+        LXD 5.21 and 6 answer a pool's /resources with an error when they can't
+        read it, for example a ZFS pool that wasn't imported. fetch() threw the
+        whole answer away, every time, so names, addresses, VMs and stopped
+        instances froze, or never showed if lxdtop started that way.
+        """
+        broken = (500, {"type": "error", "error_code": 500,
+                        "error": "Failed to run: zfs get -H -p -o value available default: exit status 1 "
+                                 "(cannot open 'default': no such pool)"})
+        api = self.fetch(lxd_routes(**{"/1.0/storage-pools/default/resources": broken}))
+        found, status, server, pools = api.snapshot()
+        self.assertEqual(status, "ok")
+        self.assertIn("web", found)
+        self.assertEqual(pools, [])                     # "default" is left out; "scratch" reports no size
+        self.assertEqual(server["version"], "6.9")
+        self.assertEqual(server["zfs_roots"], ["default"])   # its datasets still count for the DISK columns
+
     def test_an_instance_without_a_name(self):
         api = self.fetch(lxd_routes(**{INSTANCES: (200, {"metadata": [{"status": "Running"}]})}))
         self.assertEqual(api.snapshot()[1], "error (KeyError)")
