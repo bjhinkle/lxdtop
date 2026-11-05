@@ -190,7 +190,7 @@ Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_
 |---|---|
 | Container CPU, history and graph | `/sys/fs/cgroup/lxc.payload.<name>/cpu.stat`. 100% means one CPU core fully busy |
 | Container memory | `memory.current` minus inactive file cache from `memory.stat`: the working set, as `docker stats` reports it |
-| VM CPU and memory | The VM's QEMU process (`/proc/<pid>/stat` and `VmRSS`). LXD's API reports zero for VMs that do not run its guest agent, so lxdtop reads the process instead |
+| VM CPU and memory | The VM's QEMU process (`/proc/<pid>/stat` and `VmRSS`). LXD's API reports zero for VMs that do not run its guest agent, so lxdtop reads the process instead. When it can't, the VM's row and its detail view say why |
 | Busiest process and uptime | `/proc/<pid>/cgroup` (which container a process belongs to) and `/proc/<pid>/stat` |
 | Disk reads and writes | ZFS per-dataset counters (`/proc/spl/kstat/zfs/<pool>/objset-*`), which include reads served from cache; cgroup `io.stat` on other storage. A VM whose disk isn't on ZFS has no counter lxdtop's user can read on the host, so its numbers come from LXD's metrics (`GET /1.0/metrics`, read every 15 seconds while there's such a VM), which LXD takes from the VM's agent or from QEMU: they show after half a minute, and change every 15 seconds |
 | Network in and out | Host-side veth and tap interface counters, in megabits per second |

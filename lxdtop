@@ -447,6 +447,17 @@ def read_vm_process(pid):
     return (int(fields[11]) + int(fields[12])) * 1_000_000 // CLOCK_TICKS, rss, int(fields[19])
 
 
+def vm_unread(pid):
+    """Why read_vm_process() had nothing for a VM that LXD says is running: (in a few words, a hint)."""
+    if not pid:
+        return "LXD gave no QEMU process ID", ""
+    if not os.path.exists(f"/proc/{pid}"):
+        return f"QEMU process {pid} not found", "it may have just stopped, or /proc may hide it"
+    if read(f"/proc/{pid}/stat") is None:
+        return f"no access to QEMU process {pid}", "/proc may hide other users' processes (hidepid)"
+    return f"process {pid} is not QEMU", "it may have just stopped, and its ID been reused"
+
+
 def read_net(host_ends):
     """Bytes in and out so far over an instance's host-side network interfaces.
 
@@ -514,7 +525,8 @@ def new_row(cg, inst, **fields):
                project=inst.get("project") or project_of(cg), state=inst.get("status", "Running"), live=True,
                vm=False, ip=inst.get("ipv4", ""), mem=None, tasks=None, top=None, up=None,
                cpu=None, rd=None, wr=None, net_in=None, net_out=None, snapshot=inst.get("snapshot"),
-               throttled=None, cpu_max=None, cpu_quota=None, mem_max=None, tasks_max=None, waiting=None)
+               throttled=None, cpu_max=None, cpu_quota=None, mem_max=None, tasks_max=None, waiting=None,
+               unread=None)
     row.update(fields)
     return row
 
@@ -1174,10 +1186,12 @@ class Monitor:
             self.api.vm_disks_wanted = frozenset(wanted)
 
         # Anything else LXD knows about is stopped (or a VM whose process couldn't be read, which
-        # is_stopped() counts as running).
+        # is_stopped() counts as running, and whose row says why: see vm_unread()).
         for cg, inst in instances.items():
             if cg not in readings:
-                rows.append(new_row(cg, inst, live=False, vm=inst.get("type") == "virtual-machine"))
+                vm = inst.get("type") == "virtual-machine"
+                unread = vm_unread(inst.get("pid")) if vm and inst.get("status") == "Running" else None
+                rows.append(new_row(cg, inst, live=False, vm=vm, unread=unread))
         for cg in list(self.cpu_history):
             if cg not in readings:
                 del self.cpu_history[cg]
@@ -2067,7 +2081,13 @@ def draw_row(cv, y, x0, layout, row, mon, marked=()):
     if not row["live"]:
         cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "dim")      # red: see the warning
         cv.put(y, at("name"), name, "dim")
-        cv.put(y, at("up") if "up" in layout else at("cpu"), row["state"].lower(), "dim")
+        state = row["state"].lower()
+        if row["unread"]:                    # a running VM lxdtop can't read: why its row has no numbers
+            state += "   no readings: " + row["unread"][0]
+        # up to the extra columns, which still show for it, or else the table's edge
+        ops = [at(col) - 2 for col, _ in OPS_COLUMNS if col in layout]
+        end = min(ops) if ops else max(at(col) + width(col) for col in layout)
+        cv.put(y, at("up") if "up" in layout else at("cpu"), state, "dim", end)
         return
     cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "mid" if row["state"] == "Frozen" else "lo")
     cv.put(y, at("name"), name, mon.series_style.get(row["cg"], "bright"))
@@ -2357,9 +2377,13 @@ def detail_lines(row, mon, gone):
         state = [("gone", "hi"), (": no longer on this host, last seen " + row["state"].lower(), "text")]
     else:
         state = [(row["state"].lower(), "lo" if live else "dim")]
-    lines = [("state", state + [(f"   {'virtual machine' if vm else 'container'} on {where}", "dim")]),
-             ("address", [(row["ip"], "ip")] if row["ip"] else dash),
-             ("up", [(fmt_uptime(row["up"]), "text")] if row["up"] is not None else dash)]
+    lines = [("state", state + [(f"   {'virtual machine' if vm else 'container'} on {where}", "dim")])]
+    if row["unread"] and not gone:                   # a running VM lxdtop can't read: why, and what may cause it
+        why, hint = row["unread"]
+        lines.append(("readings", [("none", "mid"), (": " + why, "text")]))
+        lines += [("", [(hint, "dim")])] if hint else []
+    lines += [("address", [(row["ip"], "ip")] if row["ip"] else dash),
+              ("up", [(fmt_uptime(row["up"]), "text")] if row["up"] is not None else dash)]
     cpu = [(fmt_pct(row["cpu"]), cpu_style(row["cpu"])), (" of one core", "dim")] if row["cpu"] is not None else dash
     if row["cpu_max"] is not None:
         cpu = cpu + [("   limit ", "dim"), (f"{row['cpu_max']:.3g} cores", "text")]
