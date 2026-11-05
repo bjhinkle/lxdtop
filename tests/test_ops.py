@@ -39,20 +39,35 @@ class CgroupLimitTest(unittest.TestCase):
         h.write(WEB + "/pids.max", "500\n")
         for resource, some in (("cpu", "3.50"), ("memory", "41.20"), ("io", "12.00")):
             h.write(f"{WEB}/{resource}.pressure", pressure(some))
-        self.assertEqual(self.limits(), dict(cpu_max=1.5, mem_max=2048 * MiB, tasks_max=500, waiting=("mem", 41.2)))
+        self.assertEqual(self.limits(), dict(cpu_max=1.5, cpu_quota=1.5, mem_max=2048 * MiB, tasks_max=500,
+                                             waiting=("mem", 41.2)))
 
     def test_no_limits(self):
         for name, text in (("cpu.max", "max 100000\n"), ("memory.max", "max\n"), ("pids.max", "max\n")):
             self.host.write(f"{WEB}/{name}", text)
-        self.assertEqual(self.limits(), dict(cpu_max=None, mem_max=None, tasks_max=None, waiting=None))
+        self.assertEqual(self.limits(), dict(cpu_max=None, cpu_quota=None, mem_max=None, tasks_max=None, waiting=None))
 
     def test_files_that_are_missing_or_turned_off_are_left_out(self):
         # add_container writes none of these: a kernel without them, or a controller that's off.
-        self.assertEqual(self.limits(), dict(cpu_max=None, mem_max=None, tasks_max=None, waiting=None))
+        self.assertEqual(self.limits(), dict(cpu_max=None, cpu_quota=None, mem_max=None, tasks_max=None, waiting=None))
         # With pressure accounting off (psi=0), reading a .pressure file fails: read() gives None.
         self.host.mkdir(WEB + "/cpu.pressure")
         self.host.write(WEB + "/io.pressure", pressure("7.00"))
         self.assertEqual(self.limits()["waiting"], ("io", 7.0))
+
+    def test_a_cpuset_of_fewer_cpus_than_the_host_has_is_a_cpu_limit(self):
+        # LXD applies a container's limits.cpu as its cpuset. The fake host has four CPUs.
+        for cpus, limit in (("1-2", 2), ("3", 1), ("0,2-3", 3), ("0-3", None), ("", None), ("x", None)):
+            with self.subTest(cpus):
+                self.host.write(WEB + "/cpuset.cpus.effective", cpus + "\n")
+                self.assertEqual((self.limits()["cpu_max"], self.limits()["cpu_quota"]), (limit, None))
+
+    def test_with_a_quota_too_the_smaller_is_the_limit(self):
+        for cpus, quota, limit in (("0,2", "300000", 2), ("0-2", "150000", 1.5), ("0-3", "250000", 2.5)):
+            with self.subTest(cpus=cpus, quota=quota):
+                self.host.write(WEB + "/cpuset.cpus.effective", cpus + "\n")
+                self.host.write(WEB + "/cpu.max", quota + " 100000\n")
+                self.assertEqual((self.limits()["cpu_max"], self.limits()["cpu_quota"]), (limit, int(quota) / 100000))
 
 
 class MonitorSignalsTest(unittest.TestCase):
@@ -71,6 +86,7 @@ class MonitorSignalsTest(unittest.TestCase):
             h.add_container("web", 1_000_000 + 1000 * periods, memory=512 * MiB)
             h.write(WEB + "/cpu.stat", f"usage_usec {1_000_000 + 1000 * periods}\nuser_usec 1\nsystem_usec 1\n"
                                        f"nr_periods {periods}\nnr_throttled {throttled}\nthrottled_usec 0\n")
+            h.write(WEB + "/cpu.max", "150000 100000\n")         # throttling needs a quota
             if kills is not None:
                 h.write(WEB + "/memory.events", f"low 0\nhigh 0\nmax 4\noom 2\noom_kill {kills}\noom_group_kill 0\n")
         else:
@@ -138,6 +154,52 @@ class MonitorSignalsTest(unittest.TestCase):
             self.mon.sample()
         row = self.mon.rows[0]
         self.assertEqual((row["mem_max"], row["waiting"]), (1024 * MiB, ("mem", 30.0)))
+
+
+class CpusetLimitTest(unittest.TestCase):
+    """LXD applies a container's limits.cpu as a cpuset, so a container held to fewer CPUs than the host has
+    shows that as its CPU limit; with a quota (cpu.max) as well, the smaller. Only a quota throttles, so
+    without one there's no throttling reading. Readings 2 s apart of a 16-CPU host with three containers."""
+
+    def setUp(self):
+        self.host = h = FakeHost(self)
+        h.cpus = 16
+        h.set_basics()
+        h.set_cpu_times((100, 0, 900), [(25, 0, 225)] * 16)
+        with h.installed():
+            self.mon = lxdtop.Monitor(None, None)
+        for step in (0, 1):
+            for cg, cpus, quota in (("pinned", "4-5", "max"), ("free", "0-15", "max"), ("both", "2-5", "150000")):
+                h.add_container(cg, 1_000_000 + 500_000 * step)
+                base = f"/sys/fs/cgroup/lxc.payload.{cg}"
+                h.copy_fixture("cgroup-cpu.stat", base + "/cpu.stat")        # a real one: nr_periods 0
+                if cg == "both":                                             # held back in 6 of 20 periods
+                    h.write(base + "/cpu.stat", f"usage_usec {1_000_000 + 500_000 * step}\n"
+                                                f"nr_periods {20 * step}\nnr_throttled {6 * step}\n")
+                h.write(base + "/cpuset.cpus.effective", cpus + "\n")
+                h.write(base + "/cpu.max", quota + " 100000\n")
+            with h.installed():
+                self.mon.sample()
+            h.clock += 2
+        self.rows = {r["cg"]: r for r in self.mon.rows}
+
+    def test_the_rows(self):
+        self.assertEqual({cg: (r["cpu_max"], r["cpu_quota"], r["throttled"]) for cg, r in self.rows.items()},
+                         {"pinned": (2, None, None), "free": (None, None, None), "both": (1.5, 1.5, 30.0)})
+
+    def test_the_throttled_column(self):
+        cells = {cg: lxdtop.ops_cells(r, self.mon).get("thr") for cg, r in self.rows.items()}
+        self.assertEqual(cells, {"pinned": ("@2c", "dim"),            # as a VM's: its CPUs, no throttling
+                                 "free": ("-", "dim"), "both": ("30% @1.5c", "mid")})
+
+    def test_the_json(self):
+        found = {cg: lxdtop.instance_json(r, self.mon, 0.0, 0.0) for cg, r in self.rows.items()}
+        self.assertEqual({cg: (j["cpu_limit_cores"], j["cpu_throttled_pct"]) for cg, j in found.items()},
+                         {"pinned": (2, None), "free": (None, None), "both": (1.5, 30.0)})
+
+    def test_the_detail_view(self):
+        lines = dict(lxdtop.detail_lines(self.rows["pinned"], self.mon, False))
+        self.assertEqual("".join(text for text, _ in lines["cpu"]), "0.0% of one core   limit 2 cores")
 
 
 class PoolStateTest(unittest.TestCase):

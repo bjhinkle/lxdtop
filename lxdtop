@@ -283,22 +283,42 @@ def read_io_stat(path):
     return rd, wr
 
 
+def count_cpus(text):
+    """How many CPUs a list such as "0-3,8" names (five), as cpuset files and LXD's limits.cpu
+    write them. None if it isn't one."""
+    try:
+        count = 0
+        for part in text.split(","):
+            first, dash, last = part.partition("-")
+            count += max(0, (int(last) if dash else int(first)) - int(first) + 1)
+        return count or None
+    except ValueError:
+        return None
+
+
 def read_cgroup_limits(path):
     """An instance's limits, and how long its tasks waited, from its cgroup (v2) directory.
 
     cpu.max is "<quota> <period>" in microseconds, so quota / period is its CPU limit in
-    cores, or "max <period>" for none. memory.max and pids.max are a number or "max". Each
-    *.pressure file says what share of the recent past some of its tasks spent stalled,
-    waiting for that resource; "some avg10" covers the last 10 seconds. A file that is
-    missing, or that the kernel has turned off, leaves its reading out (None).
+    cores, or "max <period>" for none. cpuset.cpus.effective lists the CPUs its tasks may run
+    on: that's how LXD applies a container's limits.cpu, so fewer than the host has is a CPU
+    limit too, and with a quota as well the smaller is its limit. Only a quota holds tasks
+    back (throttles them), so cpu_quota keeps it on its own. memory.max and pids.max are a
+    number or "max". Each *.pressure file says what share of the recent past some of its
+    tasks spent stalled, waiting for that resource; "some avg10" covers the last 10 seconds.
+    A file that is missing, or that the kernel has turned off, leaves its reading out (None).
     """
     quota, _, period = (read(path + "/cpu.max") or "").strip().partition(" ")
+    quota = int(quota) / int(period) if quota.isdigit() and period.isdigit() else None
+    cpus = count_cpus((read(path + "/cpuset.cpus.effective") or "").strip())
+    if cpus and cpus >= (os.cpu_count() or 0):
+        cpus = None                                          # every CPU the host has: no limit
     waiting = {}
     for resource, label in (("cpu", "cpu"), ("memory", "mem"), ("io", "io")):
         for line in (read(f"{path}/{resource}.pressure") or "").splitlines():
             if line.startswith("some "):                     # "some avg10=12.34 avg60=... total=..."
                 waiting[label] = float(line.split()[1].partition("=")[2])
-    return dict(cpu_max=int(quota) / int(period) if quota.isdigit() and period.isdigit() else None,
+    return dict(cpu_max=min(filter(None, (quota, cpus)), default=None), cpu_quota=quota,
                 mem_max=read_int(path + "/memory.max"), tasks_max=read_int(path + "/pids.max"),
                 waiting=max(waiting.items(), key=lambda item: item[1], default=None))   # the worst one
 
@@ -462,7 +482,7 @@ def new_row(cg, inst, **fields):
     row = dict(cg=cg, name=inst.get("name", cg), state=inst.get("status", "Running"), live=True,
                vm=False, ip=inst.get("ipv4", ""), mem=None, tasks=None, top=None, up=None,
                cpu=None, rd=None, wr=None, net_in=None, net_out=None, snapshot=inst.get("snapshot"),
-               throttled=None, cpu_max=None, mem_max=None, tasks_max=None, waiting=None)
+               throttled=None, cpu_max=None, cpu_quota=None, mem_max=None, tasks_max=None, waiting=None)
     row.update(fields)
     return row
 
@@ -572,16 +592,7 @@ def vm_limits(config):
         return None, None
     cpus = str(config.get("limits.cpu") or VM_DEFAULT_CPUS)
     memory = str(config.get("limits.memory") or VM_DEFAULT_MEMORY)
-    try:
-        if cpus.isdigit():
-            cores = int(cpus)
-        else:                                            # pinned: each CPU or range of them, "first-last"
-            cores = 0
-            for part in cpus.split(","):
-                first, dash, last = part.partition("-")
-                cores += max(0, (int(last) if dash else int(first)) - int(first) + 1)
-    except ValueError:
-        cores = None
+    cores = int(cpus) if cpus.isdecimal() else count_cpus(cpus)      # a number of CPUs, or the ones it's pinned to
     if memory.endswith("%"):                             # of /proc/meminfo's MemTotal, as LXD works it out
         total, share = read_meminfo()["MemTotal"], memory[:-1]
         size = total // 100 * int(share) if total and share.isdigit() else None
@@ -944,8 +955,10 @@ class Monitor:
             row.update(read_cgroup_limits(path))
             self.count_kills(cg, read_fields(path + "/memory.events", ("oom_kill",)).get("oom_kill"), now)
             disk, disk_src = self.read_disk(cg, path)
+            # Only a quota throttles: without one, cpu.stat's counts stay 0, and there's no reading to take.
+            periods = (cpu.get("nr_periods"), cpu.get("nr_throttled")) if row["cpu_quota"] else None
             self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings,
-                         periods=(cpu.get("nr_periods"), cpu.get("nr_throttled")))
+                         periods=periods)
             rows.append(row)
 
         # VMs have no container cgroup: LXD runs each one as a QEMU process on the
@@ -1801,6 +1814,8 @@ def ops_cells(row, mon):
         cells["thr"] = ("-", "dim")
     elif held is not None:
         cells["thr"] = (f"{held:.0f}% @{cap:.3g}c", "mid" if held >= THROTTLED_PCT else "text" if held >= 1 else "dim")
+    elif row["cpu_quota"] is None:                      # held to its cpuset's CPUs alone: no throttling, as a VM
+        cells["thr"] = (f"@{cap:.3g}c", "dim")
     for col, used, limit, show in (("mem_pct", row["mem"], row["mem_max"], human),
                                    ("tasks_pct", row["tasks"], row["tasks_max"], fmt_count)):
         if limit is None:
