@@ -67,6 +67,8 @@ LXD_SOCKETS = ([os.path.join(os.environ["LXD_DIR"], "unix.socket")] if os.enviro
     "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/lxd/unix.socket"]
 API_EVERY = 15                     # seconds between LXD API refreshes
 EVENT_TIMEOUT = 60                 # seconds without a frame, pings included, before the event stream reconnects
+EVENT_FRAME_MAX = 16 * 1024 ** 2   # the longest event frame read, in bytes. LXD's are a few KB, so a longer one means
+                                   # the stream is broken: it reconnects instead of making a buffer that size
 REPEAT_WINDOW = 600                # an event seen again within 10 minutes joins its earlier line
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")   # unit of the CPU times in /proc/<pid>/stat (100 a second)
 
@@ -707,6 +709,10 @@ class LxdApi:
             return dict(self.instances), self.status, dict(self.server), list(self.pools)
 
 
+class FrameTooLargeError(Exception):
+    """An event frame longer than EVENT_FRAME_MAX. The events panel shows its name while it reconnects."""
+
+
 class LxdEvents:
     """Listens to LXD's live event stream for the activity feed.
 
@@ -765,6 +771,8 @@ class LxdEvents:
                 size = int.from_bytes(stream.read(2), "big")
             elif size == 127:
                 size = int.from_bytes(stream.read(8), "big")
+            if size > EVENT_FRAME_MAX:               # before stream.read(size) makes a buffer that big
+                raise FrameTooLargeError(f"{size} bytes")
             mask = stream.read(4) if head[1] & 0x80 else b""
             payload = stream.read(size)
             if mask:
