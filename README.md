@@ -46,6 +46,10 @@ These come from a running container's cgroup, so stopped instances and VMs leave
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.8.2
+
+- **The detail view fits a short window.** In a window under 18 rows, the page is cut to fit inside its box, and its last line says how tall a window shows the rest. Before, its lower lines were drawn over the box's bottom edge.
+
 ## What's new in 1.8.1
 
 - **LXD's API errors show at 80 columns.** When LXD's socket is missing or refuses connections, the instance table's bottom edge now says so, for example `lxd api error (ConnectionRefusedError)`. Where there isn't room for it beside the disk label, the disk label gives way, and on a narrower screen the error's name is shortened.
