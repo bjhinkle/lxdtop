@@ -46,6 +46,7 @@ import socket
 import threading
 import time
 import types
+import unicodedata
 import urllib.parse
 
 VERSION = "1.4.0 (2026-10-01)"
@@ -143,6 +144,7 @@ GLYPHS_ASCII = dict(full="#", mid="=", low="-", cell="#", cell_off=".", idle="."
                     tab_l="[", tab_r="]", foot_l="[", foot_r="]",
                     up="^", down="v", sorted="v", more="~", deg="", times="x")
 G = GLYPHS_UNICODE
+ONE_CELL = frozenset("".join(GLYPHS_UNICODE.values()))   # lxdtop's own glyphs, each one cell wide
 
 EVENT_LABELS = {
     "instance-started": ("started", "ev_start"),
@@ -884,6 +886,12 @@ class Canvas:
         """Write text at (y, x), stopping at column `right`. Returns the column after it."""
         if not text.isprintable():           # names from inside containers can hold escape sequences
             text = "".join(ch if ch.isprintable() else "?" for ch in text)
+        if not text.isascii() and not ONE_CELL.issuperset(text):
+            # Each character gets one cell, but a wide one (CJK, emoji) takes two on most terminals and a
+            # combining one none, which would shift the rest of the line: those become "?" too.
+            text = "".join("?" if unicodedata.east_asian_width(ch) in ("W", "F")
+                           or unicodedata.category(ch) in ("Mn", "Me") else ch
+                           for ch in unicodedata.normalize("NFC", text))
         end = x + len(text)
         right = self.w if right is None else min(right, self.w)
         if 0 <= y < self.h and text and x < right:
