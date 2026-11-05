@@ -13,6 +13,7 @@ and run it.
 
     lxdtop            run it (? lists the keys: q quits, s sorts, / filters, Enter shows details)
     lxdtop --dump     print one frame as plain text and exit (for testing)
+    lxdtop --drawing classic    draw as on the Linux console, in a terminal window too
     lxdtop --dump --json    print one reading as a JSON document, for scripts
 
 Top to bottom: a status line (LXD version, clock, counts); host panels for
@@ -55,7 +56,7 @@ import types
 import unicodedata
 import urllib.parse
 
-VERSION = "1.7.1 (2026-11-05)"
+VERSION = "1.8.0 (2026-11-05)"
 TIMEZONE = None      # the clock's default (None = the system's); TZ overrides it
 CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
@@ -142,6 +143,11 @@ STYLES = {
     "ev_exec": ("cyan", True),
     # The highlighted row: in reverse video, which the Linux console has too.
     "sel": ("white", True),
+    # The fine drawing's meters (see pick_drawing()): ten shades by level, from a meter's bottom tenth
+    # (lv0) to its top (lv9). These are the 16-color stand-ins; STYLES_256 has the shades.
+    "lv0": ("green", True), "lv1": ("green", True), "lv2": ("green", True), "lv3": ("green", True),
+    "lv4": ("green", True), "lv5": ("yellow", True), "lv6": ("yellow", True), "lv7": ("yellow", True),
+    "lv8": ("red", True), "lv9": ("red", True),
 }
 REVERSE = {"sel"}
 
@@ -156,6 +162,9 @@ STYLES_256 = {
     "arc": (74, False),
     "s4": (75, False),
     "b_graph": (68, False),
+    # The fine drawing's meter colors: green, through yellow, to red.
+    "lv0": (41, False), "lv1": (77, False), "lv2": (113, False), "lv3": (149, False), "lv4": (185, False),
+    "lv5": (221, False), "lv6": (215, False), "lv7": (209, False), "lv8": (203, False), "lv9": (196, False),
 }
 
 # Drawing characters. Ubuntu's Linux console font (Uni2-Fixed16) has no half
@@ -172,7 +181,19 @@ GLYPHS_ASCII = dict(full="#", mid="=", low="-", cell="#", cell_off=".", idle="."
                     tab_l="[", tab_r="]", foot_l="[", foot_r="]",
                     up="^", down="v", sorted="v", more="~", deg="", times="x")
 G = GLYPHS_UNICODE
-ONE_CELL = frozenset("".join(GLYPHS_UNICODE.values()) + "".join(map(chr, range(32, 127))))   # glyphs, ASCII
+
+# The fine drawing, for terminal windows (see pick_drawing()), adds braille for the CPU graph and
+# history (a cell is two columns of four dots: U+2800 plus one bit per dot) and eighth blocks for
+# meters, filled from the left, or from the bottom for the per-thread bars.
+BRAILLE = 0x2800
+BRAILLE_LEFT = (0, 0x40, 0x44, 0x46, 0x47)       # 0 to 4 dots up a cell's left column
+BRAILLE_RIGHT = (0, 0x80, 0xA0, 0xB0, 0xB8)      # and up its right column
+EIGHTHS_LEFT = " ▏▎▍▌▋▊▉█"                       # 0 to 8 eighths of a cell
+EIGHTHS_UP = " ▁▂▃▄▅▆▇█"
+FINE = False             # True while the fine drawing is in use
+DRAWING = "classic"      # the drawing in use and why, for the help screen
+ONE_CELL = frozenset("".join(GLYPHS_UNICODE.values()) + "".join(map(chr, range(32, 127)))   # glyphs, ASCII,
+                     + EIGHTHS_LEFT + EIGHTHS_UP + "".join(map(chr, range(BRAILLE, BRAILLE + 256))))   # fine
 
 EVENT_LABELS = {
     "instance-started": ("started", "ev_start"),
@@ -1029,13 +1050,22 @@ class TextCanvas(Canvas):
             out, current = [], None
             for ch, style in row:
                 if style != current:
-                    color_name, bold = STYLES.get(style, ("white", False))
-                    out.append(f"\x1b[0;{'7;' if style in REVERSE else ''}{'1;' if bold else ''}"
-                               f"{30 + COLORS.index(color_name)}m")
+                    out.append(sgr(style))
                     current = style
                 out.append(ch)
             lines.append("".join(out) + "\x1b[0m")
         return "\n".join(lines)
+
+
+def sgr(style):
+    """The escape sequence that sets a style, for --dump --color: 16 colors, as on the console, or
+    for the fine drawing the 256-color shades a terminal window gets."""
+    color_name, bold = STYLES.get(style, ("white", False))
+    code = f"{30 + COLORS.index(color_name)}"
+    if FINE and style in STYLES_256:
+        number, bold = STYLES_256[style]
+        code = f"38;5;{number}"
+    return f"\x1b[0;{'7;' if style in REVERSE else ''}{'1;' if bold else ''}{code}m"
 
 
 class Styled:
@@ -1155,14 +1185,37 @@ def cpu_style(pct):
 
 
 def heat(position):
-    """Color by place along a bar or up a graph: green, then yellow, then red."""
+    """Color by place along a bar or up a graph: green, then yellow, then red. The fine drawing has
+    ten shades for it (lv0 to lv9), changing at the same places."""
+    if FINE:
+        return f"lv{min(9, max(0, int(position * 10)))}"
     return "lo" if position < 0.5 else "mid" if position < 0.8 else "hi"
 
 
 def meter_cells(width, value, scale, color_at):
+    if FINE:
+        return fine_meter_cells(width, value, scale, color_at)
     lit = min(width, int(value / scale * width + 0.5)) if value and scale else 0
     return [(G["cell"], color_at(i / width)) if i < lit else (G["cell_off"], "faint")
             for i in range(width)]
+
+
+def fine_meter_cells(width, value, scale, color_at):
+    """meter_cells() for the fine drawing: full blocks, then an eighth block for the part of a cell,
+    so the meter ends smoothly inside that cell; then a faint light shade for the rest."""
+    eighths = min(width * 8, int(value / scale * width * 8 + 0.5)) if value and scale else 0
+    full, part = divmod(eighths, 8)
+    cells = [(EIGHTHS_LEFT[8], color_at(i / width)) for i in range(full)]
+    if part:
+        cells.append((EIGHTHS_LEFT[part], color_at(full / width)))
+    return cells + [(G["low"], "faint")] * (width - len(cells))
+
+
+def bar_glyph(fill):
+    """column_glyph() for the fine drawing's upright bars: an eighth block, so a bar's top moves
+    in eighths of a cell."""
+    eighths = min(8, int(fill * 8 + 0.5))
+    return EIGHTHS_UP[eighths] if eighths > 0 else None
 
 
 def column_glyph(fill):
@@ -1187,6 +1240,33 @@ def spark(value):
     if value < 10:
         return (G["mid"], "lo")
     return (G["full"], "lo" if value < 50 else "mid" if value < 90 else "hi")
+
+
+def braille_spark(left, right):
+    """spark() for the fine drawing: two samples in one cell, as columns of braille dots: one for a
+    little (from 0.5%), two from 2%, three from 10% and four from 50%, colored as spark() colors the
+    busier one. A cell of idle samples gets a faint dot at the bottom of each."""
+    dots = [0 if v is None or v < 0.5 else 1 if v < 2 else 2 if v < 10 else 3 if v < 50 else 4
+            for v in (left, right)]
+    if not any(dots):
+        if left is None and right is None:
+            return (" ", "text")
+        return (chr(BRAILLE + (BRAILLE_LEFT[1] if left is not None else 0)
+                    + (BRAILLE_RIGHT[1] if right is not None else 0)), "faint")
+    busiest = max(v for v in (left, right) if v is not None)
+    return (chr(BRAILLE + BRAILLE_LEFT[dots[0]] + BRAILLE_RIGHT[dots[1]]),
+            "lo" if busiest < 50 else "mid" if busiest < 90 else "hi")
+
+
+def history_cells(history, width):
+    """A CPU history as cells, newest on the right: one sample a cell, as spark() draws it, or two
+    a cell in the fine drawing (braille_spark()). Cells before the oldest sample are blank."""
+    if not FINE:
+        history = list(history)[-width:]
+        return [(" ", "text")] * (width - len(history)) + [spark(v) for v in history]
+    history = list(history)[-2 * width:]
+    history = [None] * (2 * width - len(history)) + history
+    return [braille_spark(history[i], history[i + 1]) for i in range(0, 2 * width, 2)]
 
 
 def rate_cell(value, width):
@@ -1274,7 +1354,7 @@ def draw_cpu_panel(cv, y, x, h, w, mon):
     for i, value in enumerate(threads[:iw // step]):
         height = value / 100 * bar_rows
         for level in range(bar_rows):            # level 0 is the bottom row
-            glyph = column_glyph(height - level)
+            glyph = bar_glyph(height - level) if FINE else column_glyph(height - level)
             if glyph:
                 style = heat((level + 1) / bar_rows)
             elif level == 0:
@@ -1301,7 +1381,10 @@ def draw_mem_panel(cv, y, x, h, w, mon):
     for i, (label, value, scale, style) in enumerate(meters[:h - 3]):
         row = y + 1 + i
         cv.put(row, ix, label, "text")
-        put_cells(cv, row, ix + 6, meter_cells(meter_w, value, scale, lambda _, s=style: s))
+        # The fine drawing colors used memory and swap by level, like the CPU meter; the ZFS cache
+        # and free memory aren't warnings however full they are, so they keep their own colors.
+        color_at = heat if FINE and style in ("mem", "swap") else (lambda _, s=style: s)
+        put_cells(cv, row, ix + 6, meter_cells(meter_w, value, scale, color_at))
         cv.put(row, ix + 6 + meter_w, human(value).rjust(6), style)
         cv.put(row, ix + 12 + meter_w, f"{value / scale * 100:4.0f}%", "text")
     # Bottom row: storage pools from LXD, then the root filesystem. A ZFS pool that isn't ONLINE
@@ -1359,6 +1442,8 @@ def draw_net_panel(cv, y, x, h, w, mon):
 
 def draw_graph(cv, y0, x0, width, height, mon):
     """Stacked CPU history: each column is one sample, each color one container."""
+    if FINE:
+        return draw_fine_graph(cv, y0, x0, width, height, mon)
     label_w = 6
     samples = list(mon.stack)[-(width - label_w):]
     series = mon.pick_series(samples)
@@ -1392,13 +1477,54 @@ def draw_graph(cv, y0, x0, width, height, mon):
     return series
 
 
+def draw_fine_graph(cv, y0, x0, width, height, mon):
+    """draw_graph() in braille, for the fine drawing: two samples a cell, side by side, and four
+    dots to a cell's height. A cell has one color: its taller column's, picked the way draw_graph()
+    picks a cell's (the layer at its middle when full, else its topmost)."""
+    label_w, dots = 6, height * 4
+    samples = list(mon.stack)[-2 * (width - label_w):]
+    series = mon.pick_series(samples)
+    peak = max((sum(s.values()) for s in samples), default=0.0)
+    scale = min(next((s for s in GRAPH_SCALES if s >= peak * 1.05), GRAPH_SCALES[-1]), mon.ncpu * 100)
+    for row, value in ((0, scale), (height // 2, scale / 2), (height - 1, 0)):
+        cv.put(y0 + row, x0, f"{value:g}%".rjust(label_w - 1), "dim")
+
+    styles = [mon.series_style[cg] for cg in series] + ["other", "host"]
+    columns = [(0, 0.0, [])] * (len(samples) % 2)     # (dots lit, total, layer tops): newest at a cell's right
+    for sample in samples:
+        values = [sample.get(cg, 0.0) for cg in series]
+        host = sample.get(HOST, 0.0)
+        values += [max(0.0, sum(sample.values()) - sum(values) - host), host]     # other instances, host itself
+        tops, total = [], 0.0                # where each layer ends, in dots
+        for value in values:
+            total += value / scale * dots
+            tops.append(total)
+        columns.append((min(dots, int(total + 0.5)), total, tops))
+    cells = len(columns) // 2
+    grid = [[(" ", "text")] * cells for _ in range(height)]
+    for col in range(cells):
+        left, right = columns[2 * col], columns[2 * col + 1]
+        for row in range(height):            # row 0 is the bottom
+            n_left, n_right = (min(4, max(0, lit - 4 * row)) for lit, _, _ in (left, right))
+            if not n_left and not n_right:
+                break
+            n, (_, total, tops) = (n_right, right) if n_right >= n_left else (n_left, left)
+            probe = min(4 * row + (2 if n == 4 else n - 0.5), total - 1e-9)
+            style = next(st for top, st in zip(tops, styles) if top > probe)
+            grid[height - 1 - row][col] = (chr(BRAILLE + BRAILLE_LEFT[n_left] + BRAILLE_RIGHT[n_right]), style)
+    start = x0 + label_w + (width - label_w - cells)
+    for row in range(height):
+        put_cells(cv, y0 + row, start, grid[row], right=x0 + width)
+    return series
+
+
 def instance_noun(mon):
     """ "containers", or "instances" once there are VMs on the host too."""
     return "instances" if any(r["vm"] for r in mon.rows) else "containers"
 
 
 def draw_graph_panel(cv, y, x, h, w, mon, ui):
-    span = fmt_span((w - 4 - 6) * ui.interval)
+    span = fmt_span((w - 4 - 6) * ui.interval * (2 if FINE else 1))      # the fine graph has two samples a cell
     noun = instance_noun(mon)
     box(cv, y, x, h, w, "b_graph", title=[[(f"cpu by {noun[:-1]}", "title")], [(f"last {span}", "dim")]],
         right=[[("100% = one core", "dim")]])
@@ -1504,7 +1630,7 @@ def draw_header(cv, y, x0, layout, ui):
             text = label.rjust(w) if align == ">" else label.ljust(w)
             cv.put(y, x0 + x, text[:w], "key" if sorted_here else "bright")
     x, w = layout["hist"]
-    label = f"CPU HISTORY (last {fmt_span(w * ui.interval)})"
+    label = f"CPU HISTORY (last {fmt_span(w * ui.interval * (2 if FINE else 1))})"
     cv.put(y, x0 + x, (label if len(label) <= w else "CPU HISTORY")[:w], "bright")
 
 
@@ -1568,9 +1694,7 @@ def draw_row(cv, y, x0, layout, row, mon, marked=()):
         cv.put(y, at("up"), fmt_age(up).rjust(width("up")), "mid" if up < 3600 else "text" if up < 86400 else "dim")
     cv.put(y, at("cpu"), fmt_pct(row["cpu"]).rjust(width("cpu")), cpu_style(row["cpu"]))
     if width("hist"):
-        history = list(mon.cpu_history.get(row["cg"], ()))[-width("hist"):]
-        cells = [(" ", "text")] * (width("hist") - len(history)) + [spark(v) for v in history]
-        put_cells(cv, y, at("hist"), cells)
+        put_cells(cv, y, at("hist"), history_cells(mon.cpu_history.get(row["cg"], ()), width("hist")))
     if "top" in layout and row["vm"]:
         cv.put(y, at("top"), "virtual machine", "dim")       # its processes are inside the guest
     elif "top" in layout and row["top"]:
@@ -1807,7 +1931,8 @@ def draw_help(cv):
     for row in range(y, y + h):
         cv.put(row, x, " " * w)                        # the box covers what's behind it
     box(cv, y, x, h, w, "b_events", title=[[("keys", "title")]],
-        right=[[(f"lxdtop {VERSION.split()[0]}", "dim")]], footer=[[("any key", "key"), (" closes this", "text")]])
+        right=[[(f"lxdtop {VERSION.split()[0]}", "dim")]], footer=[[("any key", "key"), (" closes this", "text")]],
+        footer_right=[[("drawing ", "dim"), (DRAWING, "text")]])      # see pick_drawing()
     for i, (label, _, text, _) in enumerate(KEYS[:h - 5]):
         cv.put(y + 2 + i, x + 3, label, "key")
         cv.put(y + 2 + i, x + 11, text, "text", x + w - 2)
@@ -1890,7 +2015,12 @@ def draw_detail(cv, y, mon, ui):
         line += 1
     history = list(mon.cpu_history.get(row["cg"], ()))[-(right - ix - 12):]
     cv.put(line, ix, "cpu history", "bright")
-    put_cells(cv, line, ix + 12, [spark(value) for value in history], right)
+    if FINE:                                       # two samples a cell, from the left like the rest
+        history = list(mon.cpu_history.get(row["cg"], ()))[-2 * (right - ix - 12):]
+        history = [None] * (len(history) % 2) + history
+        put_cells(cv, line, ix + 12, [braille_spark(*history[i:i + 2]) for i in range(0, len(history), 2)], right)
+    else:
+        put_cells(cv, line, ix + 12, [spark(value) for value in history], right)
     line += 2
     feed, _ = mon.events.snapshot() if mon.events else ([], "off")
     mine = [event for event in feed if event["name"] == row["name"]]
@@ -2083,6 +2213,32 @@ def curses_attrs():
     return attrs
 
 
+def pick_drawing(asked, colors):
+    """Choose the drawing, and say on the help screen which it is and why.
+
+    The classic drawing is what the Linux console can show: 16 colors, and only the characters in
+    Ubuntu's console font. The fine one is for terminal windows: braille for the CPU graph and
+    history, eighth blocks for meters, and ten shades of green to red on them. It needs a UTF-8
+    locale, 256 colors and a font with those characters. With no --drawing (`asked`), lxdtop draws
+    fine when TERM isn't the console's (linux) and the terminal has at least 256 `colors`; --dump
+    has no terminal to ask (colors is None), so it draws classic unless asked. --ascii, or a locale
+    that isn't UTF-8, draws plain ASCII whatever was asked.
+    """
+    global FINE, DRAWING
+    term = os.environ.get("TERM", "")
+    if G is GLYPHS_ASCII:
+        utf8 = "utf" in locale.getpreferredencoding(False).lower()
+        FINE, DRAWING = False, "ascii (--ascii)" if utf8 else "ascii (not a UTF-8 locale)"
+    elif asked:
+        FINE, DRAWING = asked == "fine", f"{asked} (--drawing {asked})"
+    elif term.startswith("linux"):
+        FINE, DRAWING = False, f"classic (TERM={term})"
+    elif colors is None:
+        FINE, DRAWING = False, "classic (--dump)"
+    else:
+        FINE, DRAWING = colors >= 256, f"{'fine' if colors >= 256 else 'classic'} ({colors} colors)"
+
+
 # Every key lxdtop answers to: (what the help calls it, its key codes, what it does, its action).
 # The help screen (?) and --help list this table, and handle_key() looks keys up in it, so what
 # they say and what the keys do can't drift apart. No key changes anything on the host.
@@ -2194,7 +2350,7 @@ def handle_key(key, mon, ui):
     return True
 
 
-def run(screen, mon, ui, max_frames=0):
+def run(screen, mon, ui, max_frames=0, drawing=None):
     try:
         curses.curs_set(0)
     except curses.error:
@@ -2205,6 +2361,7 @@ def run(screen, mon, ui, max_frames=0):
         pass
     screen.timeout(250)               # check the keyboard four times a second
     attrs = curses_attrs()
+    pick_drawing(drawing, getattr(curses, "COLORS", 0))     # curses sets COLORS when color starts
     mon.sample()
     next_sample = time.monotonic() + 0.5   # a quick second reading so rates show at once
     last_draw, frames = 0.0, 0
@@ -2254,6 +2411,10 @@ needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3."""
                         help="skip LXD's API (no IPs, network columns, VMs, stopped instances or events)")
     parser.add_argument("--socket", help="LXD socket path (default: $LXD_DIR, then the snap's, then /var/lib/lxd)")
     parser.add_argument("--ascii", action="store_true", help="draw with plain ASCII characters")
+    parser.add_argument("--drawing", choices=("fine", "classic"),
+                        help="fine: braille graphs and smooth meters, for terminal windows with 256 colors; "
+                             "classic: as on the Linux console. Default: fine where the terminal can show it "
+                             "(--dump: classic)")
     parser.add_argument("--version", action="version", version=f"lxdtop {VERSION}")
     parser.add_argument("--dump", action="store_true", help="print one frame as text and exit")
     parser.add_argument("--json", action="store_true",
@@ -2297,12 +2458,13 @@ needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3."""
         if args.json:
             print(json.dumps(reading_json(mon, args.interval), indent=2))   # ensure_ascii: no raw control bytes
             return
+        pick_drawing(args.drawing, None)
         canvas = TextCanvas(rows, cols)
         draw(canvas, mon, ui)
         print(canvas.text(color=args.color))
         return
     try:
-        curses.wrapper(run, mon, ui, args.frames)
+        curses.wrapper(run, mon, ui, args.frames, args.drawing)
     except KeyboardInterrupt:
         pass
 
