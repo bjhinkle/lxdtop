@@ -114,7 +114,15 @@ chmod 755 ~/bin/lxdtop.new
 
 The fourth line prints the version, and only if the download runs and says it is lxdtop does `mv` replace `~/bin/lxdtop`, in one step. A download cut partway never becomes `~/bin/lxdtop`, so the console service never restarts into a half-downloaded file.
 
-From a clone, `install -m 755 lxdtop ~/bin/lxdtop` does the same.
+From a clone, copy it the same way, beside where it goes, and rename it into place:
+
+```bash
+mkdir -p ~/bin
+install -m 755 lxdtop ~/bin/lxdtop.new
+~/bin/lxdtop.new --version | grep '^lxdtop ' && mv ~/bin/lxdtop.new ~/bin/lxdtop
+```
+
+`install` straight onto `~/bin/lxdtop` would remove the old file before copying the new one, so for a moment there'd be no lxdtop there, or only part of one.
 
 Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
 
@@ -142,7 +150,9 @@ lxdtop-remote install myhost    # copy lxdtop to myhost:~/bin/lxdtop
 lxdtop-remote myhost            # run it in this terminal
 ```
 
-`install` copies lxdtop over one SSH connection to `~/bin/lxdtop.new` on the host and checks it there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and `lxdtop.new --version` must print lxdtop's version. Only then is it flushed to disk and renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was, so the console service never restarts into a half-copied file. On success it prints the version and the SHA-256 it checked.
+`install` copies lxdtop over one SSH connection to a new file of its own in `~/bin` on the host, `lxdtop.new.` and six random characters, so that two installs at once never share one. It checks the copy there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and its `--version` must print lxdtop's version. Only then is it flushed to disk and renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was and the new file is removed, so the console service never restarts into a half-copied file. A connection that drops without a word, which sshd can take hours to notice, ends the install once nothing more has arrived for a minute. On success it prints the version and the SHA-256 it checked.
+
+An lxdtop that's already running keeps running the version it started with. `install` doesn't restart anything, but when the console service below is running, it says so, with the command that restarts it.
 
 On the host it runs `~/bin/lxdtop`, or the `lxdtop` on the host's PATH when `~/bin` has none, so a single copy in `/usr/local/bin` serves every user.
 
@@ -150,7 +160,7 @@ Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time
 
 ## Run it full-time on a console screen
 
-`examples/lxdtop-console.service` is a systemd unit that keeps lxdtop running on virtual terminal 8, for a small monitor attached to the host. Switch to it with Alt+F8 at the keyboard, or with `lxdtop-remote screen myhost` from another machine.
+`examples/lxdtop-console.service` is a systemd unit that keeps lxdtop running on virtual terminal 8, for a small monitor attached to the host. Switch to it with Alt+F8 at the keyboard, or with `lxdtop-remote screen myhost` from another machine. After installing a new version, restart it to run that one: `sudo systemctl restart lxdtop-console`.
 
 ## One reading as JSON
 
