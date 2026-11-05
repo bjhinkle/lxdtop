@@ -105,6 +105,18 @@ class BoxTest(unittest.TestCase):
         self.assertEqual(bottom(22), "╰─┘q└─┘? keys└──┘ok└─╯")      # as far from "ok" as "ok" may be from "q"
         self.assertEqual(bottom(21), "╰─┘q└──────────┘ok└─╯")       # no room: left out, and "ok" stays put
 
+    def test_tabs_width_says_when_box_has_room_for_every_right_hand_label(self):
+        left = [[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")]]
+        for right in ([[("lxd api ok", "lo")]], [[("lxd api ", "dim"), ("error (ConnectionRefusedError)", "mid")],
+                                                   [("disk ", "dim"), ("zfs", "dim")]]):
+            for width in range(20, 90):
+                cv = lxdtop.TextCanvas(3, width)
+                with glyphs(lxdtop.GLYPHS_UNICODE):
+                    lxdtop.box(cv, 0, 0, 3, width, "b_table", footer=left, footer_right=right)
+                drawn = all("".join(text for text, _ in label) in cv.text() for label in right)
+                fits = lxdtop.tabs_width(left) + lxdtop.tabs_width(right) <= width - 4
+                self.assertEqual(drawn, fits, f"width {width}")
+
     def test_ascii_box(self):
         cv = lxdtop.TextCanvas(3, 12)
         with glyphs(lxdtop.GLYPHS_ASCII):
