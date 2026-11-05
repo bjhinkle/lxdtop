@@ -5,7 +5,7 @@ import os
 import unittest
 from unittest import mock
 
-from tests.support import FakeLxd, lxd_routes, lxdtop
+from tests.support import GiB, MiB, FakeHost, FakeLxd, lxd_routes, lxdtop
 
 INSTANCES = "/1.0/instances?recursion=2&all-projects=true"
 NIGHTLY = datetime.datetime(2026, 11, 4, 7, 0, tzinfo=datetime.timezone.utc).timestamp()
@@ -24,15 +24,17 @@ class FetchTest(unittest.TestCase):
             # The first global IPv4 address; link-local and loopback addresses are skipped.
             # recursion=2 includes snapshots: web's newest is "nightly", 03:00 at UTC-4, so 07:00 UTC.
             "web": dict(name="web", status="Running", veths=["veth1a2b3c4d"], ipv4="10.10.10.21",
-                        type="container", pid=4242, snapshot=NIGHTLY),
+                        type="container", pid=4242, snapshot=NIGHTLY, cpu_max=None, mem_max=None),
             "db": dict(name="db", status="Running", veths=["veth22220000", "veth22221111"],
-                       ipv4="192.168.50.12", type="container", pid=4300, snapshot=None),
+                       ipv4="192.168.50.12", type="container", pid=4300, snapshot=None, cpu_max=None, mem_max=None),
             # Outside the default project, the cgroup is named "<project>_<name>".
             "dev_api": dict(name="api", status="Running", veths=[], ipv4="", type="container", pid=4400,
-                            snapshot=None),
+                            snapshot=None, cpu_max=None, mem_max=None),
+            # A VM's limits come from its config: limits.cpu and limits.memory (a container's are in its cgroup).
             "win": dict(name="win", status="Running", veths=["tap0f1e2d3c"], ipv4="10.10.10.30",
-                        type="virtual-machine", pid=5151, snapshot=None),
-            "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0, snapshot=None),
+                        type="virtual-machine", pid=5151, snapshot=None, cpu_max=2, mem_max=4 * GiB),
+            "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0, snapshot=None,
+                        cpu_max=None, mem_max=None),
         })
         self.assertEqual(server, dict(version="6.9", kernel="6.8.0-45-generic", os="Ubuntu 24.04",
                                       member="",                        # not a cluster member
@@ -193,6 +195,95 @@ class FailureTest(unittest.TestCase):
         pools.clear()
         self.assertTrue(api.snapshot()[0])
         self.assertTrue(api.snapshot()[3])
+
+
+class WatchedConfig(dict):
+    """An instance's config that keeps a list of the keys asked for, and fails if anything walks through it."""
+
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.asked = []
+
+    def get(self, key, default=None):
+        self.asked.append(key)
+        return super().get(key, default)
+
+    def __getitem__(self, key):
+        self.asked.append(key)
+        return super().__getitem__(key)
+
+    def walked(self, *args):
+        raise AssertionError("something went through the whole config")
+
+    __iter__ = __contains__ = keys = values = items = copy = __repr__ = __str__ = walked
+
+
+class VmLimitsTest(unittest.TestCase):
+    """A VM's CPU and memory limits, from limits.cpu and limits.memory, worked out as LXD 5.21 and 6 do."""
+
+    def test_cpus_a_number_or_the_ones_it_is_pinned_to(self):
+        for value, cores in (("2", 2), ("16", 16), ("0-3", 4), ("1,3", 2), ("0-3,8,10-11", 7), ("5", 5), ("7-7", 1)):
+            with self.subTest(value):
+                self.assertEqual(lxdtop.vm_limits({"limits.cpu": value})[0], cores)
+
+    def test_memory_in_lxds_units(self):
+        for value, size in (("4GiB", 4 * GiB), ("512MiB", 512 * MiB), ("8KiB", 8192), ("1TiB", 1024 * GiB),
+                            ("2GB", 2 * 10 ** 9), ("1500MB", 1500 * 10 ** 6), ("64kB", 64000), ("100B", 100),
+                            ("1073741824", GiB), ("4096 bytes", 4096)):
+            with self.subTest(value):
+                self.assertEqual(lxdtop.vm_limits({"limits.memory": value})[1], size)
+
+    def test_memory_as_a_share_of_the_hosts(self):
+        host = FakeHost(self)
+        host.copy_fixture("proc-meminfo.txt", "/proc/meminfo")            # MemTotal: 65536000 kB
+        with host.installed():
+            self.assertEqual(lxdtop.vm_limits({"limits.memory": "50%"})[1], 65536000 * 1024 // 100 * 50)
+            self.assertIsNone(lxdtop.vm_limits({"limits.memory": "half%"})[1])
+        with FakeHost(self).installed():                                   # no /proc/meminfo
+            self.assertIsNone(lxdtop.vm_limits({"limits.memory": "50%"})[1])
+
+    def test_lxds_defaults_where_they_are_not_set(self):
+        # LXD gives such a VM one CPU and 1 GiB (QEMUDefaultCPUCores and QEMUDefaultMemSize).
+        self.assertEqual(lxdtop.vm_limits({}), (1, GiB))
+        self.assertEqual(lxdtop.vm_limits({"limits.cpu": "", "limits.memory": ""}), (1, GiB))
+
+    def test_a_value_it_cannot_read_is_no_limit_it_knows(self):
+        for value in ("two", "1.5", "0-", "-3", "3-1", "0x2", "1,,3"):
+            with self.subTest(cpu=value):
+                self.assertIsNone(lxdtop.vm_limits({"limits.cpu": value})[0])
+        for value in ("4G", "4gib", "4 GiB", "1.5GiB", "GiB", "-1GiB", "%", "-5%"):
+            with self.subTest(memory=value):
+                self.assertIsNone(lxdtop.vm_limits({"limits.memory": value})[1])
+
+    def test_values_that_are_not_text(self):
+        # LXD's config values are always strings; anything else still can't stop lxdtop reading the rest.
+        self.assertEqual(lxdtop.vm_limits({"limits.cpu": 4, "limits.memory": None}), (4, GiB))
+        self.assertEqual(lxdtop.vm_limits({"limits.cpu": ["0-3"], "limits.memory": 4.5}), (None, None))
+
+    def test_no_config_from_lxd_means_no_limits_rather_than_its_defaults(self):
+        self.assertEqual(lxdtop.vm_limits(None), (None, None))
+
+    def test_only_the_two_limits_are_read(self):
+        config = WatchedConfig({"limits.cpu": "2", "limits.memory": "4GiB", "cloud-init.user-data": "password: hunter2",
+                                "environment.API_TOKEN": "s3cret"})
+        self.assertEqual(lxdtop.vm_limits(config), (2, 4 * GiB))
+        self.assertEqual(sorted(config.asked), ["limits.cpu", "limits.memory"])
+
+    def test_from_lxds_answer_only_a_vms_and_nothing_else_in_its_config(self):
+        routes = lxd_routes()
+        listed = {inst["name"]: inst for inst in routes[INSTANCES][1]["metadata"]}
+        for name in ("win", "web"):
+            listed[name]["config"] = {"cloud-init.user-data": "#cloud-config\npassword: hunter2"}
+            listed[name]["expanded_config"] = {"limits.cpu": "0-5", "limits.memory": "6GiB",
+                                               "environment.API_TOKEN": "s3cret", "user.note": "rack 7"}
+        with FakeLxd(routes) as lxd:
+            api = lxdtop.LxdApi(lxd.path)
+            api.fetch()
+        found = api.snapshot()[0]
+        self.assertEqual((found["win"]["cpu_max"], found["win"]["mem_max"]), (6, 6 * GiB))
+        self.assertEqual((found["web"]["cpu_max"], found["web"]["mem_max"]), (None, None))   # a container: its cgroup
+        for secret in ("hunter2", "s3cret", "rack 7", "cloud-init", "API_TOKEN", "limits."):
+            self.assertNotIn(secret, repr(found))
 
 
 class SocketPathTest(unittest.TestCase):

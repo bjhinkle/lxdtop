@@ -30,10 +30,10 @@ Everything it does is read-only. Each refresh it reads:
     /sys/class/net/<nic>/statistics/        network bytes per instance (veth/tap) and host port
     /proc/stat, /proc/meminfo, hwmon, ...   host totals, temperature, clock speed
 It also talks to LXD over its local socket, GET requests and an event stream
-only: every 15 seconds for names, state, addresses and pool usage, and
-continuously for lifecycle events. That socket needs membership in the lxd
-group (or root). Without it lxdtop still runs, minus IPs, the network
-columns, VMs, stopped instances and the event feed.
+only: every 15 seconds for names, state, addresses, each VM's CPU and memory
+limits and pool usage, and continuously for lifecycle events. That socket
+needs membership in the lxd group (or root). Without it lxdtop still runs,
+minus IPs, the network columns, VMs, stopped instances and the event feed.
 
 Needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3.
 Tested on Ubuntu 24.04 with LXD 6.7 and Python 3.12.
@@ -545,6 +545,48 @@ def parse_time(text):
         return None
 
 
+# What LXD 5.21 and 6 give a VM without limits.cpu or limits.memory (QEMUDefaultCPUCores and
+# QEMUDefaultMemSize), and the units limits.memory can be in (units.ParseByteSizeString()).
+VM_DEFAULT_CPUS, VM_DEFAULT_MEMORY = "1", "1GiB"
+BYTE_UNITS = {"": 1, "B": 1, " bytes": 1, "kB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3, "TB": 1000 ** 4,
+              "PB": 1000 ** 5, "EB": 1000 ** 6, "KiB": 1024, "MiB": 1024 ** 2, "GiB": 1024 ** 3,
+              "TiB": 1024 ** 4, "PiB": 1024 ** 5, "EiB": 1024 ** 6}
+
+
+def vm_limits(config):
+    """A VM's CPU limit in cores and memory limit in bytes, worked out from its config as LXD does.
+
+    A container's limits are in its cgroup, but a VM has no cgroup here: its limits are the CPUs and
+    memory LXD gives QEMU, from limits.cpu and limits.memory in its expanded config (its own and its
+    profiles'). Only those two keys are read, since the rest of the config can hold secrets.
+      limits.cpu      a number of CPUs ("2"), or the host CPUs it is pinned to ("0-3,8" is five)
+      limits.memory   a size ("4GiB", "512MB", or bytes), or a share of the host's memory ("50%")
+    Unset, they are LXD's defaults. A value lxdtop can't read is None, and both are when LXD sent no config.
+    """
+    if not isinstance(config, dict):
+        return None, None
+    cpus = str(config.get("limits.cpu") or VM_DEFAULT_CPUS)
+    memory = str(config.get("limits.memory") or VM_DEFAULT_MEMORY)
+    try:
+        if cpus.isdigit():
+            cores = int(cpus)
+        else:                                            # pinned: each CPU or range of them, "first-last"
+            cores = 0
+            for part in cpus.split(","):
+                first, dash, last = part.partition("-")
+                cores += max(0, (int(last) if dash else int(first)) - int(first) + 1)
+    except ValueError:
+        cores = None
+    if memory.endswith("%"):                             # of /proc/meminfo's MemTotal, as LXD works it out
+        total, share = read_meminfo()["MemTotal"], memory[:-1]
+        size = total // 100 * int(share) if total and share.isdigit() else None
+    else:                                                # digits, then one of LXD's units
+        number = memory[:len(memory) - len(memory.lstrip("0123456789"))]
+        unit = memory[len(number):]
+        size = int(number) * BYTE_UNITS[unit] if number and unit in BYTE_UNITS else None
+    return cores or None, size
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     """Plain HTTP, but over LXD's local unix socket instead of a TCP port."""
 
@@ -606,9 +648,13 @@ class LxdApi:
                     if not ipv4 and addr.get("family") == "inet" and addr.get("scope") == "global":
                         ipv4 = addr.get("address", "")
             taken = [parse_time(snap.get("created_at")) for snap in inst.get("snapshots") or []]
+            # A VM's limits are in its config (see vm_limits()); a container's are read from its cgroup.
+            cpu_max, mem_max = (vm_limits(inst.get("expanded_config")) if inst.get("type") == "virtual-machine"
+                                else (None, None))
             found[cg] = dict(name=inst["name"], status=inst.get("status", "?"), veths=veths, ipv4=ipv4,
                              type=inst.get("type", "container"), pid=(inst.get("state") or {}).get("pid"),
-                             snapshot=max(filter(None, taken), default=None))   # when the newest was taken
+                             snapshot=max(filter(None, taken), default=None),   # when the newest was taken
+                             cpu_max=cpu_max, mem_max=mem_max)
         return found
 
     def fetch_server(self):
@@ -896,7 +942,8 @@ class Monitor:
             if not process:
                 continue
             cpu_usec, rss, start = process
-            row = new_row(cg, inst, vm=True, mem=rss, up=uptime - start / CLOCK_TICKS)
+            row = new_row(cg, inst, vm=True, mem=rss, up=uptime - start / CLOCK_TICKS,
+                          cpu_max=inst.get("cpu_max"), mem_max=inst.get("mem_max"))    # from LXD: see vm_limits()
             disk, disk_src = self.read_disk(cg)
             self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings)
             rows.append(row)
@@ -1677,9 +1724,16 @@ def draw_header(cv, y, x0, layout, ui):
     cv.put(y, x0 + x, (label if len(label) <= w else "CPU HISTORY")[:w], "bright")
 
 
+def limit_cell(used, limit, show):
+    """MEM/LIMIT or PROCS/LIMIT: what's used as a share of its limit, in yellow from NEAR_LIMIT_PCT."""
+    share = used / limit * 100 if limit else 100.0
+    return f"{share:.0f}% of {show(limit)}", "mid" if share >= NEAR_LIMIT_PCT else "text"
+
+
 def ops_cells(row, mon):
     """The extra columns' (text, style) for one row: {column: (text, style)}. "-" means no limit
-    (or no kill), and a cell left out means no reading: VMs and stopped instances have no cgroup here."""
+    (or no kill), and a cell left out means no reading: stopped instances have no cgroup here, and
+    nor do VMs, which have only the limits LXD gives them."""
     cells, seen = {}, mon.kills.get(row["cg"])
     if seen and seen[1]:
         ago = time.monotonic() - seen[2]
@@ -1688,9 +1742,17 @@ def ops_cells(row, mon):
         cells["kills"] = ("-", "dim")
     taken = row["snapshot"]
     cells["snap"] = (fmt_age(time.time() - taken), "text") if taken else ("never", "dim")
-    if not row["live"] or row["vm"]:
+    if not row["live"]:
         return cells
     held, cap = row["throttled"], row["cpu_max"]
+    if row["vm"]:
+        # Its CPUs and memory from LXD (vm_limits()), and MEM, its QEMU process's, as a share of that
+        # memory. There's no throttling reading for it: it is held to its CPUs, not to a quota.
+        if cap is not None:
+            cells["thr"] = (f"@{cap:.3g}c", "dim")
+        if row["mem_max"] and row["mem"] is not None:
+            cells["mem_pct"] = limit_cell(row["mem"], row["mem_max"], human)
+        return cells
     if cap is None:
         cells["thr"] = ("-", "dim")
     elif held is not None:
@@ -1700,8 +1762,7 @@ def ops_cells(row, mon):
         if limit is None:
             cells[col] = ("-", "dim")
         elif used is not None:
-            share = used / limit * 100 if limit else 100.0
-            cells[col] = (f"{share:.0f}% of {show(limit)}", "mid" if share >= NEAR_LIMIT_PCT else "text")
+            cells[col] = limit_cell(used, limit, show)
     if row["waiting"]:
         resource, share = row["waiting"]
         cells["wait"] = ("-", "dim") if share < 1 else (f"{resource} {share:.0f}%",
@@ -2138,8 +2199,9 @@ def number(text):
 def instance_json(row, mon, now, wall):
     """One instance with every field the table can show; None where there's no reading.
 
-    VMs and stopped instances have no container cgroup here, so no limits, throttling, pressure
-    or memory kills; a VM's processes are inside its guest, so no busiest process either.
+    VMs and stopped instances have no container cgroup here, so no throttling, pressure or memory
+    kills, and a stopped one no limits. A running VM's limits are the CPUs and memory LXD gives it
+    (see vm_limits()); its processes are inside its guest, so no busiest process or tasks either.
     """
     past, kills, waiting = mon.past.get(row["cg"]), mon.kills.get(row["cg"]), row["waiting"]
     top, taken = (None if row["vm"] else row["top"]), row["snapshot"]

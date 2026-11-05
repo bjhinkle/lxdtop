@@ -16,7 +16,7 @@ import types
 import unittest
 from unittest import mock
 
-from tests.support import MiB, glyphs, lxdtop, monitor, row
+from tests.support import GiB, MiB, glyphs, lxdtop, monitor, row
 
 Q, ESC, ENTER, UP, DOWN = ord("q"), 27, 10, curses.KEY_UP, curses.KEY_DOWN
 
@@ -307,10 +307,14 @@ class DetailViewTest(unittest.TestCase):
 
     def test_a_vm_and_a_stopped_instance(self):
         stopped = dict.fromkeys(("mem", "tasks", "top", "up", "cpu", "rd", "wr", "net_in", "net_out"))
-        mon = monitor([row("win", vm=True, top=None, tasks=None), row("old", state="Stopped", live=False, **stopped)])
+        mon = monitor([row("win", vm=True, top=None, tasks=None, mem=3 * GiB, cpu_max=2, mem_max=4 * GiB),
+                       row("old", state="Stopped", live=False, **stopped)])
         _, text = self.open(mon, "win")
         self.assertIn("virtual machine on lxdhost", text)
         self.assertIn("busiest     inside the guest", text)
+        self.assertRegex(text, r"cpu {9}33\.3% of one core   limit 2 cores +│")       # LXD's, and no throttling
+        self.assertIn("memory      3.0G   limit 4.0G (75%)", text)
+        self.assertIn("processes   inside the guest", text)
         _, text = self.open(mon, "old")
         self.assertIn("state       stopped   container on lxdhost", text)
         self.assertIn("cpu         -", text)

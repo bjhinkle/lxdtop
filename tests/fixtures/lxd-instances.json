@@ -111,6 +111,17 @@
       "type": "virtual-machine",
       "status": "Running",
       "status_code": 103,
+      "config": {
+        "limits.memory": "4GiB",
+        "volatile.uuid": "5f0e3a52-8c1d-4b7e-9a26-0d4c8e1f7b39"
+      },
+      "expanded_config": {
+        "image.os": "Windows",
+        "limits.cpu": "2",
+        "limits.memory": "4GiB",
+        "security.secureboot": "false",
+        "volatile.uuid": "5f0e3a52-8c1d-4b7e-9a26-0d4c8e1f7b39"
+      },
       "state": {
         "status": "Running",
         "status_code": 103,

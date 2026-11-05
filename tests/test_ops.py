@@ -339,9 +339,29 @@ class OpsColumnsTest(unittest.TestCase):
                                           "wait": ("-", "dim"), "kills": ("-", "dim"), "snap": ("20d", "text")})
         self.assertEqual(cells["old"], {"snap": ("2d", "text")})                 # stopped: no cgroup readings
 
-    def test_a_vm_shows_only_its_snapshot(self):
-        vm = row("win", vm=True, cpu_max=None, snapshot=None)
+    def test_a_vm_shows_the_cpus_and_memory_lxd_gives_it(self):
+        # No throttling, stalls or processes: those are inside its guest, and it has no cgroup here.
+        vm = row("win", vm=True, mem=3 * GiB, cpu_max=2, mem_max=4 * GiB, top=None, tasks=None, snapshot=None)
+        self.assertEqual(lxdtop.ops_cells(vm, monitor([vm])),
+                         {"thr": ("@2c", "dim"), "mem_pct": ("75% of 4.0G", "text"), "snap": ("never", "dim")})
+        vm["mem"] = int(3.8 * GiB)                                               # near its memory, as a container
+        self.assertEqual(lxdtop.ops_cells(vm, monitor([vm]))["mem_pct"], ("95% of 4.0G", "mid"))
+
+    def test_a_vm_without_limits_from_lxd_shows_only_its_snapshot(self):
+        vm = row("win", vm=True, cpu_max=None, snapshot=None)                  # not "-": its limits aren't known
         self.assertEqual(lxdtop.ops_cells(vm, monitor([vm])), {"snap": ("never", "dim")})
+        stopped = row("win", vm=True, live=False, state="Stopped", cpu_max=2, mem_max=4 * GiB, snapshot=None)
+        self.assertEqual(lxdtop.ops_cells(stopped, monitor([stopped])), {"snap": ("never", "dim")})
+
+    def test_a_vms_limits_in_their_columns(self):
+        mon = monitor([row("web"), row("win", vm=True, mem=3 * GiB, cpu_max=2, mem_max=4 * GiB, top=None, tasks=None)])
+        lines = render(mon, 240, 60).text().splitlines()
+        header = next(i for i, line in enumerate(lines) if "THROTTLED" in line)
+        win = next(line for line in lines[header:] if line.startswith("│ ■ win "))    # its row, not the legend
+        layout = lxdtop.table_layout(236)
+        cell = {col: win[2 + x:2 + x + w] for col, (x, w) in layout.items()}
+        self.assertEqual((cell["thr"], cell["mem_pct"]), ("@2c".rjust(10), "75% of 4.0G".rjust(12)))
+        self.assertEqual((cell["wait"].strip(), cell["tasks_pct"].strip()), ("", ""))
 
     def test_counts(self):
         self.assertEqual([lxdtop.fmt_count(n) for n in (0, 500, 9999, 10_000, 42_000, 4_194_304)],
