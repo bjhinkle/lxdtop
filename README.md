@@ -50,6 +50,7 @@ Every threshold is a named constant near the top of `lxdtop`, with a comment say
 
 - **The detail view fits a short window.** In a window under 18 rows, the page is cut to fit inside its box, and its last line says how tall a window shows the rest. Before, its lower lines were drawn over the box's bottom edge.
 - **The CPU graph's legend cuts no words.** Where it doesn't fit, `other instances` and `host itself` shorten to `other` and `host`, then the least busy names give way to `…`. The table still shows each name in its graph color. Before, at 80 columns, the legend could end in `■ h`.
+- **Root's usage shows whole in the memory panel.** Where the pools and root don't fit on the panel's bottom row, their sizes go (`default 13%   root 40%`), then healthy pools give way to `…`. Root, and a pool that isn't ONLINE, always show. Before, root was cut at 120 columns (`root 40G/10`), and at 160 columns while a pool wasn't ONLINE.
 
 ## What's new in 1.8.1
 

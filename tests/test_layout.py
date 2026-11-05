@@ -364,6 +364,49 @@ class GraphLegendTest(unittest.TestCase):
                 self.assertTrue(word in names or word in ("other", "host"), f"{width}x{height}: {line}")
 
 
+class DiskRowTest(unittest.TestCase):
+    """The memory panel's bottom row: each storage pool, then root. Where it doesn't fit, the sizes go,
+    then healthy pools give way to "…"; root and a pool that isn't ONLINE always show, whole."""
+
+    def disks(self, width, height, pools=None, zpools=None, ascii=False):
+        mon = monitor([row("web")])
+        if pools is not None:
+            mon.pools = pools
+        if zpools:
+            mon.host["zpools"] = zpools
+        with glyphs(lxdtop.GLYPHS_ASCII if ascii else lxdtop.GLYPHS_UNICODE):
+            lines = render(mon, width, height).text().splitlines()
+        side = width * 52 // 160                                         # the memory panel's columns
+        return next(line[side + 2:2 * side - 2].rstrip() for line in lines if "root" in line[side:2 * side])
+
+    def test_as_before_where_it_fits(self):
+        self.assertEqual(self.disks(160, 45), "default 120G/900G 13%   root 40G/100G 40%")
+        self.assertEqual(self.disks(200, 60), "default 120G/900G 13%   root 40G/100G 40%")
+
+    def test_at_120_columns_the_sizes_go_and_root_shows_whole(self):
+        self.assertEqual(self.disks(120, 30), "default 13%   root 40%")
+
+    def test_a_pool_that_is_not_online_no_longer_pushes_root_out(self):
+        self.assertEqual(self.disks(160, 45, zpools={"default": "DEGRADED"}), "default 13% DEGRADED   root 40%")
+
+    def test_many_pools_give_way_but_not_root_or_one_that_is_not_online(self):
+        pools = [(name, used * lxdtop.MB * 1024, 900 * lxdtop.MB * 1024)
+                 for name, used in (("default", 120), ("fast", 450), ("tank", 630), ("backup", 90))]
+        self.assertEqual(self.disks(120, 30, pools, {"tank": "DEGRADED"}), "tank 70% DEGRADED   …   root 40%")
+        self.assertEqual(self.disks(120, 30, pools, {"tank": "DEGRADED"}, ascii=True),
+                         "tank 70% DEGRADED   ~   root 40%")
+        self.assertEqual(self.disks(120, 30, pools), "default 13%   …   root 40%")      # the last pools go first
+
+    def test_without_roots_size_the_pools_still_fit(self):
+        mon = monitor([row("web")])
+        mon.pools = [(name, used * lxdtop.MB * 1024, 900 * lxdtop.MB * 1024)
+                     for name, used in (("default", 120), ("fast", 450), ("tank", 630), ("backup", 90))]
+        mon.host["root_total"] = None                                    # statvfs("/") failed
+        lines = render(mon, 120, 30).text().splitlines()
+        side = 120 * 52 // 160
+        self.assertEqual(lines[6][side + 2:2 * side - 2].rstrip(), "default 13%   fast 50%   …")
+
+
 class FakeEvents:
     def __init__(self, feed, status="live"):
         self.feed, self.status = feed, status

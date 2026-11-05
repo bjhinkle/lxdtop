@@ -1407,18 +1407,34 @@ def draw_mem_panel(cv, y, x, h, w, mon):
     # Bottom row: storage pools from LXD, then the root filesystem. A ZFS pool that isn't ONLINE
     # shows its state in red: after the LXD pool of the same name, or on its own before root.
     sick = {pool: state for pool, state in host.get("zpools", {}).items() if state != "ONLINE"}
-    disks = list(mon.pools) + [(pool, None, None) for pool in sorted(sick) if pool not in {p[0] for p in mon.pools}]
-    disks += [("root", host["root_used"], host["root_total"])] if host.get("root_total") else []
-    pos = ix
-    for name, used, size in disks:
+    pools = list(mon.pools) + [(pool, None, None) for pool in sorted(sick) if pool not in {p[0] for p in mon.pools}]
+    root = [("root", host["root_used"], host["root_total"])] if host.get("root_total") else []
+
+    def disk(name, used, size, short):
         parts = [(name + " ", "hi" if name in sick else "text")]
         if size is not None:
             share = used / size * 100 if size else 0
-            parts += [(human(used), "bright"), ("/" + human(size), "dim"),
-                      (f" {share:.0f}%", "mid" if share >= 80 else "dim")]
+            parts += [] if short else [(human(used), "bright"), ("/" + human(size), "dim")]
+            parts.append((("" if short else " ") + f"{share:.0f}%", "mid" if share >= 80 else "dim"))
         if name in sick:
             parts.append(((" " if size is not None else "") + sick[name], "hi"))
-        pos = put_parts(cv, y + h - 2, pos, parts + [("   ", "dim")], ix + iw)
+        return parts + [("   ", "dim")]
+
+    def disk_row(dropped, short):                  # the row without the `dropped` pools, "…" in their place
+        parts = []
+        for i, (name, used, size) in enumerate(pools):
+            parts += [] if i in dropped else disk(name, used, size, short)
+        parts += [(G["more"] + "   ", "dim")] if dropped else []
+        for name, used, size in root:
+            parts += disk(name, used, size, short)
+        return parts
+
+    # Where the row doesn't fit, the sizes go ("default 13%"), then healthy pools give way from the
+    # end. Root and a pool that isn't ONLINE always keep their place, and no word is cut short.
+    healthy = [i for i, (name, _, _) in enumerate(pools) if name not in sick]
+    tries = [disk_row((), False)] + [disk_row(healthy[n:], True) for n in range(len(healthy), -1, -1)]
+    parts = next((p for p in tries if sum(len(text) for text, _ in p) - 3 <= iw), tries[-1])
+    put_parts(cv, y + h - 2, ix, parts, ix + iw)
 
 
 def draw_net_panel(cv, y, x, h, w, mon):
