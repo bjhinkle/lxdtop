@@ -368,6 +368,49 @@ class HelpTabTest(unittest.TestCase):
             self.assertEqual(before[35:43], ("-" if ascii else "─") * 8)
 
 
+class ApiStatusFooterTest(unittest.TestCase):
+    """LXD's API status in a bottom edge: an error shows even at 80 columns, where the disk label gives
+    way to it, and on a narrower screen its name is shortened, then left out."""
+
+    KEYS = "╰─┘q quit└─┘s sort└─┘- + every 2s└"
+
+    def bottom(self, status, width=80, height=24, zfs=True, ui=None):
+        mon = monitor(rows("web", "db"), api_status=status, zfs={"web": "kstat"} if zfs else {})
+        return draw(mon, ui or lxdtop.new_ui(2), width, height).text().splitlines()[-1]
+
+    def test_an_error_shows_at_80_columns(self):
+        for zfs in (True, False):                                    # whichever the disk label was
+            self.assertEqual(self.bottom("error (FileNotFoundError)", zfs=zfs),        # no socket
+                             self.KEYS + "─" * 9 + "┘lxd api error (FileNotFoundError)└─╯")
+            self.assertEqual(self.bottom("error (ConnectionRefusedError)", zfs=zfs),   # LXD not answering
+                             self.KEYS + "─" * 4 + "┘lxd api error (ConnectionRefusedError)└─╯")
+
+    def test_a_status_that_fits_beside_the_disk_label_keeps_it(self):
+        self.assertEqual(self.bottom("off"), self.KEYS + "─┘? keys└" + "─" * 11 + "┘lxd api off└─┘disk zfs└─╯")
+        self.assertTrue(self.bottom("error (OSError)", zfs=False)
+                        .endswith("┘lxd api error (OSError)└─┘disk io.stat└─╯"))
+        self.assertTrue(self.bottom("ok", 200, 60).endswith("┘lxd api ok└─┘disk zfs└─╯"))
+
+    def test_on_a_narrower_screen_the_name_is_shortened_then_left_out(self):
+        self.assertEqual(self.bottom("error (FileNotFoundError)", 70, 12),            # as the events panel
+                         self.KEYS + "─" * 4 + "┘lxd api error (FileNotFound)└─╯")    # shortens it
+        self.assertEqual(self.bottom("error (ConnectionRefusedError)", 70, 12),
+                         self.KEYS + "─┘? keys└" + "─" * 10 + "┘lxd api error└─╯")
+
+    def test_while_typing_a_long_filter_the_error_still_shows(self):
+        ui = lxdtop.new_ui(2)
+        keys(monitor(rows("web")), ui, "/", *"web-frontend-01")
+        line = self.bottom("error (ConnectionRefusedError)", ui=ui)
+        self.assertTrue(line.endswith("┘lxd api error└─╯"), line)
+        self.assertTrue(line.startswith("╰─┘/ web-frontend-01_└"), line)
+
+    def test_the_detail_view_already_has_room_at_80_columns(self):
+        ui = lxdtop.new_ui(2)
+        ui.view, ui.detail = "detail", "web"
+        self.assertTrue(self.bottom("error (ConnectionRefusedError)", ui=ui)
+                        .endswith("┘lxd api error (ConnectionRefusedError)└─╯"))
+
+
 class RunLoopKeysTest(unittest.TestCase):
     def test_esc_acts_at_once(self):
         screen = types.SimpleNamespace(getmaxyx=lambda: (45, 160), timeout=lambda ms: None, erase=lambda: None,

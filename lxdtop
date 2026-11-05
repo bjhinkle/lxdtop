@@ -1135,6 +1135,13 @@ def box(cv, y, x, h, w, style, title=(), right=(), footer=(), footer_right=(), f
             pos = cv.put(row, pos, close_tab, style) + 1
 
 
+def tabs_width(labels):
+    """The columns a row of labels takes in a box's edge: each one in its two tabs, and one after it.
+    box() has room for every right-hand label in an edge when the left-hand and right-hand labels
+    together take no more than the box's width less 4."""
+    return sum(sum(len(text) for text, _ in label) + 3 for label in labels)
+
+
 def human(n):
     """Bytes as a short string: 512B, 4.2K, 37M, 2.0G."""
     if n is None:
@@ -1796,12 +1803,21 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
         footer = [[("/ ", "key"), (ui.filter, "bright"), ("_", "key")],
                   [("Enter", "key"), (" keep", "text")], [("Esc", "key"), (" clear", "text")]]
         help_tab = []                                  # (? is typed into the filter)
+
+    def api(status):
+        return [("lxd api ", "dim"), (status, "lo" if sources_ok else "mid")]
+
+    status = mon.api_status
+    sources = [api(status), [("disk ", "dim"), ("zfs" if mon.zfs else "io.stat", "dim")]]
+    if not sources_ok:
+        # A failing API matters more than where the disk numbers come from. Where both don't fit beside
+        # the keys (most errors, at 80 columns), the disk label gives way; on a narrower screen the
+        # error's name is shortened as the events panel shortens it, then left out.
+        tries = [sources, [api(status)], [api(status.replace("Error)", ")"))], [api(status.split(" (")[0])]]
+        sources = next((labels for labels in tries if tabs_width(footer) + tabs_width(labels) <= w - 4), tries[-1])
     box(cv, y, x, h, w, "b_table", title=title,
         right=[[("sorted by ", "dim"), (ui.sort, "key")]],
-        footer=footer,
-        footer_right=[[("lxd api ", "dim"), (mon.api_status, "lo" if sources_ok else "mid")],
-                      [("disk ", "dim"), ("zfs" if mon.zfs else "io.stat", "dim")]],
-        footer_if_room=help_tab)
+        footer=footer, footer_right=sources, footer_if_room=help_tab)
     ix, iw = x + 2, w - 4
     layout = table_layout(iw)
     draw_header(cv, y + 1, ix, layout, ui)
