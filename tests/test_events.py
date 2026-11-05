@@ -67,6 +67,35 @@ def listen(lxd, show_commands=False):
     return events, error
 
 
+LARGEST_READ = 64 * 1024 * 1024         # more than any test needs read at once: asking for more fails the test
+
+
+class GuardedStream:
+    """The stream lxdtop reads its socket through, but asking it for more than LARGEST_READ bytes at once
+    fails the test before any buffer is made: a 1 TiB read must never reach the allocator."""
+
+    def __init__(self, stream):
+        self.stream = stream
+
+    def read(self, size=-1):
+        if size > LARGEST_READ:
+            raise AssertionError(f"lxdtop asked to read {size} bytes at once")
+        return self.stream.read(size)
+
+    def readline(self, *args):
+        return self.stream.readline(*args)
+
+
+class GuardedSocket(socket.socket):
+    def makefile(self, *args, **kwargs):
+        return GuardedStream(super().makefile(*args, **kwargs))
+
+
+def guarded_sockets():
+    """lxdtop's socket module, as LxdEvents uses it, with GuardedSocket for its sockets."""
+    return types.SimpleNamespace(socket=GuardedSocket, AF_UNIX=socket.AF_UNIX, SOCK_STREAM=socket.SOCK_STREAM)
+
+
 def run_loop(lxd_path, connections=1):
     """Run LxdEvents._loop() for this many connection attempts.
 
@@ -298,13 +327,32 @@ class LoopTest(unittest.TestCase):
                 self.assertIn(events.status, {f"reconnecting ({error})" for error in errors})
 
     def test_an_impossible_frame_length_reconnects(self):
-        """SECURITY-REVIEW.md L-4: a length of 2**63 raised OverflowError, and 2**40 MemoryError."""
-        for length, error in ((1 << 63, "OverflowError"), (1 << 40, "MemoryError")):
+        """SECURITY-REVIEW.md L-4: a length of 2**63 raised OverflowError, and 2**40 MemoryError on Linux, while
+        macOS handed out a 1 TiB buffer that Python's -X dev allocator then filled. Now neither is read at all."""
+        for length in (1 << 63, 1 << 40):
             with self.subTest(length=length), \
-                    FakeLxd(script=[bytes([0x81, 127]) + length.to_bytes(8, "big")]) as lxd:
+                    FakeLxd(script=[bytes([0x81, 127]) + length.to_bytes(8, "big")]) as lxd, \
+                    mock.patch.object(lxdtop, "socket", guarded_sockets()):
                 events = run_loop(lxd.path)
                 self.assertIsNone(events.ended)
-                self.assertEqual(events.status, f"reconnecting ({error})")
+                self.assertEqual(events.status, "reconnecting (FrameTooLargeError)")
+
+    def test_a_frame_at_the_limit_still_reads(self):
+        limit = lxdtop.EVENT_FRAME_MAX
+        self.assertEqual(limit, 16 * 1024 * 1024)
+        event = json.dumps(lifecycle_events()[0]).encode()
+        script = [ws_frame(1, event.ljust(limit)), ws_frame(1, event)]     # JSON may end in spaces
+        with FakeLxd(script=script) as lxd, mock.patch.object(lxdtop, "socket", guarded_sockets()):
+            events = run_loop(lxd.path)
+        feed, status = events.snapshot()
+        self.assertEqual((feed[0]["action"], feed[0]["count"]), ("instance-started", 2))     # both frames read
+        self.assertEqual(status, "reconnecting (ConnectionError)")                # then the stream closed
+        over = bytes([0x81, 127]) + (limit + 1).to_bytes(8, "big") + b" " * 64     # one byte more: refused
+        with FakeLxd(script=frames(lifecycle_events()[0]) + [over]) as lxd, \
+                mock.patch.object(lxdtop, "socket", guarded_sockets()):
+            events = run_loop(lxd.path)
+        feed, status = events.snapshot()
+        self.assertEqual((len(feed), status), (1, "reconnecting (FrameTooLargeError)"))
 
 
 class PanelStatusTest(unittest.TestCase):
@@ -316,6 +364,7 @@ class PanelStatusTest(unittest.TestCase):
 
     def test_the_reconnect_error_shows_beside_reconnecting(self):
         self.assertIn("reconnecting (TimeoutError)", self.corner("reconnecting (TimeoutError)"))
+        self.assertIn("┐reconnecting (FrameTooLargeError)┌", self.corner("reconnecting (FrameTooLargeError)"))
 
     def test_a_long_error_name_still_fits(self):
         # The panel is 54 columns wide: "reconnecting (ConnectionRefusedError)" is 3 too many.
