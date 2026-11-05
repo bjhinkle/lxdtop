@@ -37,6 +37,7 @@ import argparse
 import base64
 import collections
 import curses
+import datetime
 import glob
 import http.client
 import json
@@ -55,12 +56,26 @@ CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
 ZFS_KSTAT_GLOB = "/proc/spl/kstat/zfs/*/objset-*"
 ZFS_ARCSTATS = "/proc/spl/kstat/zfs/arcstats"
+ZFS_STATE_GLOB = "/proc/spl/kstat/zfs/*/state"
 LXD_SOCKETS = ([os.path.join(os.environ["LXD_DIR"], "unix.socket")] if os.environ.get("LXD_DIR") else []) + [
     "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/lxd/unix.socket"]
 API_EVERY = 15                     # seconds between LXD API refreshes
 EVENT_TIMEOUT = 60                 # seconds without a frame, pings included, before the event stream reconnects
 REPEAT_WINDOW = 600                # an event seen again within 10 minutes joins its earlier line
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")   # unit of the CPU times in /proc/<pid>/stat (100 a second)
+
+# When an instance is struggling, not just busy. Each of these puts a short warning in the top
+# edge of the instance table, most serious first, and marks the instance's row in red. A ZFS pool
+# that isn't ONLINE always does. The extra columns on screens wider than 160 use the same figures.
+THROTTLED_PCT = 20       # throttled: held back by its CPU limit in at least this % of the limit's
+                         # periods (100 ms each, by default) during the last reading interval
+PRESSURE_PCT = 25        # high pressure: some of its tasks were stalled waiting for CPU, memory or disk
+                         # at least this % of the last 10 seconds (the kernel's "some avg10" figure)
+RECENT_KILL = 3600       # a recent memory kill: the kernel killed one of its processes for memory
+                         # (oom_kill) less than this many seconds ago, counting kills since lxdtop started
+NEAR_LIMIT_PCT = 90      # near a limit: memory or processes at this % of their limit or more (shown in
+                         # yellow in the wide-screen columns; no warning)
+OPS_FROM = 160           # screens wider than this many columns get the extra columns (see OPS_COLUMNS)
 
 HISTORY = 900                      # samples kept per graph (30 min at 2 s)
 RATE_WINDOW = 4                    # disk and network rates average over the last 3 intervals
@@ -230,6 +245,31 @@ def read_io_stat(path):
     return rd, wr
 
 
+def read_cgroup_limits(path):
+    """An instance's limits, and how long its tasks waited, from its cgroup (v2) directory.
+
+    cpu.max is "<quota> <period>" in microseconds, so quota / period is its CPU limit in
+    cores, or "max <period>" for none. memory.max and pids.max are a number or "max". Each
+    *.pressure file says what share of the recent past some of its tasks spent stalled,
+    waiting for that resource; "some avg10" covers the last 10 seconds. A file that is
+    missing, or that the kernel has turned off, leaves its reading out (None).
+    """
+    quota, _, period = (read(path + "/cpu.max") or "").strip().partition(" ")
+    waiting = {}
+    for resource, label in (("cpu", "cpu"), ("memory", "mem"), ("io", "io")):
+        for line in (read(f"{path}/{resource}.pressure") or "").splitlines():
+            if line.startswith("some "):                     # "some avg10=12.34 avg60=... total=..."
+                waiting[label] = float(line.split()[1].partition("=")[2])
+    return dict(cpu_max=int(quota) / int(period) if quota.isdigit() and period.isdigit() else None,
+                mem_max=read_int(path + "/memory.max"), tasks_max=read_int(path + "/pids.max"),
+                waiting=max(waiting.items(), key=lambda item: item[1], default=None))   # the worst one
+
+
+def read_zpool_states():
+    """Each ZFS pool's health, the way `zpool status` says it: ONLINE, DEGRADED, FAULTED, ..."""
+    return {path.split("/")[-2]: (read(path) or "").strip() for path in glob.glob(ZFS_STATE_GLOB)}
+
+
 def find_zfs_datasets(roots=None, own=None):
     """Map instance names to the ZFS kstat file for their disk.
 
@@ -382,7 +422,8 @@ def new_row(cg, inst, **fields):
     """One table row; fields not given stay empty until a reading fills them."""
     row = dict(cg=cg, name=inst.get("name", cg), state=inst.get("status", "Running"), live=True,
                vm=False, ip=inst.get("ipv4", ""), mem=None, tasks=None, top=None, up=None,
-               cpu=None, rd=None, wr=None, net_in=None, net_out=None)
+               cpu=None, rd=None, wr=None, net_in=None, net_out=None, snapshot=inst.get("snapshot"),
+               throttled=None, cpu_max=None, mem_max=None, tasks_max=None, waiting=None)
     row.update(fields)
     return row
 
@@ -459,6 +500,17 @@ class ProcessTable:
 
 # --- LXD's API and event stream -------------------------------------------------
 
+def parse_time(text):
+    """Seconds since 1970 from a time as LXD writes it, e.g. 2026-11-04T09:00:05.123456789Z or
+    2021-03-23T20:00:00-04:00. None if it isn't one."""
+    try:
+        zone = text[19:].lstrip(".0123456789")             # after the seconds: a fraction, then the zone
+        when = datetime.datetime.fromisoformat(text[:19] + ("+00:00" if zone in ("", "Z") else zone))
+        return when.timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     """Plain HTTP, but over LXD's local unix socket instead of a TCP port."""
 
@@ -519,8 +571,10 @@ class LxdApi:
                 for addr in nic.get("addresses") or []:
                     if not ipv4 and addr.get("family") == "inet" and addr.get("scope") == "global":
                         ipv4 = addr.get("address", "")
+            taken = [parse_time(snap.get("created_at")) for snap in inst.get("snapshots") or []]
             found[cg] = dict(name=inst["name"], status=inst.get("status", "?"), veths=veths, ipv4=ipv4,
-                             type=inst.get("type", "container"), pid=(inst.get("state") or {}).get("pid"))
+                             type=inst.get("type", "container"), pid=(inst.get("state") or {}).get("pid"),
+                             snapshot=max(filter(None, taken), default=None))   # when the newest was taken
         return found
 
     def fetch_server(self):
@@ -704,6 +758,7 @@ class Monitor:
         self.nics, self.nics_checked, self.prev_nics = [], 0.0, {}
         self.prev_cpu = None
         self.asked = set()             # new containers we've already asked LXD about
+        self.kills = {}                # container -> (its oom_kill count, kills seen since start, when the last was)
         self.series_style = {}         # container -> graph color, kept steady between frames
         self.temp_file = find_cpu_temp_sensor()
         self.freq_files = glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")
@@ -749,7 +804,7 @@ class Monitor:
             mem_used=max(0, mem["MemTotal"] - mem["MemAvailable"] - arc),
             swap_total=mem["SwapTotal"], swap_used=mem["SwapTotal"] - mem["SwapFree"],
             root_total=root_total, root_used=root_used,
-            load=(read("/proc/loadavg") or "0 0 0").split()[:3], uptime=uptime)
+            load=(read("/proc/loadavg") or "0 0 0").split()[:3], uptime=uptime, zpools=read_zpool_states())
 
     def sample_network(self, now):
         if now - self.nics_checked > 60:
@@ -774,7 +829,8 @@ class Monitor:
         rows, readings = [], {}
         for path in sorted(glob.glob(CGROUP_GLOB)):
             cg = os.path.basename(path)[len(CGROUP_PREFIX):]
-            cpu_usec = read_fields(path + "/cpu.stat", ("usage_usec",)).get("usage_usec")
+            cpu = read_fields(path + "/cpu.stat", ("usage_usec", "nr_periods", "nr_throttled"))
+            cpu_usec = cpu.get("usage_usec")
             if cpu_usec is None:
                 continue                          # it stopped between listing and reading
             inst = instances.get(cg, {})
@@ -790,8 +846,11 @@ class Monitor:
             row = new_row(cg, inst, mem=max(0, current - inactive), tasks=read_int(path + "/pids.current"),
                           top=self.procs.top.get(cg),
                           up=uptime - started / CLOCK_TICKS if started is not None else None)
+            row.update(read_cgroup_limits(path))
+            self.count_kills(cg, read_fields(path + "/memory.events", ("oom_kill",)).get("oom_kill"), now)
             disk, disk_src = self.read_disk(cg, path)
-            self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings)
+            self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings,
+                         periods=(cpu.get("nr_periods"), cpu.get("nr_throttled")))
             rows.append(row)
 
         # VMs have no container cgroup: LXD runs each one as a QEMU process on the
@@ -815,6 +874,9 @@ class Monitor:
         for cg in list(self.cpu_history):
             if cg not in readings:
                 del self.cpu_history[cg]
+        for cg, (_, _, when) in list(self.kills.items()):
+            if cg not in readings and (when is None or now - when >= RECENT_KILL):
+                del self.kills[cg]            # gone, with no recent kill to remember it by
         self.past, self.rows = readings, rows
 
         if self.host.get("cpu") is not None:
@@ -835,7 +897,17 @@ class Monitor:
             return read_io_stat(cgroup_path + "/io.stat"), "io"
         return None, None
 
-    def measure(self, row, now, cpu_usec, disk, disk_src, net, readings):
+    def count_kills(self, cg, total, now):
+        """Keep count of the memory kills seen since lxdtop started, and when the latest was seen."""
+        if total is None:
+            return
+        seen, count, when = self.kills.get(cg, (total, 0, None))      # kills before lxdtop started don't count
+        added = total - seen if total >= seen else total              # the count starts again on a restart
+        if added:
+            count, when = count + added, now
+        self.kills[cg] = (total, count, when)
+
+    def measure(self, row, now, cpu_usec, disk, disk_src, net, readings, periods=None):
         """Work out rates against this instance's recent readings, then keep this one."""
         cg = row["cg"]
         past = self.past.get(cg) or collections.deque(maxlen=RATE_WINDOW)
@@ -852,7 +924,11 @@ class Monitor:
             if net and oldest["net"]:
                 row["net_in"] = rate(net[0], oldest["net"][0], secs)
                 row["net_out"] = rate(net[1], oldest["net"][1], secs)
-        past.append(dict(t=now, cpu=cpu_usec, disk=disk, disk_src=disk_src, net=net))
+            if periods and None not in periods and last.get("periods"):
+                # Of its CPU limit's periods in the last interval, the share in which it was held back.
+                ran, held = periods[0] - last["periods"][0], periods[1] - last["periods"][1]
+                row["throttled"] = min(100.0, max(0, held) / ran * 100) if ran > 0 else 0.0
+        past.append(dict(t=now, cpu=cpu_usec, disk=disk, disk_src=disk_src, net=net, periods=periods))
         readings[cg] = past
         self.cpu_history.setdefault(cg, collections.deque(maxlen=HISTORY)).append(row["cpu"])
 

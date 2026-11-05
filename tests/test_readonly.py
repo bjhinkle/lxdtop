@@ -42,7 +42,7 @@ class ReadOnlyTest(unittest.TestCase):
                 imported |= {alias.name for alias in node.names}
             elif isinstance(node, ast.ImportFrom):
                 imported.add(node.module)
-        self.assertEqual(imported, {"argparse", "base64", "collections", "curses", "glob", "http.client",
+        self.assertEqual(imported, {"argparse", "base64", "collections", "curses", "datetime", "glob", "http.client",
                                     "json", "locale", "os", "socket", "threading", "time", "types",
                                     "unicodedata", "urllib.parse"},
                          "lxdtop's imports changed: check the new one is in the standard library and "
