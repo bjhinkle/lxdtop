@@ -287,13 +287,15 @@ class LoopTest(unittest.TestCase):
         itself always sends event objects, so this needs something other than
         LXD on the socket.
         """
-        for payload, error in ((b"[]", "AttributeError"), (b'{"metadata": "x"}', "AttributeError"),
-                               (b'{"metadata": {"source": null}}', "AttributeError"),
-                               (b"[" * 100000 + b"]" * 100000, "RecursionError")):
+        # Since Python 3.14 the parser's depth limit is the real stack, so 100000 levels may parse after
+        # all (a large or unlimited stack), and then the list is just JSON that isn't an event.
+        for payload, errors in ((b"[]", {"AttributeError"}), (b'{"metadata": "x"}', {"AttributeError"}),
+                                (b'{"metadata": {"source": null}}', {"AttributeError"}),
+                                (b"[" * 100000 + b"]" * 100000, {"RecursionError", "AttributeError"})):
             with self.subTest(payload=payload[:30]), FakeLxd(script=[ws_frame(1, payload)]) as lxd:
                 events = run_loop(lxd.path)
                 self.assertIsNone(events.ended)                # the listener is still running
-                self.assertEqual(events.status, f"reconnecting ({error})")
+                self.assertIn(events.status, {f"reconnecting ({error})" for error in errors})
 
     def test_an_impossible_frame_length_reconnects(self):
         """SECURITY-REVIEW.md L-4: a length of 2**63 raised OverflowError, and 2**40 MemoryError."""
