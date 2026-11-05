@@ -51,12 +51,22 @@ Every threshold is a named constant near the top of `lxdtop`, with a comment say
 
 ## What's new in 1.9.0
 
-- **`--dump --json` says `null` for a reading lxdtop couldn't take,** such as an unreadable `/proc/loadavg` or a container's `memory.current`, where it said `0`. On screen, those cells are left blank.
-- **VMs show their CPU and memory limits,** from LXD's `limits.cpu` and `limits.memory`: in THROTTLED (`@2c`) and MEM/LIMIT on screens wider than 160 columns, in the detail view and in the JSON. lxdtop reads no other key of an instance's config.
-- **A container held to some of the host's CPUs shows that limit.** LXD applies a container's `limits.cpu` as a set of CPUs, so THROTTLED now shows `@2c` for one held to two, and the JSON's `cpu_limit_cores` says 2; with a quota too, the smaller. Without a quota there's no throttling, so `cpu_throttled_pct` is `null` there.
-- **`s` sorts by THROTTLED and WAITING too,** most held back or most stalled first.
+- **The busiest process never shows more CPU than its container.** Its figure was averaged with the reading before, so a process that had just gone quiet could show more than its whole container. Now it covers the last interval, as the container's does.
 - **The network graph is drawn in braille in the fine drawing,** two readings to a character, with traffic out filling down from the middle line. The classic drawing and `--ascii` are unchanged.
+- **VMs whose disks aren't on ZFS show disk reads and writes,** from LXD's metrics, which the `lxd` group can read: averaged over 15 seconds, and updated as often. The detail view and the JSON's `disk_source` say they come from `lxd`.
+- **VMs show their CPU and memory limits,** from LXD's `limits.cpu` and `limits.memory`: in THROTTLED (`@2c`) and MEM/LIMIT on screens wider than 160 columns, in the detail view and in the JSON. lxdtop reads no other key of an instance's config.
+- **A running VM that lxdtop can't read counts as running, and says why.** It no longer adds to `N stopped`, and its row says, for example, `no readings: no access to QEMU process 5151`, with what may cause it in its detail view.
+- **`s` sorts by THROTTLED and WAITING too,** most held back or most stalled first.
+- **A container held to some of the host's CPUs shows that limit.** LXD applies a container's `limits.cpu` as a set of CPUs, so THROTTLED now shows `@2c` for one held to two, and the JSON's `cpu_limit_cores` says 2; with a quota too, the smaller. Without a quota there's no throttling, so `cpu_throttled_pct` is `null` there.
+- **The events panel says what each event is about.** A network's, a profile's or a storage pool's change reads `config network lxdbr0`, not like an instance's, and the JSON gives its name as `subject`, keeping `instance` for an instance's events. Each instance's detail view keeps its own latest 50 events, however busy the rest of the host is.
+- **Instances with the same name in different projects can be told apart:** beside the default project's `api`, the `dev` project's shows as `dev/api` wherever names show. An instance in another project no longer shows by its cgroup name, `dev_api`, in the graph's legend or without LXD's API. In the JSON, each instance, warning and event has its `project`.
+- **An LXD pool kept inside another zpool shows that zpool's state under its own name,** such as `default DEGRADED` rather than `tank DEGRADED`, in the memory panel, the warning line and the JSON.
+- **On a slow link, keys whose codes arrive split no longer act as Esc.** When the rest of an arrow's, Page Up's or another key's code follows an Esc within half a second, lxdtop undoes the Esc, so the filter, the highlight and the detail view stay as they were. Esc on its own still acts at once.
+- **`lxdtop-remote install` copes with two installs at once and with a dropped connection.** Each install writes its own new file, and a connection that drops without a word ends it within about a minute, on the host and on your machine, leaving `~/bin/lxdtop` as it was. It says when the console service is still running the old copy. The README's installs by hand also copy beside `~/bin/lxdtop`, flush the copy to disk, and rename it into place.
+- **On an LXD cluster member, each ZFS pool's own config, and more time for LXD.** lxdtop reads the pool config the cluster-wide list leaves out, so a pool kept in a dataset with another name, such as `tank/lxd`, still gets its instances' disk numbers. It waits up to 30 seconds for LXD's answers, since listing instances asks every member. Like the rest of cluster support, this has been checked against LXD's source only.
+- **`--dump --json` says `null` for a reading lxdtop couldn't take,** such as an unreadable `/proc/loadavg` or a container's `memory.current`, where it said `0`. On screen, those cells are left blank.
 - **An event frame over 16 MiB is refused before it's read,** so a broken event stream can't make lxdtop ask for a huge buffer. The events panel says `reconnecting (FrameTooLargeError)` while it reconnects.
+- **Other fixes.** Without LXD's API, a pool kept under `tank/containers/<x>` no longer loses its ZFS disk numbers while a container called `<x>` runs.
 
 ## What's new in 1.8.2
 
@@ -97,7 +107,7 @@ Every threshold is a named constant near the top of `lxdtop`, with a comment say
 - Linux with cgroup v2 (Ubuntu 22.04 or later)
 - LXD 5 or 6 (snap or package; `LXD_DIR` is honored). On a cluster member, it shows that member's instances and events. That has been checked against LXD's source only, not yet on a real cluster (see [#16](https://github.com/bjhinkle/lxdtop/issues/16)).
 - Python 3
-- Membership in the `lxd` group, or root, for names, IP addresses, VMs, stopped instances and the event feed. Without it, lxdtop still shows each container's CPU, memory and disk.
+- Membership in the `lxd` group, or root, for IP addresses, VMs, stopped instances and the event feed. Without it, lxdtop still shows each running container, by name, with its CPU, memory and disk.
 
 Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12.
 
@@ -133,7 +143,7 @@ Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, n
 |---|---|
 | `--show-commands` | Show the command line of `lxc exec` sessions in the event feed. Hidden by default, because command lines can contain passwords |
 | `--interval N` | Seconds between readings (default 2) |
-| `--no-api` | Skip LXD's API: no names, IPs, VMs, stopped instances or events |
+| `--no-api` | Skip LXD's API: no IPs, VMs, stopped instances or events. Running containers still show by name, from their cgroups |
 | `--ascii` | Plain ASCII drawing characters |
 | `--drawing fine` or `--drawing classic` | Choose the drawing: fine (braille graphs, smooth meters) or classic (as on the Linux console). lxdtop picks one when this isn't given: see [Terminals](#terminals) |
 | `--dump` | Print one frame as text and exit, for testing (with `--color`, `--size COLSxROWS`, `--samples N`, `--drawing`) |

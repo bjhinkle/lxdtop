@@ -2878,10 +2878,12 @@ notes:
   MEM for a container is its working set (memory.current minus inactive file cache);
   for a VM it is the resident memory of its QEMU process.
   DISK figures are reads and writes by the instance (ZFS counts cache hits too).
-  {f"The clock shows {TIMEZONE} time unless TZ is set" if TIMEZONE else "The clock follows the system time zone"}; e.g. TZ=UTC lxdtop.
-  Names, IPs, VMs, stopped instances and the event feed need access to LXD's socket
-  (membership in the lxd group, or root). Exec command lines in the event feed are
-  hidden unless --show-commands is given, because they can contain passwords.
+  {f"The clock shows {TIMEZONE} time unless TZ is set" if TIMEZONE
+   else "The clock follows the system time zone"}; e.g. TZ=UTC lxdtop.
+  IP addresses, VMs, stopped instances and the event feed need access to LXD's socket
+  (membership in the lxd group, or root). Without it, lxdtop still shows each running
+  container, by name, with its CPU, memory and disk. Exec command lines in the event
+  feed are hidden unless --show-commands is given, because they can contain passwords.
 
 needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3.""")
     parser.add_argument("-i", "--interval", type=float, default=2, help="seconds between readings (default 2)")
