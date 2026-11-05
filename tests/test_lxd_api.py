@@ -38,7 +38,8 @@ class FetchTest(unittest.TestCase):
         })
         self.assertEqual(server, dict(version="6.9", kernel="6.8.0-45-generic", os="Ubuntu 24.04",
                                       member="",                        # not a cluster member
-                                      zfs_roots=["default"]))          # where the ZFS pool keeps its datasets
+                                      zfs_roots=["default"],           # where the ZFS pool keeps its datasets
+                                      zpools={"default": "default"}))  # and the zpool that is in
         self.assertEqual(pools, [("default", 128849018880, 966367641600)])   # "scratch" reports no size
 
     def test_only_get_requests_to_these_paths(self):
