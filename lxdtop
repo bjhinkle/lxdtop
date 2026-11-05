@@ -2704,8 +2704,9 @@ KEYS = (
 KEY_ACTIONS = {code: action for _, codes, _, action in KEYS for code in codes}
 BACKSPACE = (curses.KEY_BACKSPACE, 127, 8)      # while typing a filter
 ESC_DELAY_MS = 25                  # how long curses waits after Esc for more of a key's code (default 1000)
-SPLIT_KEY_SECS = 0.5               # how long after an Esc the rest of an arrow key's code may still come
-ARROWS = {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN}     # Esc, [ or O, then this letter
+SPLIT_KEY_SECS = 0.5               # how long after an Esc the rest of a key's code may still come
+SPLIT_KEYS = {"[A": curses.KEY_UP, "OA": curses.KEY_UP, "[B": curses.KEY_DOWN, "OB": curses.KEY_DOWN}   # after Esc
+OTHER_KEY = curses.KEY_MAX         # any other key whose code starts with Esc: Left, Home, Page Up, F1...
 QUIT = "quit"
 
 
@@ -2748,22 +2749,24 @@ def type_filter(key, ui):
 
 
 def split_key(key, ui):
-    """An arrow key sends Esc, "[" (or "O"), then a letter, and curses waits ESC_DELAY_MS for all of it.
-    On a slow link the rest can come later, after the Esc has acted on its own: then this undoes the
-    Esc, and gives the arrow key's code. "wait" means the rest is still coming; None, that key isn't it.
-    Esc acts at once, as before: only a split arrow key waits for its own rest.
+    """A key such as Up, Left or Page Up sends Esc, "[" or "O", perhaps some digits and ";", then one
+    last character from "@" to "~" (the Linux console's F1 to F5: Esc, "[[", then a letter). curses
+    waits ESC_DELAY_MS for all of it. On a slow link the rest can come later, after the Esc has acted
+    on its own: then this undoes the Esc, and gives the key's own code, Up's or Down's, or OTHER_KEY
+    for one lxdtop has no use for. "wait" means more of it is still coming; None, that key isn't part
+    of it. Esc acts at once, as before: only a split key waits for the rest of its own code.
     """
-    when, before, opened = ui.split
-    if time.monotonic() - when > SPLIT_KEY_SECS:
-        ui.split = None
-    elif not opened and key in (ord("["), ord("O")):
-        ui.split = (when, before, True)
-        return "wait"
-    elif opened and key in ARROWS:
-        vars(ui).update(before)                      # as if the Esc never came
-        return ARROWS[key]
-    else:
-        ui.split = None
+    when, before, code = ui.split                    # code: what has come since the Esc
+    char = chr(key) if 32 <= key < 127 else ""
+    if char and time.monotonic() - when <= SPLIT_KEY_SECS:
+        code += char
+        if code in ("[", "O", "[[") or (code[0] in "[O" and code[:2] != "[[" and " " <= char <= "?"):
+            ui.split = (when, before, code)          # its start, or a digit or ";" in it: more to come
+            return "wait"
+        if code[0] in "[O" and len(code) > 1 and "@" <= char <= "~":
+            vars(ui).update(before)                  # its last character: as if the Esc never came
+            return SPLIT_KEYS.get(code, OTHER_KEY)
+    ui.split = None
     return None
 
 
@@ -2775,13 +2778,13 @@ def handle_key(key, mon, ui):
     if key == curses.KEY_RESIZE:
         return True
     if ui.split:
-        arrow = split_key(key, ui)
-        if arrow == "wait":
+        whole = split_key(key, ui)
+        if whole == "wait":
             return False
-        if arrow is not None:
-            return handle_key(arrow, mon, ui) or True        # the Esc's undoing needs drawing too
-    if KEY_ACTIONS.get(key) == "escape":             # it may be the start of a split arrow key
-        ui.split = (time.monotonic(), dict(vars(ui), split=None), False)
+        if whole is not None:
+            return handle_key(whole, mon, ui) or True        # the Esc's undoing needs drawing too
+    if KEY_ACTIONS.get(key) == "escape":             # it may be the start of a split key's code
+        ui.split = (time.monotonic(), dict(vars(ui), split=None), "")
     if ui.view == "help":                            # any key closes the help
         ui.view = ui.back
         return True

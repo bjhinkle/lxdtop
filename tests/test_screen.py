@@ -1,4 +1,4 @@
-"""The screen: an arrow key whose code comes split, and the busiest process's CPU."""
+"""The screen: a key whose code comes split, and the busiest process's CPU."""
 
 import curses
 import unittest
@@ -76,9 +76,39 @@ class SplitArrowKeyTest(unittest.TestCase):
         self.press("[", "A")
         self.assertIsNone(self.ui.selected)                   # Esc stands; "[" and "A" do nothing
 
-    def test_other_keys_after_esc_and_bracket(self):
+    def test_any_other_key_split_the_same_way_undoes_the_esc_too(self):
+        """#16: a split Left, Right, Home or Page Up still acted as Esc. lxdtop has no use for those keys,
+        so once the rest of the code has come, nothing is left of it: as when the key comes whole."""
+        keys = {"Right": "[C", "Left": "[D", "Left, the other form": "OD", "Home": "[H", "Home on the console": "[1~",
+                "End": "[F", "Page Up": "[5~", "Page Down": "[6~", "Delete": "[3~", "F1": "OP",
+                "F1 on the console": "[[A", "F5": "[15~", "Shift+Up": "[1;2A", "Ctrl+Right": "[1;5C"}
+        for name, code in keys.items():
+            with self.subTest(name):
+                self.setUp()
+                self.press("/", "w", 10, DOWN)                # filter on "w", kept, and web highlighted
+                said = self.press(ESC, *code)
+                self.assertEqual(said, [True] + [False] * (len(code) - 1) + [True])   # Esc acts, and is undone
+                self.assertEqual(self.state(), dict(view="main", filter="w", selected="web"))
+
+    def test_while_typing_none_of_it_is_typed(self):
+        self.press("/", "w", "e")
+        self.press(ESC, "[", "D")                              # Left
+        self.press(ESC, "[", "[", "A")                         # the console's F1
+        self.press(ESC, "[", "5", "~")                         # Page Up
+        self.assertEqual(self.state(), dict(view="typing", filter="we", selected=None))
+
+    def test_on_the_help_screen_it_closes_the_help_as_any_key_does(self):
+        self.press(DOWN, "?")
+        self.press(ESC, "[", "D")
+        self.assertEqual((self.ui.view, self.ui.selected), ("main", "web"))
+
+    def test_the_rest_too_late_or_something_else_leaves_the_esc(self):
         self.press(DOWN)
-        self.press(ESC, "[", "5", "~")                        # Page Up, split: lxdtop has no use for it
+        self.press(ESC, "[", "5", gap=lxdtop.SPLIT_KEY_SECS / 2)
+        self.press("~")                                       # a second after the Esc
+        self.assertIsNone(self.ui.selected)
+        self.press(DOWN)
+        self.assertEqual(self.press(ESC, "[", "5", ESC), [True, False, False, False])  # a new Esc: not a key's
         self.assertIsNone(self.ui.selected)
 
 
