@@ -385,9 +385,24 @@ class BashInstallTest(InstallTest):
 
 
 class BusyBoxInstallTest(InstallTest):
-    """The same, on a host whose shell and tools all come from BusyBox, as on Alpine."""
+    """The same, on a host whose shell and tools all come from BusyBox, as on Alpine.
+
+    Some BusyBox builds run their own applets before they search the PATH, among them Ubuntu's
+    busybox-static, which most Ubuntu systems (and CI's runners) have. A stand-in tool on the
+    host's PATH never runs there, so the tests that need one are skipped on those builds; the
+    rest still run BusyBox's own tools, sync included.
+    """
 
     login_shell = "busybox"
+
+    def host_tool(self, name, text):
+        path = super().host_tool(name, text)
+        found = subprocess.run([self.shell, "-c", f"command -v {name}"], env=dict(PATH=path),
+                               capture_output=True, text=True, timeout=60).stdout.strip()
+        if found != os.path.join(path.split(os.pathsep)[0], name):
+            self.skipTest(f"this BusyBox's sh runs its own {name} before it searches the PATH ({found!r}), "
+                          f"so a stand-in {name} there never runs")
+        return path
 
     def setUp(self):
         super().setUp()
