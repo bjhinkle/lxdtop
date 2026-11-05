@@ -46,6 +46,13 @@ These come from a running container's cgroup, so stopped instances and VMs leave
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.5.0
+
+- **Security fixes.** A review of 1.4.0 found nothing high-severity, and everything it found is fixed. Text from inside containers can't send escape sequences to your terminal or shift the screen. A process name that isn't UTF-8, or an odd or stalled answer on LXD's socket, no longer stops lxdtop or its updates, and the event panel names the error it reconnects after. Interface names from LXD stay inside `/sys/class/net`, a delegated ZFS dataset can't take another instance's disk numbers, and `lxdtop-remote` passes hosts and options to ssh without them being read as options or shell code. Details are in [SECURITY-REVIEW.md](SECURITY-REVIEW.md).
+- **Cluster support.** On a member of an LXD cluster, lxdtop shows that member's instances and events, not the whole cluster's. A standalone host looks as before.
+- **Ops signals.** A warning line names instances that are struggling rather than just busy (a memory kill, CPU throttling, or tasks stalled waiting for CPU, memory or disk) and ZFS pools that aren't ONLINE, and marks their rows in red. Screens wider than 160 columns get six more columns. See [Warnings and wide screens](#warnings-and-wide-screens).
+- **Other fixes.** The event feed covers every project, a storage pool LXD can't read no longer stops lxdtop's LXD data, and lxdtop no longer exits when `LANG` names a locale the host lacks.
+
 ## Requirements
 
 - Linux with cgroup v2 (Ubuntu 22.04 or later)
