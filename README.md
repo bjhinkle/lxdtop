@@ -49,6 +49,7 @@ Every threshold is a named constant near the top of `lxdtop`, with a comment say
 ## What's new in 1.8.2
 
 - **The detail view fits a short window.** In a window under 18 rows, the page is cut to fit inside its box, and its last line says how tall a window shows the rest. Before, its lower lines were drawn over the box's bottom edge.
+- **The CPU graph's legend cuts no words.** Where it doesn't fit, `other instances` and `host itself` shorten to `other` and `host`, then the least busy names give way to `…`. The table still shows each name in its graph color. Before, at 80 columns, the legend could end in `■ h`.
 
 ## What's new in 1.8.1
 

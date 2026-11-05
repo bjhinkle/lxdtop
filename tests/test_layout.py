@@ -328,6 +328,42 @@ class SortTest(unittest.TestCase):
         self.assertEqual(order("name"), ["a", "b", "c", "d", "z"])
 
 
+class GraphLegendTest(unittest.TestCase):
+    """The CPU graph's legend: whole words only. Where it doesn't fit, "other instances" and "host itself"
+    shorten, then the least busy names give way; the table shows every name in its color anyway."""
+
+    def legend(self, names, width=80, height=24, ascii=False):
+        mon = monitor([row(name, cpu=float(60 - 5 * i)) for i, name in enumerate(names)])
+        with glyphs(lxdtop.GLYPHS_ASCII if ascii else lxdtop.GLYPHS_UNICODE):
+            lines = render(mon, width, height).text().splitlines()
+        top = next(i for i, line in enumerate(lines) if "cpu by" in line)
+        bottom = next(i for i in range(top + 1, len(lines)) if lines[i][0] in "╰+")
+        return lines[bottom - 1]                                         # the row above the panel's bottom edge
+
+    def test_as_before_where_it_fits(self):
+        self.assertEqual(self.legend(["web", "db"]),
+                         "│ ■ web  ■ db  ■ other containers  ■ host itself" + " " * 31 + "│")
+
+    def test_at_80_columns_long_names_give_way_and_no_word_is_cut(self):
+        names = ["auth-lex-old", "avimark-db", "isc-31-web", "nextcloud", "unifi-ctrl"]
+        self.assertEqual(self.legend(names),
+                         "│ ■ auth-lex-old  ■ avimark-db  ■ isc-31-web  ■ nextcloud  …  ■ other  ■ host  │")
+        self.assertEqual(self.legend(names, ascii=True),
+                         "| # auth-lex-old  # avimark-db  # isc-31-web  # nextcloud  ~  # other  # host  |")
+
+    def test_shorter_words_before_any_name_goes(self):
+        line = self.legend(["auth-lex-old", "avimark-db", "isc-31-web", "nextcloud"])
+        self.assertTrue(line.endswith("■ nextcloud  ■ other  ■ host" + " " * 5 + "│"), line)
+
+    def test_every_size_shows_other_and_host_and_whole_names(self):
+        names = ["a-very-long-instance-name-%d" % i for i in range(5)]
+        for width, height in ((70, 24), (80, 24), (120, 30), (160, 45), (200, 60)):
+            line = self.legend(names, width, height).rstrip("│ ")
+            self.assertRegex(line, r"■ other( containers)?  ■ host( itself)?$", f"{width}x{height}")
+            for word in re.findall(r"■ (\S+)", line):
+                self.assertTrue(word in names or word in ("other", "host"), f"{width}x{height}: {line}")
+
+
 class FakeEvents:
     def __init__(self, feed, status="live"):
         self.feed, self.status = feed, status

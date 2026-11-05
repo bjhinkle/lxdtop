@@ -1546,11 +1546,21 @@ def draw_graph_panel(cv, y, x, h, w, mon, ui):
     box(cv, y, x, h, w, "b_graph", title=[[(f"cpu by {noun[:-1]}", "title")], [(f"last {span}", "dim")]],
         right=[[("100% = one core", "dim")]])
     series = draw_graph(cv, y + 1, x + 2, w - 4, h - 3, mon)
-    pos, right = x + 2, x + w - 2
-    for cg in series:
-        pos = put_parts(cv, y + h - 2, pos, [(G["cell"] + " ", mon.series_style[cg]), (cg + "  ", "text")], right)
-    put_parts(cv, y + h - 2, pos, [(G["cell"] + " ", "other"), (f"other {noun}  ", "text"),
-                                   (G["cell"] + " ", "host"), ("host itself", "text")], right)
+
+    def legend(shown, short):                      # a swatch and a name for each series, then the rest
+        parts = []
+        for cg in shown:
+            parts += [(G["cell"] + " ", mon.series_style[cg]), (cg + "  ", "text")]
+        if len(shown) < len(series):
+            parts.append((G["more"] + "  ", "dim"))
+        return parts + [(G["cell"] + " ", "other"), ("other  " if short else f"other {noun}  ", "text"),
+                        (G["cell"] + " ", "host"), ("host" if short else "host itself", "text")]
+
+    # Where the legend doesn't fit, "other instances" and "host itself" shorten, then the least busy
+    # names give way to "…" (the table shows each name in its series' color), so no word is cut short.
+    tries = [legend(series, False)] + [legend(series[:n], True) for n in range(len(series), -1, -1)]
+    parts = next((p for p in tries if sum(len(text) for text, _ in p) <= w - 4), tries[-1])
+    put_parts(cv, y + h - 2, x + 2, parts, x + w - 2)
 
 
 def draw_events_panel(cv, y, x, h, w, mon):
