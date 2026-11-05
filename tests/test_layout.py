@@ -468,7 +468,8 @@ class DiskRowTest(unittest.TestCase):
 
 class FakeEvents:
     def __init__(self, feed, status="live"):
-        self.feed, self.status = feed, status
+        # each line an instance's in the default project, unless it says otherwise
+        self.feed, self.status = [dict(dict(project="default", instance=True), **line) for line in feed], status
 
     def snapshot(self):
         return list(self.feed), self.status
@@ -477,7 +478,7 @@ class FakeEvents:
 class EventsPanelTest(unittest.TestCase):
     def draw(self, feed, status="live", width=54):
         cv = lxdtop.TextCanvas(14, width)
-        mon = types.SimpleNamespace(events=FakeEvents(feed, status))
+        mon = monitor(events=FakeEvents(feed, status))
         with glyphs(lxdtop.GLYPHS_UNICODE):
             lxdtop.draw_events_panel(cv, 0, 0, 14, width, mon)
         return cv.text().split("\n")

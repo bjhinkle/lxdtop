@@ -479,8 +479,7 @@ class RecordTest(unittest.TestCase):
                 entry = events.feed[0]
                 for key in ("action", "name", "detail", "user"):
                     self.assertIsInstance(entry[key], str, key)
-                lxdtop.draw_events_panel(lxdtop.TextCanvas(14, 54), 0, 0, 14, 54,
-                                         types.SimpleNamespace(events=events))
+                lxdtop.draw_events_panel(lxdtop.TextCanvas(14, 54), 0, 0, 14, 54, monitor(events=events))
 
 if __name__ == "__main__":
     unittest.main()

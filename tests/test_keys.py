@@ -279,9 +279,10 @@ class DetailViewTest(unittest.TestCase):
     def test_a_container_with_everything_lxdtop_has(self):
         web = row("web", cpu_max=2.0, throttled=45.0, mem_max=4096 * MiB, tasks_max=500, waiting=("mem", 34.0),
                   snapshot=time.time() - 3 * 3600)
-        events = types.SimpleNamespace(snapshot=lambda: ([
-            dict(t=time.time() - 60, action="instance-exec", name="web", detail="", user="backup", count=3),
-            dict(t=time.time() - 90, action="instance-started", name="db", detail="", user="bj", count=1)], "live"))
+        events = lxdtop.LxdEvents("/unused")
+        for name, action, user in (("db", "instance-started", "bj"), *[("web", "instance-exec", "backup")] * 3):
+            events._record(dict(metadata=dict(action=action, source=f"/1.0/instances/{name}",
+                                              requestor=dict(username=user))))
         mon = monitor([web, row("db")], events=events, kills={"web": (4, 1, time.monotonic() - 720)})
         mon.past["web"] = [dict(disk_src="zfs", disk=(1, 1))]
         _, text = self.open(mon, "web")

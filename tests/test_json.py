@@ -146,7 +146,7 @@ class JsonDumpTest(unittest.TestCase):
         self.assertEqual(doc["pools"], [
             dict(name="default", used_bytes=128849018880, total_bytes=966367641600, health="ONLINE"),
             dict(name="tank", used_bytes=None, total_bytes=None, health="DEGRADED")])
-        self.assertEqual(doc["warnings"][0], dict(severity=3, kind="pool", instance=None, pool="tank",
+        self.assertEqual(doc["warnings"][0], dict(severity=3, kind="pool", instance=None, project=None, pool="tank",
                                                   text="tank DEGRADED"))
 
     def test_warnings_most_serious_first(self):
@@ -206,7 +206,7 @@ class JsonDumpTest(unittest.TestCase):
     def test_a_container(self):
         web = self.instance(self.reading(), "web")
         self.assertEqual(web, {
-            "name": "web", "type": "container", "state": "Running", "ipv4": "10.10.10.21",
+            "name": "web", "project": "default", "type": "container", "state": "Running", "ipv4": "10.10.10.21",
             "uptime_s": 123451.8, "cpu_pct": 25.0, "cpu_history_pct": [None, 25.0],
             "busiest_process": {"name": "nginx", "cpu_pct": 0.0}, "mem_bytes": 384 * MiB,
             "disk_read_bytes_per_s": 0.0, "disk_write_bytes_per_s": 0.0, "disk_source": "io.stat",
@@ -250,7 +250,8 @@ class JsonDumpTest(unittest.TestCase):
     def test_a_stopped_instance_has_nulls_not_zeros(self):
         old = self.instance(self.reading(), "old")
         self.assertEqual((old["type"], old["state"], old["cpu_history_pct"]), ("container", "Stopped", []))
-        readings = {key: value for key, value in old.items() if key not in ("name", "type", "state", "cpu_history_pct")}
+        readings = {key: value for key, value in old.items()
+                    if key not in ("name", "project", "type", "state", "cpu_history_pct")}
         self.assertEqual(set(readings.values()), {None}, readings)
 
     def test_what_it_could_not_read_is_null(self):

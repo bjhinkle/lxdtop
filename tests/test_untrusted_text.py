@@ -169,8 +169,8 @@ class ControlCharacterTest(unittest.TestCase):
 
     def test_event_text_and_addresses(self):
         mon = monitor([row("win", vm=True, top=None, ip="\x1b[2J10.10.10.30")])
-        feed = [dict(action="instance-file-pushed", name="web\x1b[8m", detail="/tmp/\x1b]52;c;cm0K\x07",
-                     user="ci\r", t=time.time(), count=1)]
+        feed = [dict(action="instance-file-pushed", project="default", name="web\x1b[8m", instance=True,
+                     detail="/tmp/\x1b]52;c;cm0K\x07", user="ci\r", t=time.time(), count=1)]
         mon.events = types.SimpleNamespace(snapshot=lambda: (feed, "live"))
         text = render(mon).text()
         self.assertNotIn("\x1b", text)
