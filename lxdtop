@@ -1068,11 +1068,12 @@ def put_parts(cv, y, x, parts, right=None):
     return x
 
 
-def box(cv, y, x, h, w, style, title=(), right=(), footer=(), footer_right=()):
+def box(cv, y, x, h, w, style, title=(), right=(), footer=(), footer_right=(), footer_if_room=()):
     """A panel with rounded corners, labels set into its top and bottom edges.
 
     Labels sit in little tabs the way btop draws them:  ╭─┐cpu┌────┐43°C┌─╮
-    Each label is a list of (text, style) pieces.
+    Each label is a list of (text, style) pieces. footer_if_room's labels follow the footer's
+    left-hand ones, but only where they fit beside the right-hand ones, which they never push out.
     """
     line = G["h"] * (w - 2)
     cv.put(y, x, G["tl"] + line + G["tr"], style)
@@ -1080,9 +1081,9 @@ def box(cv, y, x, h, w, style, title=(), right=(), footer=(), footer_right=()):
         cv.put(row, x, G["v"], style)
         cv.put(row, x + w - 1, G["v"], style)
     cv.put(y + h - 1, x, G["bl"] + line + G["br"], style)
-    for row, left_items, right_items, (open_tab, close_tab) in (
-            (y, title, right, (G["tab_l"], G["tab_r"])),
-            (y + h - 1, footer, footer_right, (G["foot_l"], G["foot_r"]))):
+    for row, left_items, right_items, (open_tab, close_tab), if_room in (
+            (y, title, right, (G["tab_l"], G["tab_r"]), ()),
+            (y + h - 1, footer, footer_right, (G["foot_l"], G["foot_r"]), footer_if_room)):
         pos = x + 2
         for item in left_items:
             pos = cv.put(row, pos, open_tab, style, x + w - 2)
@@ -1096,6 +1097,12 @@ def box(cv, y, x, h, w, style, title=(), right=(), footer=(), footer_right=()):
             cv.put(row, start, open_tab, style)
             cv.put(row, put_parts(cv, row, start + 1, item), close_tab, style)
             end = start - 2
+        for item in if_room:                 # as far from the right-hand labels as they are from the left
+            if pos + sum(len(text) for text, _ in item) + 2 > end:
+                break
+            pos = cv.put(row, pos, open_tab, style)
+            pos = put_parts(cv, row, pos, item)
+            pos = cv.put(row, pos, close_tab, style) + 1
 
 
 def human(n):
@@ -1660,14 +1667,17 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
         title.append(warning_parts(alerts, edge))
     footer = [[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")],
               [("- +", "key"), (f" every {ui.interval:g}s", "text")]]
+    help_tab = [[("?", "key"), (" keys", "text")]]       # where the help screen is: gives way to the status
     if ui.view == "typing":                            # the filter being typed, along the bottom
         footer = [[("/ ", "key"), (ui.filter, "bright"), ("_", "key")],
                   [("Enter", "key"), (" keep", "text")], [("Esc", "key"), (" clear", "text")]]
+        help_tab = []                                  # (? is typed into the filter)
     box(cv, y, x, h, w, "b_table", title=title,
         right=[[("sorted by ", "dim"), (ui.sort, "key")]],
         footer=footer,
         footer_right=[[("lxd api ", "dim"), (mon.api_status, "lo" if sources_ok else "mid")],
-                      [("disk ", "dim"), ("zfs" if mon.zfs else "io.stat", "dim")]])
+                      [("disk ", "dim"), ("zfs" if mon.zfs else "io.stat", "dim")]],
+        footer_if_room=help_tab)
     ix, iw = x + 2, w - 4
     layout = table_layout(iw)
     draw_header(cv, y + 1, ix, layout, ui)

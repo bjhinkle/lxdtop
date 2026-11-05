@@ -94,6 +94,17 @@ class BoxTest(unittest.TestCase):
             lxdtop.box(cv, 0, 0, 3, 12, "b_mem", title=[[("memory", "title")]], right=[[("64G total", "text")]])
         self.assertEqual(cv.text().split("\n")[0], "╭─┐memory┌─╮")
 
+    def test_a_footer_label_if_room_never_pushes_a_right_hand_one_out(self):
+        def bottom(width):
+            cv = lxdtop.TextCanvas(3, width)
+            with glyphs(lxdtop.GLYPHS_UNICODE):
+                lxdtop.box(cv, 0, 0, 3, width, "b_table", footer=[[("q", "key")]], footer_right=[[("ok", "lo")]],
+                           footer_if_room=[[("? keys", "text")]])
+            return cv.text().split("\n")[2]
+        self.assertEqual(bottom(24), "╰─┘q└─┘? keys└────┘ok└─╯")
+        self.assertEqual(bottom(22), "╰─┘q└─┘? keys└──┘ok└─╯")      # as far from "ok" as "ok" may be from "q"
+        self.assertEqual(bottom(21), "╰─┘q└──────────┘ok└─╯")       # no room: left out, and "ok" stays put
+
     def test_ascii_box(self):
         cv = lxdtop.TextCanvas(3, 12)
         with glyphs(lxdtop.GLYPHS_ASCII):
