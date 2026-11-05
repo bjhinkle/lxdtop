@@ -96,6 +96,15 @@ class MonitorSignalsTest(unittest.TestCase):
             self.mon.sample()
         self.assertIsNone(self.mon.rows[0]["throttled"])
 
+    def test_a_cpu_controller_turned_on_while_lxdtop_runs(self):
+        self.host.add_container("web", 1)                  # cpu.stat without nr_periods: the controller is off
+        with self.host.installed():
+            self.mon.sample()
+        self.host.clock += 2
+        # It's on now: nr_periods appears, with no earlier count to compare it with.
+        self.assertIsNone(self.reading(periods=100, throttled=10)["throttled"])
+        self.assertEqual(self.reading(periods=120, throttled=25)["throttled"], 75.0)
+
     def test_memory_kills_since_lxdtop_started(self):
         self.reading(kills=3)                              # killed 3 times before lxdtop started: not counted
         self.assertEqual(self.mon.kills["web"][1:], (0, None))

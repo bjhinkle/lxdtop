@@ -8,6 +8,7 @@ help screen and handle_key() use.
 import contextlib
 import curses
 import io
+import itertools
 import re
 import sys
 import time
@@ -318,6 +319,53 @@ class HelpViewTest(unittest.TestCase):
             for _, _, description, _ in lxdtop.KEYS:
                 self.assertIn(description, text)                     # nothing cut short
             self.assertEqual(text.isascii(), ascii)
+
+
+class HelpTabTest(unittest.TestCase):
+    """The "? keys" tab in the table's bottom edge: after the other keys, where it fits."""
+
+    KEYS_80 = "╰─┘q quit└─┘s sort└─┘- + every 2s└"
+
+    def bottom(self, width=80, height=24, ascii=False, status="ok", zfs=True, ui=None):
+        mon = monitor(rows("web", "db"), api_status=status, zfs={"web": "kstat"} if zfs else {})
+        return draw(mon, ui or lxdtop.new_ui(2), width, height, ascii).text().splitlines()[-1]
+
+    def test_after_the_other_keys_at_80x24(self):
+        self.assertEqual(self.bottom(), self.KEYS_80 + "─┘? keys└" + "─" * 12 + "┘lxd api ok└─┘disk zfs└─╯")
+        self.assertEqual(self.bottom(ascii=True), "+-[q quit]-[s sort]-[- + every 2s]-[? keys]"
+                                                  "------------[lxd api ok]-[disk zfs]-+")
+        self.assertIn("┘- + every 2s└─┘? keys└", self.bottom(160, 45))
+
+    def test_it_gives_way_to_the_lxd_api_status(self):
+        # At 80 columns a longer status leaves no room for it: the status stays where it always was.
+        self.assertEqual(self.bottom(status="no access", zfs=False),
+                         self.KEYS_80 + "─" * 10 + "┘lxd api no access└─┘disk io.stat└─╯")
+        self.assertIn("┘? keys└", self.bottom(120, 30, status="no access", zfs=False))
+
+    def test_not_while_typing_a_filter(self):
+        ui = lxdtop.new_ui(2)
+        keys(monitor(rows("web")), ui, "/", "w")
+        self.assertNotIn("keys", self.bottom(ui=ui))                 # a ? typed now goes into the filter
+
+    def test_nothing_else_on_the_screen_moves(self):
+        real_box = lxdtop.box
+
+        def box_without_the_tab(*args, footer_if_room=(), **kwargs):
+            return real_box(*args, **kwargs)
+
+        clock = mock.patch.object(lxdtop.time, "strftime", return_value="Thu Nov 5  09:30:00 UTC")
+        for (width, height), ascii in itertools.product(((80, 24), (160, 45), (200, 60)), (False, True)):
+            mon, ui = monitor(rows("web", "db", "cache")), lxdtop.new_ui(2)
+            with clock:
+                with_tab = draw(mon, ui, width, height, ascii)
+                with mock.patch.object(lxdtop, "box", box_without_the_tab):
+                    without = draw(mon, ui, width, height, ascii)
+            self.assertEqual(with_tab.text(color=True).splitlines()[:-1], without.text(color=True).splitlines()[:-1])
+            last, before = with_tab.text().splitlines()[-1], without.text().splitlines()[-1]
+            changed = [x for x, (a, b) in enumerate(zip(last, before)) if a != b]
+            self.assertEqual(len(last), len(before))
+            self.assertEqual(changed, list(range(35, 43)))           # just the tab's 8 cells, where the edge was
+            self.assertEqual(before[35:43], ("-" if ascii else "─") * 8)
 
 
 class RunLoopKeysTest(unittest.TestCase):
