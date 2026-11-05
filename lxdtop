@@ -540,8 +540,9 @@ class ProcessTable:
     def __init__(self):
         self.owner = {}           # pid -> container name, or None for host processes
         self.ticks = {}           # pid -> CPU time at the last reading, in clock ticks
-        self.busy = {}            # pid -> CPU %, smoothed
-        self.top = {}             # container -> (busiest process name, its CPU %)
+        self.busy = {}            # pid -> CPU %, smoothed: only to choose the busiest, so its name doesn't flicker
+        self.recent = {}          # pid -> CPU % in the last interval, as a container's CPU is shown
+        self.top = {}             # container -> (busiest process name, its CPU % in the last interval)
         self.started = {}         # container -> start of its oldest process, ticks after boot
         self.first = {}           # container -> its oldest process (its init), for root_dataset()
         self.last = None
@@ -558,6 +559,7 @@ class ProcessTable:
                 del self.owner[pid]
                 self.ticks.pop(pid, None)
                 self.busy.pop(pid, None)
+                self.recent.pop(pid, None)
         top, started, first = {}, {}, {}
         for pid in alive:
             if pid not in self.owner:
@@ -577,12 +579,14 @@ class ProcessTable:
             if before is not None and secs > 0:
                 pct = max(0, ticks - before) / CLOCK_TICKS / secs * 100
                 self.busy[pid] = (self.busy.get(pid, pct) + pct) / 2
+                self.recent[pid] = pct
             busy = self.busy.get(pid, 0.0)
-            if cg not in top or busy > top[cg][1]:
-                top[cg] = (name, busy)
+            if cg not in top or busy > top[cg][2]:
+                top[cg] = (name, self.recent.get(pid, 0.0), busy)
             if start <= started.get(cg, start):
                 started[cg], first[cg] = start, pid
-        self.top, self.started, self.first = top, started, first
+        self.top = {cg: (name, pct) for cg, (name, pct, _) in top.items()}
+        self.started, self.first = started, first
 
 
 # --- LXD's API and event stream -------------------------------------------------
@@ -1128,6 +1132,9 @@ class Monitor:
             periods = (cpu.get("nr_periods"), cpu.get("nr_throttled")) if row["cpu_quota"] else None
             self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings,
                          periods=periods)
+            if row["top"] and row["cpu"] is not None:
+                # Its process's clock ticks can add up to a little more than the cgroup counted.
+                row["top"] = (row["top"][0], min(row["top"][1], row["cpu"]))
             rows.append(row)
 
         # VMs have no container cgroup: LXD runs each one as a QEMU process on the
@@ -2635,6 +2642,8 @@ KEYS = (
 KEY_ACTIONS = {code: action for _, codes, _, action in KEYS for code in codes}
 BACKSPACE = (curses.KEY_BACKSPACE, 127, 8)      # while typing a filter
 ESC_DELAY_MS = 25                  # how long curses waits after Esc for more of a key's code (default 1000)
+SPLIT_KEY_SECS = 0.5               # how long after an Esc the rest of an arrow key's code may still come
+ARROWS = {ord("A"): curses.KEY_UP, ord("B"): curses.KEY_DOWN}     # Esc, [ or O, then this letter
 QUIT = "quit"
 
 
@@ -2648,7 +2657,7 @@ def new_ui(interval):
     filter, or "detail"), the name filter, the highlighted instance (by cgroup name), and where the
     table is scrolled to."""
     return types.SimpleNamespace(interval=interval, sort="cpu", view="main", back="main", filter="",
-                                 selected=None, scroll=0, detail=None, last=None)
+                                 selected=None, scroll=0, detail=None, last=None, split=None)
 
 
 def name_matches(row, text):
@@ -2676,6 +2685,26 @@ def type_filter(key, ui):
     return True
 
 
+def split_key(key, ui):
+    """An arrow key sends Esc, "[" (or "O"), then a letter, and curses waits ESC_DELAY_MS for all of it.
+    On a slow link the rest can come later, after the Esc has acted on its own: then this undoes the
+    Esc, and gives the arrow key's code. "wait" means the rest is still coming; None, that key isn't it.
+    Esc acts at once, as before: only a split arrow key waits for its own rest.
+    """
+    when, before, opened = ui.split
+    if time.monotonic() - when > SPLIT_KEY_SECS:
+        ui.split = None
+    elif not opened and key in (ord("["), ord("O")):
+        ui.split = (when, before, True)
+        return "wait"
+    elif opened and key in ARROWS:
+        vars(ui).update(before)                      # as if the Esc never came
+        return ARROWS[key]
+    else:
+        ui.split = None
+    return None
+
+
 def handle_key(key, mon, ui):
     """Act on one key press: QUIT to end lxdtop, True when the screen needs drawing again, False
     when the key does nothing here."""
@@ -2683,6 +2712,14 @@ def handle_key(key, mon, ui):
         return False
     if key == curses.KEY_RESIZE:
         return True
+    if ui.split:
+        arrow = split_key(key, ui)
+        if arrow == "wait":
+            return False
+        if arrow is not None:
+            return handle_key(arrow, mon, ui) or True        # the Esc's undoing needs drawing too
+    if KEY_ACTIONS.get(key) == "escape":             # it may be the start of a split arrow key
+        ui.split = (time.monotonic(), dict(vars(ui), split=None), False)
     if ui.view == "help":                            # any key closes the help
         ui.view = ui.back
         return True

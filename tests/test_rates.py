@@ -55,14 +55,19 @@ class ProcessTableTest(unittest.TestCase):
         self.assertEqual(self.table.top["dev_api"], ("(sd-pam)", 0.0))   # name in parentheses kept whole
         self.assertNotIn(200, self.table.ticks)                  # host processes aren't read again
 
-    def test_rates_are_smoothed(self):
+    def test_the_busiest_is_chosen_smoothed_and_shown_for_the_last_interval(self):
+        """Smoothed, the name doesn't flicker between processes; its CPU is the last interval's, as the container's."""
         self.host.add_process(100, "nginx", "/lxc.payload.web", utime=0)
+        self.host.add_process(101, "cron", "/lxc.payload.web", utime=0)
         self.sample(10.0)
         self.host.add_process(100, "nginx", "/lxc.payload.web", utime=2 * TICKS)    # 100% for 2 s
+        self.host.add_process(101, "cron", "/lxc.payload.web", utime=TICKS // 2)    # 25%
         self.sample(12.0)
         self.host.add_process(100, "nginx", "/lxc.payload.web", utime=2 * TICKS)    # then idle
+        self.host.add_process(101, "cron", "/lxc.payload.web", utime=TICKS)         # 25% again
         self.sample(14.0)
-        self.assertEqual(self.table.top["web"], ("nginx", 50.0))
+        self.assertEqual(self.table.busy, {100: 50.0, 101: 25.0})                   # nginx is still the busiest
+        self.assertEqual(self.table.top["web"], ("nginx", 0.0))                      # at 0% in the last 2 s
 
     def test_gone_processes_are_forgotten(self):
         self.host.add_process(100, "nginx", "/lxc.payload.web", utime=1)
