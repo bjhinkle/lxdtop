@@ -24,6 +24,7 @@ import socket
 import sys
 import tempfile
 import threading
+import time
 import types
 from unittest import mock
 
@@ -346,16 +347,18 @@ class FakeLxd:
     seconds. The connection closes at the end of the script.
 
     Every request line is kept in `requests`, so a test can check exactly
-    which methods and paths lxdtop used.
+    which methods and paths lxdtop used. `delays` maps a request target to
+    the seconds to wait before answering it, as a slow LXD would.
     """
 
     READ_FRAME = "read frame"
     DRAIN = "drain"
 
-    def __init__(self, routes=None, script=(), events_status=101, hold_open=False):
+    def __init__(self, routes=None, script=(), events_status=101, hold_open=False, delays=None):
         self.dir = tempfile.mkdtemp(prefix="lxdtop-fakelxd-")
         self.path = os.path.join(self.dir, "unix.socket")
         self.routes = dict(routes or {})
+        self.delays = dict(delays or {})
         self.script = list(script)
         self.events_status = events_status
         self.hold_open = hold_open
@@ -407,6 +410,7 @@ class FakeLxd:
             if target.startswith("/1.0/events"):
                 self._events(conn)
             else:
+                time.sleep(self.delays.get(target, 0))
                 status, body = self.routes.get(target, (404, {"type": "error", "error": "not found",
                                                               "error_code": 404}))
                 data = body if isinstance(body, bytes) else json.dumps(body).encode()
