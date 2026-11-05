@@ -1088,6 +1088,11 @@ def human(n):
     return f"{value:.1f}{unit}" if value < 10 else f"{value:.0f}{unit}"
 
 
+def fmt_count(n):
+    """A count in about 4 characters: 500, 9999, 42k, 4.2M."""
+    return str(n) if n < 10_000 else f"{n / 1000:.0f}k" if n < 1_000_000 else f"{n / 1_000_000:.1f}M"
+
+
 def fmt_pct(value):
     if value is None:
         return ""
@@ -1268,14 +1273,21 @@ def draw_mem_panel(cv, y, x, h, w, mon):
         put_cells(cv, row, ix + 6, meter_cells(meter_w, value, scale, lambda _, s=style: s))
         cv.put(row, ix + 6 + meter_w, human(value).rjust(6), style)
         cv.put(row, ix + 12 + meter_w, f"{value / scale * 100:4.0f}%", "text")
-    # Bottom row: storage pools from LXD, then the root filesystem.
-    disks = list(mon.pools) + ([("root", host["root_used"], host["root_total"])] if host.get("root_total") else [])
+    # Bottom row: storage pools from LXD, then the root filesystem. A ZFS pool that isn't ONLINE
+    # shows its state in red: after the LXD pool of the same name, or on its own before root.
+    sick = {pool: state for pool, state in host.get("zpools", {}).items() if state != "ONLINE"}
+    disks = list(mon.pools) + [(pool, None, None) for pool in sorted(sick) if pool not in {p[0] for p in mon.pools}]
+    disks += [("root", host["root_used"], host["root_total"])] if host.get("root_total") else []
     pos = ix
     for name, used, size in disks:
-        share = used / size * 100 if size else 0
-        pos = put_parts(cv, y + h - 2, pos, [
-            (name + " ", "text"), (human(used), "bright"), ("/" + human(size), "dim"),
-            (f" {share:.0f}%", "mid" if share >= 80 else "dim"), ("   ", "dim")], ix + iw)
+        parts = [(name + " ", "hi" if name in sick else "text")]
+        if size is not None:
+            share = used / size * 100 if size else 0
+            parts += [(human(used), "bright"), ("/" + human(size), "dim"),
+                      (f" {share:.0f}%", "mid" if share >= 80 else "dim")]
+        if name in sick:
+            parts.append(((" " if size is not None else "") + sick[name], "hi"))
+        pos = put_parts(cv, y + h - 2, pos, parts + [("   ", "dim")], ix + iw)
 
 
 def draw_net_panel(cv, y, x, h, w, mon):
@@ -1394,6 +1406,14 @@ def draw_events_panel(cv, y, x, h, w, mon):
             cv.put(y + 1 + i, right - len(count), count, "key")
 
 
+# The extra columns on screens wider than OPS_FROM, added in this order while they fit:
+# THROTTLED (share of the CPU limit's periods held back @ the limit in cores), MEM/LIMIT (MEM as
+# a share of memory.max), WAITING (its worst stall: cpu, mem or io), MEM KILLS (memory kills since
+# lxdtop started, and how long ago the last was), PROCS/LIMIT (TASKS as a share of pids.max) and
+# LAST SNAP (how old its newest snapshot is). (column, width)
+OPS_COLUMNS = (("thr", 10), ("mem_pct", 12), ("wait", 8), ("kills", 10), ("tasks_pct", 11), ("snap", 9))
+
+
 def table_layout(width):
     """Pick the columns that fit; the CPU history column gets the width left over.
 
@@ -1418,6 +1438,12 @@ def table_layout(width):
             cols.append(("tasks", 5, 2))
         if "ip" not in drop:
             cols.append(("ip", 15, 2))
+        room = width - (OPS_FROM - 4)                  # what a screen wider than OPS_FROM adds (table: 4 narrower)
+        for name, w in OPS_COLUMNS if n_drop == 0 else ():
+            if w + 2 > room:
+                break                                  # in order: a later one never jumps ahead
+            cols.append((name, w, 2))
+            room -= w + 2
         spare = width - sum(w + gap for _, w, gap in cols)
         if spare >= 16 or n_drop == len(optional):
             layout, x = {}, 0
@@ -1432,7 +1458,9 @@ def table_layout(width):
 
 HEADERS = (("name", "NAME", "<"), ("up", "UP", ">"), ("cpu", "CPU", ">"), ("top", "BUSIEST PROCESS", "<"),
            ("mem", "MEM", ">"), ("rd", "DISK R", ">"), ("wr", "DISK W", ">"), ("net_in", "IN Mb/s", ">"),
-           ("net_out", "OUT Mb/s", ">"), ("tasks", "TASKS", ">"), ("ip", "IPV4", "<"))
+           ("net_out", "OUT Mb/s", ">"), ("tasks", "TASKS", ">"), ("ip", "IPV4", "<"),
+           ("thr", "THROTTLED", ">"), ("mem_pct", "MEM/LIMIT", ">"), ("wait", "WAITING", ">"),
+           ("kills", "MEM KILLS", ">"), ("tasks_pct", "PROCS/LIMIT", ">"), ("snap", "LAST SNAP", ">"))
 
 
 def draw_header(cv, y, x0, layout, ui):
@@ -1449,7 +1477,39 @@ def draw_header(cv, y, x0, layout, ui):
     cv.put(y, x0 + x, (label if len(label) <= w else "CPU HISTORY")[:w], "bright")
 
 
-def draw_row(cv, y, x0, layout, row, mon):
+def ops_cells(row, mon):
+    """The extra columns' (text, style) for one row: {column: (text, style)}. "-" means no limit
+    (or no kill), and a cell left out means no reading: VMs and stopped instances have no cgroup here."""
+    cells, seen = {}, mon.kills.get(row["cg"])
+    if seen and seen[1]:
+        ago = time.monotonic() - seen[2]
+        cells["kills"] = (f"{seen[1]} {fmt_age(ago)} ago", "hi" if ago < RECENT_KILL else "text")
+    elif seen:
+        cells["kills"] = ("-", "dim")
+    taken = row["snapshot"]
+    cells["snap"] = (fmt_age(time.time() - taken), "text") if taken else ("never", "dim")
+    if not row["live"] or row["vm"]:
+        return cells
+    held, cap = row["throttled"], row["cpu_max"]
+    if cap is None:
+        cells["thr"] = ("-", "dim")
+    elif held is not None:
+        cells["thr"] = (f"{held:.0f}% @{cap:.3g}c", "mid" if held >= THROTTLED_PCT else "text" if held >= 1 else "dim")
+    for col, used, limit, show in (("mem_pct", row["mem"], row["mem_max"], human),
+                                   ("tasks_pct", row["tasks"], row["tasks_max"], fmt_count)):
+        if limit is None:
+            cells[col] = ("-", "dim")
+        elif used is not None:
+            share = used / limit * 100 if limit else 100.0
+            cells[col] = (f"{share:.0f}% of {show(limit)}", "mid" if share >= NEAR_LIMIT_PCT else "text")
+    if row["waiting"]:
+        resource, share = row["waiting"]
+        cells["wait"] = ("-", "dim") if share < 1 else (f"{resource} {share:.0f}%",
+                                                       "hi" if share >= PRESSURE_PCT else "text")
+    return cells
+
+
+def draw_row(cv, y, x0, layout, row, mon, marked=()):
     def at(col):
         return x0 + layout[col][0]
 
@@ -1460,12 +1520,16 @@ def draw_row(cv, y, x0, layout, row, mon):
     if len(name) > width("name"):
         name = name[:width("name") - 1] + G["more"]
     marker = G["vm"] if row["vm"] else G["dot"]
+    if "thr" in layout:                                 # the extra columns, on screens wider than OPS_FROM
+        for col, (text, style) in ops_cells(row, mon).items():
+            if col in layout:
+                cv.put(y, at(col), text.rjust(width(col))[:width(col)], style)
     if not row["live"]:
-        cv.put(y, at("dot"), marker, "dim")
+        cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "dim")      # red: see the warning
         cv.put(y, at("name"), name, "dim")
         cv.put(y, at("up") if "up" in layout else at("cpu"), row["state"].lower(), "dim")
         return
-    cv.put(y, at("dot"), marker, "mid" if row["state"] == "Frozen" else "lo")
+    cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "mid" if row["state"] == "Frozen" else "lo")
     cv.put(y, at("name"), name, mon.series_style.get(row["cg"], "bright"))
     if "up" in layout and row["up"] is not None:
         # Recently (re)started containers stand out in yellow for their first hour.
@@ -1512,9 +1576,60 @@ def sort_rows(mon, mode):
     return live + rest
 
 
+def warnings(mon):
+    """What's wrong right now, most serious first: [(how serious, order, text, container or None)].
+
+    A ZFS pool that is down, then a recent memory kill, then a DEGRADED pool, then high pressure,
+    then throttling, by the thresholds at the top of the file; within each, the worst first.
+    """
+    found, now = [], time.monotonic()
+    names = {row["cg"]: row["name"] for row in mon.rows}
+    for pool, state in sorted(mon.host.get("zpools", {}).items()):
+        if state != "ONLINE":
+            found.append((3 if state == "DEGRADED" else 5, 0, f"{pool} {state}", None))
+    for cg, (_, count, when) in mon.kills.items():
+        if count and now - when < RECENT_KILL:
+            ago = fmt_age(now - when)
+            what = f"memory kill {ago} ago" if count == 1 else f"{count} memory kills, last {ago} ago"
+            found.append((4, now - when, f"{names.get(cg, cg)}: {what}", cg))
+    for row in mon.rows:
+        if row["waiting"] and row["waiting"][1] >= PRESSURE_PCT:
+            resource, share = row["waiting"]
+            found.append((2, -share, f"{row['name']}: waiting on {resource} {share:.0f}%", row["cg"]))
+        if row["cpu_max"] and row["throttled"] is not None and row["throttled"] >= THROTTLED_PCT:
+            what = f"throttled {row['throttled']:.0f}% @{row['cpu_max']:.3g}c"
+            found.append((1, -row["throttled"], f"{row['name']}: {what}", row["cg"]))
+    return sorted(found, key=lambda item: (-item[0], item[1]))
+
+
+def warning_parts(alerts, room):
+    """The warnings as (text, style) pieces for one line of at most `room` characters: as many
+    as fit, then how many more there are. Pools and memory kills in red, the rest in yellow."""
+    texts, sep = [(text, "hi" if serious >= 3 else "mid") for serious, _, text, _ in alerts], f" {G['idle']} "
+    shown, used = 0, -len(sep)                          # (no separator before the first)
+    for text, _ in texts:
+        rest = len(texts) - shown - 1                   # how many would be left over if this one shows
+        if used + len(sep) + len(text) + (len(sep) + len(f"+{rest} more") if rest else 0) > room:
+            break
+        shown, used = shown + 1, used + len(sep) + len(text)
+    if shown:
+        more = [(f"+{len(texts) - shown} more", "dim")] if shown < len(texts) else []
+    else:                                               # not even one fits: cut the most serious short
+        texts, more, shown = [(texts[0][0][:room - 1] + G["more"], texts[0][1])], [], 1
+    parts = []
+    for text, style in texts[:shown] + more:
+        parts += ([(sep, "dim")] if parts else []) + [(text, style)]
+    return parts
+
+
 def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
     sources_ok = mon.api_status == "ok"
-    box(cv, y, x, h, w, "b_table", title=[[(instance_noun(mon), "title")]],
+    noun, alerts = instance_noun(mon), warnings(mon)
+    title = [[(noun, "title")]]
+    room = w - len(noun) - len("sorted by " + ui.sort) - 13   # the top edge between the title and the sort
+    if alerts and room >= 8:
+        title.append(warning_parts(alerts, room))
+    box(cv, y, x, h, w, "b_table", title=title,
         right=[[("sorted by ", "dim"), (ui.sort, "key")]],
         footer=[[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")],
                 [("- +", "key"), (f" every {ui.interval:g}s", "text")]],
@@ -1528,7 +1643,7 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
         if i == room - 1 and len(rows) > room:
             cv.put(y + 2 + i, ix, f"{G['more']} {len(rows) - i} more", "dim")
             break
-        draw_row(cv, y + 2 + i, ix, layout, row, mon)
+        draw_row(cv, y + 2 + i, ix, layout, row, mon, {cg for *_, cg in alerts if cg})
 
 
 def draw(cv, mon, ui):
