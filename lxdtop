@@ -328,6 +328,15 @@ def read_zpool_states():
     return {path.split("/")[-2]: (read(path) or "").strip() for path in glob.glob(ZFS_STATE_GLOB)}
 
 
+def pool_states(zpools, of):
+    """The zpools' states, named as LXD names its pools: an LXD pool's state is that of the zpool it's
+    in, which `of` says (from LXD's API). A pool with zfs.pool_name=tank/lxd is in tank, which can hold
+    other pools too. A zpool no LXD pool is in keeps its own name."""
+    states = {pool: zpools[zpool] for pool, zpool in of.items() if zpool in zpools}
+    states.update((zpool, state) for zpool, state in zpools.items() if zpool not in of.values())
+    return states
+
+
 def find_zfs_datasets(roots=None, own=None):
     """Map instance names to the ZFS kstat file for their disk.
 
@@ -340,9 +349,12 @@ def find_zfs_datasets(roots=None, own=None):
     has said: then only a dataset directly in one of them counts. Without them,
     `own` says which dataset each running container has as "/" ("" if it isn't
     ZFS, None if unknown), and a dataset inside a running container's own (made
-    there, with zfs.delegate) doesn't count.
+    there, with zfs.delegate) doesn't count. For a running container whose "/" is unknown, a dataset
+    with containers/<its name>/ in its path doesn't count either, since that may be inside its own.
     """
     running = {os.path.basename(p)[len(CGROUP_PREFIX):] for p in glob.glob(CGROUP_GLOB)}
+    inside = tuple(root + "/" for root in (own or {}).values() if root)    # in a running container's own dataset
+    unknown = {cg for cg in running if (own or {}).get(cg) is None}       # running, its "/" unknown
     mapping, lengths = {}, {}
     for path in glob.glob(ZFS_KSTAT_GLOB):
         dataset = (read_kstat(path, ("dataset_name",)) or {}).get("dataset_name", "")
@@ -352,7 +364,8 @@ def find_zfs_datasets(roots=None, own=None):
                 if roots and parent not in roots:
                     continue                     # not directly in one of LXD's pools: not an instance's own
                 parts = parent.split("/")
-                if not roots and any(a == "containers" and b in running for a, b in zip(parts, parts[1:])):
+                if not roots and (dataset.startswith(inside)
+                                  or any(a == "containers" and b in unknown for a, b in zip(parts, parts[1:]))):
                     continue                     # inside a running container's dataset: made in there
                 instance = name[:len(name) - len(suffix)]
                 mounted = (own or {}).get(instance)
@@ -603,6 +616,52 @@ def vm_limits(config):
     return cores or None, size
 
 
+def whole_disk(device):
+    """Whether a VM's disk in LXD's metrics is a whole disk: QEMU's own (dev-lxd_<disk>), or one the guest
+    sees, such as sda, vdb, xvdc or nvme0n1, rather than a partition (sda1, nvme0n1p1), a loop,
+    device-mapper or RAID device on top of one, or a CD."""
+    if "dev-lxd_" in device:
+        return True
+    for prefix in ("sd", "vd", "xvd", "hd"):
+        if device.startswith(prefix) and device[len(prefix):].isalpha():
+            return True
+    controller, _, namespace = device[4:].partition("n")
+    return device.startswith("nvme") and controller.isdigit() and namespace.isdigit()
+
+
+def vm_disk_totals(text):
+    """Each running VM's disk counters from LXD's metrics: {cgroup name: {disk: (bytes read, bytes written)}}.
+
+    LXD's GET /1.0/metrics answers in Prometheus's text format, a line a number, for example
+      lxd_disk_read_bytes_total{device="sda",name="win",project="default",type="virtual-machine"} 1.2e+09
+    For a VM, LXD takes them from the lxd-agent inside it, which reads the guest's /proc/diskstats,
+    or else from QEMU itself: either way, whatever the storage driver. Only whole disks count (see
+    whole_disk()), so that a partition's bytes don't count twice.
+    """
+    wanted = {"lxd_disk_read_bytes_total": 0, "lxd_disk_written_bytes_total": 1}
+    totals = {}
+    for line in text.splitlines():
+        metric, _, rest = line.partition("{")
+        labels_text, _, value = rest.rpartition("} ")
+        if metric not in wanted:
+            continue
+        labels = {}
+        for pair in labels_text.split(","):
+            key, _, quoted = pair.partition("=")
+            labels[key] = quoted.strip('"')
+        if labels.get("type") != "virtual-machine" or not whole_disk(labels.get("device", "")):
+            continue
+        try:
+            count = float(value)
+        except ValueError:
+            continue
+        project, name = labels.get("project") or "default", labels.get("name", "")
+        disks = totals.setdefault(name if project == "default" else f"{project}_{name}", {})
+        counts = disks.setdefault(labels["device"], [0.0, 0.0])
+        counts[wanted[metric]] = count
+    return {cg: {disk: tuple(counts) for disk, counts in disks.items()} for cg, disks in totals.items()}
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     """Plain HTTP, but over LXD's local unix socket instead of a TCP port."""
 
@@ -633,6 +692,8 @@ class LxdApi:
         self.status = "starting"
         self.rounds = 0
         self.wake = threading.Event()  # set this to refresh early (a new container appeared)
+        self.vm_disks_wanted = frozenset()     # running VMs the screen has no disk counters for (Monitor sets it)
+        self.vm_disks = None                   # (when, vm_disk_totals()) at the last metrics reading
 
     def get(self, path):
         conn = UnixHTTPConnection(self.socket_path)
@@ -645,6 +706,40 @@ class LxdApi:
         if reply.status != 200:
             raise ValueError(body.get("error") or f"HTTP {reply.status}")
         return body.get("metadata")
+
+    def get_text(self, path):
+        """A GET whose answer is text rather than JSON: LXD's metrics."""
+        conn = UnixHTTPConnection(self.socket_path)
+        try:
+            conn.request("GET", path)
+            reply = conn.getresponse()
+            body = reply.read()
+        finally:
+            conn.close()
+        if reply.status != 200:
+            raise ValueError(f"HTTP {reply.status}")
+        return body.decode("utf-8", "replace")
+
+    def fetch_vm_disks(self, instances):
+        """Disk read and write rates, bytes a second, for the running VMs the screen has no disk
+        counters for: from LXD's metrics (vm_disk_totals()), between this reading and the last,
+        15 seconds apart. Only disks in both readings count, so a VM whose numbers switched between
+        its agent's and QEMU's, which name disks differently, has none until its next reading."""
+        try:
+            text = self.get_text("/1.0/metrics")
+        except (OSError, ValueError, http.client.HTTPException):
+            return                                       # no metrics (an error, or LXD has none): no rates
+        now, totals = time.monotonic(), vm_disk_totals(text)
+        before, self.vm_disks = self.vm_disks, (now, totals)
+        if not before:
+            return
+        for cg, disks in totals.items():
+            pairs = [(counts, before[1].get(cg, {}).get(disk)) for disk, counts in disks.items()]
+            pairs = [(after, earlier) for after, earlier in pairs if earlier]
+            if cg in instances and pairs:
+                secs = now - before[0]
+                instances[cg]["disk_rates"] = (sum(rate(a[0], b[0], secs) for a, b in pairs),
+                                               sum(rate(a[1], b[1], secs) for a, b in pairs))
 
     def fetch_instances(self, member=None):
         found = {}
@@ -677,11 +772,12 @@ class LxdApi:
         env = (self.get("/1.0") or {}).get("environment") or {}
         server = dict(version=env.get("server_version", ""), kernel=env.get("kernel_version", ""),
                       os=f"{env.get('os_name', '')} {env.get('os_version', '')}".strip(), zfs_roots=[],
-                      member=env.get("server_name", "") if env.get("server_clustered") else "")
+                      zpools={}, member=env.get("server_name", "") if env.get("server_clustered") else "")
         pools = []
         for pool in self.get("/1.0/storage-pools?recursion=1") or []:
             if pool.get("driver") == "zfs":              # the dataset its volumes live in (zfs.pool_name)
                 server["zfs_roots"].append((pool.get("config") or {}).get("zfs.pool_name") or pool["name"])
+                server["zpools"][pool["name"]] = server["zfs_roots"][-1].split("/")[0]     # the zpool it's in
             path = f"/1.0/storage-pools/{urllib.parse.quote(pool['name'])}/resources"
             try:
                 space = (self.get(path) or {}).get("space") or {}
@@ -695,6 +791,8 @@ class LxdApi:
         try:
             server, pools = self.fetch_server() if self.rounds % 4 == 0 else (self.server, self.pools)
             instances = self.fetch_instances(server.get("member"))     # on a cluster, this member's only
+            if self.vm_disks_wanted & instances.keys():
+                self.fetch_vm_disks(instances)
             status = "ok"
         except PermissionError:
             instances, status = None, "no access"        # not in the lxd group
@@ -909,7 +1007,8 @@ class Monitor:
             swap_total=mem["SwapTotal"],
             swap_used=None if None in (mem["SwapTotal"], mem["SwapFree"]) else mem["SwapTotal"] - mem["SwapFree"],
             root_total=root_total, root_used=root_used,
-            load=(read("/proc/loadavg") or "").split()[:3], uptime=uptime, zpools=read_zpool_states())
+            load=(read("/proc/loadavg") or "").split()[:3], uptime=uptime,
+            zpools=pool_states(read_zpool_states(), self.server.get("zpools", {})))     # named as LXD names them
 
     def sample_network(self, now):
         if now - self.nics_checked > 60:
@@ -963,6 +1062,7 @@ class Monitor:
 
         # VMs have no container cgroup: LXD runs each one as a QEMU process on the
         # host, so read that process instead (CPU time, resident memory, start time).
+        wanted = set()                            # VMs with no disk counters here: see LxdApi.fetch_vm_disks()
         for cg, inst in instances.items():
             if inst.get("type") != "virtual-machine" or inst["status"] != "Running" or cg in readings:
                 continue
@@ -973,10 +1073,16 @@ class Monitor:
             row = new_row(cg, inst, vm=True, mem=rss, up=uptime - start / CLOCK_TICKS,
                           cpu_max=inst.get("cpu_max"), mem_max=inst.get("mem_max"))    # from LXD: see vm_limits()
             disk, disk_src = self.read_disk(cg)
-            self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings)
+            self.measure(row, now, cpu_usec, disk, disk_src or "lxd", read_net(inst.get("veths", ())), readings)
+            if disk is None:                      # not on ZFS: its rates from LXD's metrics, every 15 seconds
+                wanted.add(cg)
+                row["rd"], row["wr"] = inst.get("disk_rates") or (None, None)
             rows.append(row)
+        if self.api:
+            self.api.vm_disks_wanted = frozenset(wanted)
 
-        # Anything else LXD knows about is stopped (or a VM whose process couldn't be read).
+        # Anything else LXD knows about is stopped (or a VM whose process couldn't be read, which
+        # is_stopped() counts as running).
         for cg, inst in instances.items():
             if cg not in readings:
                 rows.append(new_row(cg, inst, live=False, vm=inst.get("type") == "virtual-machine"))
@@ -1408,7 +1514,7 @@ def draw_status(cv, y, mon):
         for part in (server.get("os"), server.get("kernel") and "kernel " + server["kernel"]):
             if part:
                 x = put_parts(cv, y, x, [(f"  {G['idle']}  ", "dim"), (part, "dim")])
-    running = sum(1 for r in mon.rows if r["live"])
+    running = sum(1 for r in mon.rows if not is_stopped(r))
     right = [(f"{running} running", "lo")]
     if len(mon.rows) > running:
         right.append((f" {G['idle']} {len(mon.rows) - running} stopped", "dim"))
@@ -1877,6 +1983,12 @@ def draw_row(cv, y, x0, layout, row, mon, marked=()):
         cv.put(y, at("ip"), row["ip"], "ip")
 
 
+def is_stopped(row):
+    """Stopped: no readings, and LXD doesn't say it's running. A running VM whose QEMU process
+    lxdtop can't read has no readings either, but it counts as running, as LXD says."""
+    return not row["live"] and row["state"] != "Running"
+
+
 def sort_rows(mon, mode):
     def recent_cpu(row):              # average of the last few samples, so rows don't jump about
         values = [v for v in list(mon.cpu_history.get(row["cg"], ()))[-5:] if v is not None]
@@ -1893,9 +2005,9 @@ def sort_rows(mon, mode):
         "throttled": lambda r: -(r["throttled"] or 0),
         "waiting": lambda r: -(r["waiting"][1] if r["waiting"] else 0),
     }
-    live = sorted((r for r in mon.rows if r["live"]), key=lambda r: (keys[mode](r), r["name"].lower()))
-    rest = sorted((r for r in mon.rows if not r["live"]), key=lambda r: r["name"].lower())
-    return live + rest
+    running = sorted((r for r in mon.rows if not is_stopped(r)), key=lambda r: (keys[mode](r), r["name"].lower()))
+    rest = sorted((r for r in mon.rows if is_stopped(r)), key=lambda r: r["name"].lower())
+    return running + rest
 
 
 def warnings(mon):
@@ -1989,7 +2101,7 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
     if ui.selected in {row["cg"] for row in rows}:     # a highlighted row: see draw_scrolled()
         draw_scrolled(cv, y + 2, ix, iw, room, layout, rows, mon, ui, marked)
         return
-    live = [row for row in rows if row["live"]]
+    live = [row for row in rows if not is_stopped(row)]      # running, as LXD says (sort_rows() puts them first)
     if shown is None or (shown >= len(live) and not fold):     # a row for every instance, as always
         for i, row in enumerate(rows[:room]):                   # (fit_layout() left room for them all)
             draw_row(cv, y + 2 + i, ix, layout, row, mon, marked)
@@ -2077,7 +2189,7 @@ def draw_main(cv, mon, ui):
     rows = sort_rows(mon, ui.sort)
     draw_status(cv, 0, mon)
     y = 1
-    running = sum(1 for row in rows if row["live"])
+    running = sum(1 for row in rows if not is_stopped(row))
     top_h, mid_h, shown, fold = fit_layout(cv.w, cv.h, running, len(rows) - running)
     if top_h:
         side = cv.w * 52 // 160
@@ -2112,6 +2224,17 @@ def draw_help(cv):
     cv.put(y + h - 2, x + 3, "lxdtop only reads: no key starts, stops or changes anything", "dim", x + w - 2)
 
 
+def disk_source(row, mon):
+    """Where an instance's disk numbers come from: "zfs", "io.stat", "lxd" (its metrics, for a VM
+    whose disk isn't on ZFS), or None when there are none."""
+    past = mon.past.get(row["cg"])
+    if not past:
+        return None
+    if past[-1]["disk_src"] == "lxd":
+        return "lxd" if row["rd"] is not None else None
+    return {"zfs": "zfs", "io": "io.stat"}.get(past[-1]["disk_src"]) if past[-1]["disk"] else None
+
+
 def detail_lines(row, mon, gone):
     """The detail view's lines: (label, [(text, style), ...]), from what lxdtop already has."""
     dash, kills = [("-", "dim")], mon.kills.get(row["cg"])
@@ -2142,8 +2265,7 @@ def detail_lines(row, mon, gone):
     top = row["top"]
     lines.append(("busiest", [("inside the guest", "dim")] if vm else
                   [(top[0], "text"), (" " + fmt_pct(top[1]), cpu_style(top[1]))] if top else dash))
-    past = mon.past.get(row["cg"])
-    source = {"zfs": "zfs", "io": "io.stat"}.get(past[-1]["disk_src"]) if past and past[-1]["disk"] else None
+    source = disk_source(row, mon)
     lines.append(("disk", [("read ", "dim"), (human(row["rd"]) + "/s", "text"), ("   write ", "dim"),
                            (human(row["wr"]) + "/s", "text"), (f"   from {source}" if source else "", "dim")]
                   if row["rd"] is not None else dash))
@@ -2263,7 +2385,7 @@ def instance_json(row, mon, now, wall):
     kills, and a stopped one no limits. A running VM's limits are the CPUs and memory LXD gives it
     (see vm_limits()); its processes are inside its guest, so no busiest process or tasks either.
     """
-    past, kills, waiting = mon.past.get(row["cg"]), mon.kills.get(row["cg"]), row["waiting"]
+    kills, waiting = mon.kills.get(row["cg"]), row["waiting"]
     top, taken = (None if row["vm"] else row["top"]), row["snapshot"]
     return {
         "name": row["name"],
@@ -2277,7 +2399,7 @@ def instance_json(row, mon, now, wall):
         "mem_bytes": row["mem"],
         "disk_read_bytes_per_s": rounded(row["rd"], 1),
         "disk_write_bytes_per_s": rounded(row["wr"], 1),
-        "disk_source": {"zfs": "zfs", "io": "io.stat"}.get(past[-1]["disk_src"]) if past and past[-1]["disk"] else None,
+        "disk_source": disk_source(row, mon),
         "net_in_bits_per_s": bits_per_s(row["net_in"]),
         "net_out_bits_per_s": bits_per_s(row["net_out"]),
         "tasks": row["tasks"],
@@ -2311,7 +2433,7 @@ def reading_json(mon, interval):
              for name, used, total in mon.pools]
     pools += [dict(name=name, used_bytes=None, total_bytes=None, health=state)    # ZFS pools LXD didn't list
               for name, state in sorted(zpools.items()) if name not in {pool["name"] for pool in pools}]
-    running = sum(1 for row in rows if row["live"])
+    running = sum(1 for row in rows if not is_stopped(row))
     return {
         "schema": 1,
         "lxdtop_version": VERSION,
