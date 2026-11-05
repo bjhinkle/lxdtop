@@ -159,7 +159,7 @@ GLYPHS_ASCII = dict(full="#", mid="=", low="-", cell="#", cell_off=".", idle="."
                     tab_l="[", tab_r="]", foot_l="[", foot_r="]",
                     up="^", down="v", sorted="v", more="~", deg="", times="x")
 G = GLYPHS_UNICODE
-ONE_CELL = frozenset("".join(GLYPHS_UNICODE.values()))   # lxdtop's own glyphs, each one cell wide
+ONE_CELL = frozenset("".join(GLYPHS_UNICODE.values()) + "".join(map(chr, range(32, 127))))   # glyphs, ASCII
 
 EVENT_LABELS = {
     "instance-started": ("started", "ev_start"),
@@ -1626,9 +1626,9 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
     sources_ok = mon.api_status == "ok"
     noun, alerts = instance_noun(mon), warnings(mon)
     title = [[(noun, "title")]]
-    room = w - len(noun) - len("sorted by " + ui.sort) - 13   # the top edge between the title and the sort
-    if alerts and room >= 8:
-        title.append(warning_parts(alerts, room))
+    edge = w - len(noun) - len("sorted by " + ui.sort) - 13   # the top edge between the title and the sort
+    if alerts and edge >= 8:
+        title.append(warning_parts(alerts, edge))
     box(cv, y, x, h, w, "b_table", title=title,
         right=[[("sorted by ", "dim"), (ui.sort, "key")]],
         footer=[[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")],
@@ -1638,12 +1638,13 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
     ix, iw = x + 2, w - 4
     layout = table_layout(iw)
     draw_header(cv, y + 1, ix, layout, ui)
+    marked = {cg for *_, cg in alerts if cg}           # rows to mark in red
     room = h - 3
     for i, row in enumerate(rows[:room]):
         if i == room - 1 and len(rows) > room:
             cv.put(y + 2 + i, ix, f"{G['more']} {len(rows) - i} more", "dim")
             break
-        draw_row(cv, y + 2 + i, ix, layout, row, mon, {cg for *_, cg in alerts if cg})
+        draw_row(cv, y + 2 + i, ix, layout, row, mon, marked)
 
 
 def draw(cv, mon, ui):
