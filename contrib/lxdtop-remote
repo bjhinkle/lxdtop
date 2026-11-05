@@ -78,10 +78,12 @@ case "$1" in
     dest=$(login_for "$2") || exit 2
     echo "copying $LXDTOP to $dest:~/bin/lxdtop"
     # One connection, so one login. On the host: write the copy to ~/bin/lxdtop.new, check
-    # its SHA-256 and that it runs, and only then rename it over ~/bin/lxdtop with mv, which
-    # replaces the file, or a symlink there, in one step. If a check fails, or the connection
-    # drops partway (the copy then ends early, so its SHA-256 is wrong), ~/bin/lxdtop stays
-    # as it was and lxdtop.new is removed.
+    # its SHA-256 and that it runs, flush it to disk, and only then rename it over
+    # ~/bin/lxdtop with mv, which replaces the file, or a symlink there, in one step. The
+    # flush is `sync FILE`, which coreutils and BusyBox both have, so that a power cut just
+    # after the rename can't leave an empty file. If a check fails, or the connection drops
+    # partway (the copy then ends early, so its SHA-256 is wrong), ~/bin/lxdtop stays as it
+    # was and lxdtop.new is removed.
     # shellcheck disable=SC2016 # expanded by the shell on the host, not here
     check='
       new=$HOME/bin/lxdtop.new
@@ -96,6 +98,7 @@ case "$1" in
       out=$("$new" --version < /dev/null) || fail "the copy does not run: its --version exited with status $?"
       case $out in "lxdtop "*) ;; *) fail "the copy is not lxdtop: its --version printed \"$out\"" ;; esac
       [ ! -d ~/bin/lxdtop ] || fail "can not replace ~/bin/lxdtop: it is a directory, or a link to one"
+      sync "$new" || fail "could not flush ~/bin/lxdtop.new to disk"
       mv -f "$new" ~/bin/lxdtop || fail "could not rename ~/bin/lxdtop.new to ~/bin/lxdtop"
       printf "installed %s\nSHA-256 %s, checked on the host\n" "$out" "$got"'
     ssh -- "$dest" "want=$sum; $check" < "$LXDTOP"
