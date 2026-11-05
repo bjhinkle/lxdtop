@@ -937,7 +937,7 @@ class Monitor:
             if net and oldest["net"]:
                 row["net_in"] = rate(net[0], oldest["net"][0], secs)
                 row["net_out"] = rate(net[1], oldest["net"][1], secs)
-            if periods and None not in periods and last.get("periods"):
+            if periods and None not in periods and last.get("periods") and None not in last["periods"]:
                 # Of its CPU limit's periods in the last interval, the share in which it was held back.
                 ran, held = periods[0] - last["periods"][0], periods[1] - last["periods"][1]
                 row["throttled"] = min(100.0, max(0, held) / ran * 100) if ran > 0 else 0.0
