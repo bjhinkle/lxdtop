@@ -176,6 +176,20 @@ class MainTest(unittest.TestCase):
         self.assertRegex(text, r"● old +stopped")
         self.assertEqual({m for m, _, _ in lxd.requests}, {"GET"})
 
+    def test_dump_on_a_cluster_member(self):
+        # SECURITY-REVIEW.md N-10: instances on other cluster members used to show here as stopped.
+        routes = lxd_routes()
+        routes["/1.0"][1]["metadata"]["environment"].update(server_clustered=True, server_name="m1")
+        for inst in routes["/1.0/instances?recursion=2&all-projects=true"][1]["metadata"]:
+            inst["location"] = "m1" if inst["name"] == "web" else "m2"
+        with FakeLxd(routes) as lxd, \
+                mock.patch.object(lxdtop.LxdApi, "start"), mock.patch.object(lxdtop.LxdEvents, "start"):
+            text = self.main("--dump", "--socket", lxd.path)
+        self.assertIn("1 running   up", text)                 # and no "stopped" count
+        self.assertIn("10.10.10.21", text)                    # web is still there, with its address
+        self.assertNotIn("stopped", text)
+        self.assertIn("┐containers┌", text)                   # the VM is on m2
+
     def test_dump_when_lxd_answers_in_an_unexpected_shape(self):
         # SECURITY-REVIEW.md L-9: main() asks LXD once before drawing, and an
         # AttributeError from that first answer used to end lxdtop there.

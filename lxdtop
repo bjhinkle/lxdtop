@@ -482,7 +482,7 @@ class LxdApi:
         self.socket_path = socket_path
         self.lock = threading.Lock()
         self.instances = {}           # cgroup name -> {name, status, veths, ipv4}
-        self.server = {}              # LXD version, OS, kernel, where its ZFS pools keep datasets
+        self.server = {}              # LXD version, OS, kernel, cluster member name, where its ZFS pools keep datasets
         self.pools = []               # (pool name, bytes used, bytes total)
         self.status = "starting"
         self.rounds = 0
@@ -500,9 +500,11 @@ class LxdApi:
             raise ValueError(body.get("error") or f"HTTP {reply.status}")
         return body.get("metadata")
 
-    def fetch_instances(self):
+    def fetch_instances(self, member=None):
         found = {}
         for inst in self.get("/1.0/instances?recursion=2&all-projects=true") or []:
+            if member and inst.get("location") != member:
+                continue                                 # on another cluster member, not on this host
             project = inst.get("project") or "default"
             # Containers outside the default project get "<project>_" in their cgroup name.
             cg = inst["name"] if project == "default" else f"{project}_{inst['name']}"
@@ -522,7 +524,8 @@ class LxdApi:
     def fetch_server(self):
         env = (self.get("/1.0") or {}).get("environment") or {}
         server = dict(version=env.get("server_version", ""), kernel=env.get("kernel_version", ""),
-                      os=f"{env.get('os_name', '')} {env.get('os_version', '')}".strip(), zfs_roots=[])
+                      os=f"{env.get('os_name', '')} {env.get('os_version', '')}".strip(), zfs_roots=[],
+                      member=env.get("server_name", "") if env.get("server_clustered") else "")
         pools = []
         for pool in self.get("/1.0/storage-pools?recursion=1") or []:
             if pool.get("driver") == "zfs":              # the dataset its volumes live in (zfs.pool_name)
@@ -538,8 +541,8 @@ class LxdApi:
 
     def fetch(self):
         try:
-            instances = self.fetch_instances()
             server, pools = self.fetch_server() if self.rounds % 4 == 0 else (self.server, self.pools)
+            instances = self.fetch_instances(server.get("member"))     # on a cluster, this member's only
             status = "ok"
         except PermissionError:
             instances, status = None, "no access"        # not in the lxd group
