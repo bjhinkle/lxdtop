@@ -157,6 +157,13 @@ class UnreadVmTest(unittest.TestCase):
                 self.assertRegex(line, r"win +running   no readings: " + why)
                 self.assertRegex(self.draw(mon, width, height, detail="win"), r"\n│ readings    none: " + why)
 
+    def test_and_in_the_json(self):
+        """#16: the JSON gave such a VM nulls and no reason. no_readings has the reason its row gives."""
+        self.host.mkdir("/proc/5151")
+        doc = lxdtop.reading_json(self.readings(), 2)
+        self.assertEqual({i["name"]: i["no_readings"] for i in doc["instances"]},
+                         {"win": "no access to QEMU process 5151", "web": None, "db": None, "api": None, "old": None})
+
     def test_its_process_is_not_there(self):
         self.says(self.readings(), "QEMU process 5151 not found")              # this fake host has no /proc/5151
 

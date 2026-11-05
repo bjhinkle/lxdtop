@@ -2533,6 +2533,7 @@ def instance_json(row, mon, now, wall):
         "project": row["project"],
         "type": "virtual-machine" if row["vm"] else "container",
         "state": row["state"],
+        "no_readings": row["unread"][0] if row["unread"] else None,       # why, for a VM lxdtop can't read
         "ipv4": row["ip"] or None,
         "uptime_s": rounded(row["up"], 1),
         "cpu_pct": rounded(row["cpu"], 2),                        # 100 = one core
