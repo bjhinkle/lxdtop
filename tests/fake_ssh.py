@@ -28,6 +28,18 @@ Two things that can happen to what ssh sends the host on its standard input:
                           because sshd doesn't stop a command that has no
                           terminal. This waits for it, so a test sees what it
                           left behind, then fails as ssh does, with status 255.
+  FAKE_SSH_STALL_AFTER=N  the connection goes quiet after N bytes, as one that
+                          dropped without a word: nothing more reaches the host,
+                          and nothing it prints comes back, but its input stays
+                          open, because sshd hasn't noticed. This waits for the
+                          command to end, for FAKE_SSH_STALL_WAIT seconds at most
+                          (default 20), then stops it. It writes down in
+                          $FAKE_SSH_LOG.host whether the command ended by itself,
+                          what it printed, and whether anything still reads its
+                          input, then fails as ssh does when it gives up, with
+                          status 255. With FAKE_SSH_RESUME=PATH, the connection
+                          only pauses: the rest arrives once PATH exists, and the
+                          command's output comes back as usual.
 """
 
 import getopt
@@ -35,6 +47,8 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
+import time
 
 OPTIONS = "1246ab:c:e:fgi:kl:m:no:p:qstvxAB:CD:E:F:GI:J:KL:MNO:P:Q:R:S:TVw:W:XYy"   # from OpenSSH's ssh.c
 
@@ -80,11 +94,14 @@ def main():
     env = dict(os.environ, HOME=home, PATH=os.environ.get("FAKE_SSH_REMOTE_PATH", os.environ.get("PATH", "")))
     host = [os.environ.get("FAKE_SSH_LOGIN_SHELL", "sh"), "-c", command]
     flip, drop = os.environ.get("FAKE_SSH_FLIP_BYTE"), os.environ.get("FAKE_SSH_DROP_AFTER")
-    if flip is None and drop is None:
+    stall = os.environ.get("FAKE_SSH_STALL_AFTER")
+    if flip is None and drop is None and stall is None:
         return subprocess.run(host, cwd=home, env=env).returncode
     data = bytearray(sys.stdin.buffer.read())
     if flip is not None:
         data[int(flip)] ^= 1
+    if stall is not None:
+        return stalled(host, home, env, data, int(stall), destination)
     if drop is None:
         return subprocess.run(host, cwd=home, env=env, input=data).returncode
     pipe = subprocess.PIPE
@@ -98,6 +115,46 @@ def main():
     proc.stderr.close()
     proc.wait()
     print("client_loop: send disconnect: Broken pipe", file=sys.stderr)
+    return 255
+
+
+def stalled(host, home, env, data, after, destination):
+    """The connection goes quiet after this many bytes: see FAKE_SSH_STALL_AFTER above."""
+    resume = os.environ.get("FAKE_SSH_RESUME")
+    if resume:
+        proc = subprocess.Popen(host, cwd=home, env=env, stdin=subprocess.PIPE, bufsize=0)
+        proc.stdin.write(data[:after])
+        for _ in range(6000):                   # a minute at most
+            if os.path.exists(resume):
+                break
+            time.sleep(0.01)
+        proc.stdin.write(data[after:])
+        proc.stdin.close()
+        return proc.wait()
+    with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
+        proc = subprocess.Popen(host, cwd=home, env=env, stdin=subprocess.PIPE, stdout=out, stderr=err, bufsize=0)
+        proc.stdin.write(data[:after])
+        try:
+            proc.wait(timeout=float(os.environ.get("FAKE_SSH_STALL_WAIT", "20")))
+            ended = True
+        except subprocess.TimeoutExpired:
+            ended = False
+            proc.kill()
+            proc.wait()
+        try:
+            proc.stdin.write(b"x")              # fails if nothing reads the input any more
+            read = True
+        except BrokenPipeError:
+            read = False
+        try:
+            proc.stdin.close()                  # an input still read ends now
+        except BrokenPipeError:
+            pass
+        out.seek(0)
+        err.seek(0)
+        with open(os.environ["FAKE_SSH_LOG"] + ".host", "w") as log:
+            json.dump(dict(ended=ended, input_read=read, stdout=out.read().decode(), stderr=err.read().decode()), log)
+    print(f"Read from remote host {destination.rpartition('@')[2]}: Operation timed out", file=sys.stderr)
     return 255
 
 

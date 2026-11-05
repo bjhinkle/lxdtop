@@ -77,30 +77,65 @@ case "$1" in
     fi
     dest=$(login_for "$2") || exit 2
     echo "copying $LXDTOP to $dest:~/bin/lxdtop"
-    # One connection, so one login. On the host: write the copy to ~/bin/lxdtop.new, check
-    # its SHA-256 and that it runs, flush it to disk, and only then rename it over
-    # ~/bin/lxdtop with mv, which replaces the file, or a symlink there, in one step. The
-    # flush is `sync FILE`, which coreutils and BusyBox both have, so that a power cut just
-    # after the rename can't leave an empty file. If a check fails, or the connection drops
-    # partway (the copy then ends early, so its SHA-256 is wrong), ~/bin/lxdtop stays as it
-    # was and lxdtop.new is removed.
+    # One connection, so one login. On the host: write the copy to a new file of its own in
+    # ~/bin, made by mktemp, so that two installs at once never share one. Check its SHA-256
+    # and that it runs, flush it to disk, and only then rename it over ~/bin/lxdtop with mv,
+    # which replaces the file, or a symlink there, in one step. The flush is `sync FILE`,
+    # which coreutils and BusyBox both have, so that a power cut just after the rename can't
+    # leave an empty file. If a check fails, or the connection drops partway (the copy then
+    # ends early, so its SHA-256 is wrong), ~/bin/lxdtop stays as it was and the new file is
+    # removed. A connection that drops without a word leaves the copy waiting for more, and
+    # sshd may take hours to notice (Ubuntu's TCP keepalive starts after two), so the host
+    # gives up once nothing more has arrived for a minute. It doesn't restart anything that
+    # runs lxdtop, but it says so when the console service from examples/ is running.
     # shellcheck disable=SC2016 # expanded by the shell on the host, not here
     check='
-      new=$HOME/bin/lxdtop.new
-      fail() { rm -f "$new"; printf "lxdtop-remote: %s; ~/bin/lxdtop was not changed\n" "$1" >&2; exit 1; }
-      trap "rm -f \"\$new\"; exit 1" HUP INT TERM
+      new= pid= watch=
+      clean() { for p in $pid $watch; do kill "$p" 2>/dev/null; done; [ -z "$new" ] || rm -f "$new"; }
+      fail() { clean; printf "lxdtop-remote: %s; ~/bin/lxdtop was not changed\n" "$1" >&2; exit 1; }
+      trap "clean; exit 1" HUP INT TERM
       mkdir -p ~/bin || fail "could not make ~/bin"
-      rm -f "$new"; cat > "$new" || fail "could not write ~/bin/lxdtop.new"
-      got=$(sha256sum < "$new") || fail "could not work out the SHA-256 of ~/bin/lxdtop.new"
+      # What an install killed outright left behind: the one name earlier versions used, and
+      # new files two days old, which no install is still writing.
+      rm -f ~/bin/lxdtop.new
+      find ~/bin/. ! -name . -prune -type f -name "lxdtop.new.??????" -mtime +1 -exec rm -f {} \; 2>/dev/null
+      new=$(mktemp ~/bin/lxdtop.new.XXXXXX) || fail "could not make a new file in ~/bin"
+      name="~/${new#"$HOME"/}"
+      # Receive the copy in the background, so that a watch beside it can stop it. Once a
+      # second, until cat ends, the watch looks at how much has arrived, and after a minute
+      # with nothing more it stops cat with PIPE, as a broken connection would: no other
+      # signal leaves 141, and the shells do not report a job that PIPE stopped.
+      exec 3<&0
+      cat <&3 >"$new" 3<&- &
+      pid=$!
+      exec 3<&-
+      (
+        size=0 still=0
+        while sleep 1 && kill -0 "$pid"; do
+          now=$(wc -c <"$new")
+          if [ "$now" != "$size" ]; then size=$now still=0
+          elif [ $((still += 1)) -ge 60 ]; then kill -s PIPE "$pid"; fi
+        done
+      ) >/dev/null 2>&1 &
+      watch=$!
+      wait "$pid"; status=$?
+      pid= watch=
+      [ "$status" -ne 141 ] || fail "nothing more of the copy arrived for a minute"
+      [ "$status" -eq 0 ] || fail "could not write $name"
+      got=$(sha256sum < "$new") || fail "could not work out the SHA-256 of $name"
       got=${got%% *}
       [ "$got" = "$want" ] || fail "the copy that arrived is incomplete or damaged: its SHA-256 is $got, not $want"
-      chmod 755 "$new" || fail "could not make ~/bin/lxdtop.new executable"
+      chmod 755 "$new" || fail "could not make $name executable"
       out=$("$new" --version < /dev/null) || fail "the copy does not run: its --version exited with status $?"
       case $out in "lxdtop "*) ;; *) fail "the copy is not lxdtop: its --version printed \"$out\"" ;; esac
       [ ! -d ~/bin/lxdtop ] || fail "can not replace ~/bin/lxdtop: it is a directory, or a link to one"
-      sync "$new" || fail "could not flush ~/bin/lxdtop.new to disk"
-      mv -f "$new" ~/bin/lxdtop || fail "could not rename ~/bin/lxdtop.new to ~/bin/lxdtop"
-      printf "installed %s\nSHA-256 %s, checked on the host\n" "$out" "$got"'
+      sync "$new" || fail "could not flush $name to disk"
+      mv -f "$new" ~/bin/lxdtop || fail "could not rename $name to ~/bin/lxdtop"
+      printf "installed %s\nSHA-256 %s, checked on the host\n" "$out" "$got"
+      if systemctl is-active --quiet lxdtop-console 2>/dev/null; then
+        echo "lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the host" \
+             "with sudo systemctl restart lxdtop-console"
+      fi'
     ssh -- "$dest" "want=$sum; $check" < "$LXDTOP"
     status=$?
     # 255: ssh itself failed, and has said why. The host may or may not have got that far.

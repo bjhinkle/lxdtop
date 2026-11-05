@@ -3,11 +3,13 @@
 import hashlib
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 from tests.support import LXDTOP_PATH, REMOTE_PATH, ROOT, lxdtop
@@ -50,12 +52,15 @@ class RemoteCase(unittest.TestCase):
     def conf(self, text):
         self.write(os.path.join(self.home, ".config", "lxdtop", "remote.conf"), text)
 
-    def remote(self, *args, stdin="", **env):
+    def environ(self, **env):
         environ = dict(PATH=self.bin + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"), HOME=self.home,
                        FAKE_SSH_LOG=self.log, FAKE_SSH_REMOTE_HOME=self.remote_home, LANG="C.UTF-8")
         environ.update(env)
+        return environ
+
+    def remote(self, *args, stdin="", **env):
         return subprocess.run([SH, REMOTE_PATH, *args], input=stdin, capture_output=True, text=True,
-                              env=environ, timeout=60)
+                              env=self.environ(**env), timeout=60)
 
     def ssh_runs(self):
         if not os.path.exists(self.log):
@@ -183,6 +188,30 @@ algorithm = sys.argv[2] if sys.argv[1:2] == ["-a"] else "1"
 print(hashlib.new("sha" + algorithm, sys.stdin.buffer.read()).hexdigest() + "  -")
 '''
 
+NO_WAIT = """#!/bin/sh
+# Stands in for sleep on the host: it returns at once, so that a minute of one-second waits passes at once.
+"""
+
+PAUSE_AT_SYNC = f'''#!{sys.executable}
+"""Stands in for sync on the host: say it got here, then wait for the go-ahead, for 30 seconds at most."""
+import os, time
+open(os.environ["AT_SYNC"], "w").close()
+for _ in range(3000):
+    if os.path.exists(os.environ["GO"]):
+        break
+    time.sleep(0.01)
+'''
+
+SYSTEMCTL = """#!/bin/sh
+# Stands in for systemctl on the host: write down what it was asked, and answer that lxdtop-console
+# is running when $CONSOLE_SERVICE says so.
+echo "$*" >> "$HOME/systemctl-log"
+[ "$*" = "is-active --quiet lxdtop-console" ] && [ "$CONSOLE_SERVICE" = running ]
+"""
+
+STILL_RUNNING = ("lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the "
+                 "host with sudo systemctl restart lxdtop-console")
+
 SYNC_RECORDER = """#!/bin/sh
 # Stands in for sync on the host: write down what it was asked to flush, and what that file
 # and ~/bin/lxdtop held at that moment.
@@ -191,7 +220,7 @@ SYNC_RECORDER = """#!/bin/sh
 
 
 class InstallTest(RemoteCase):
-    """`install` checks the copy as ~/bin/lxdtop.new on the host, then renames it over ~/bin/lxdtop.
+    """`install` checks the copy as a new file in ~/bin on the host, then renames it over ~/bin/lxdtop.
 
     SECURITY-REVIEW.md N-7: it used to write straight over ~/bin/lxdtop, so a
     connection cut partway left a broken file there, which the console service
@@ -209,11 +238,42 @@ class InstallTest(RemoteCase):
             self.skipTest(f"needs {self.login_shell}")
         self.host_path = os.environ.get("PATH", "/usr/bin:/bin")             # the PATH on the host
         self.installed = os.path.join(self.remote_home, "bin", "lxdtop")     # the old copy: STUB_LXDTOP
-        self.new = self.installed + ".new"
 
     def install(self, **env):
         env.setdefault("FAKE_SSH_REMOTE_PATH", self.host_path)
         return self.remote("install", "me@lxdhost", FAKE_SSH_LOGIN_SHELL=self.shell, **env)
+
+    def start_install(self, **env):
+        """An install that runs while the test goes on."""
+        env.setdefault("FAKE_SSH_REMOTE_PATH", self.host_path)
+        proc = subprocess.Popen([SH, REMOTE_PATH, "install", "me@lxdhost"], stdin=subprocess.DEVNULL,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                env=self.environ(FAKE_SSH_LOGIN_SHELL=self.shell, **env))
+        self.addCleanup(proc.wait, 60)
+        self.addCleanup(proc.stderr.close)
+        self.addCleanup(proc.stdout.close)
+        return proc
+
+    @staticmethod
+    def touch(path):
+        open(path, "w").close()
+
+    def wait_until(self, done, what):
+        for _ in range(3000):
+            if done():
+                return
+            time.sleep(0.01)
+        self.fail(f"waited 30 seconds for {what}")
+
+    def leftovers(self):
+        """The new files installs make beside ~/bin/lxdtop, if any are left there."""
+        return sorted(name for name in os.listdir(os.path.dirname(self.installed)) if name.startswith("lxdtop.new"))
+
+    def copy_there(self):
+        """What ~/bin/lxdtop holds: its size and SHA-256."""
+        with open(self.installed, "rb") as f:
+            data = f.read()
+        return len(data), hashlib.sha256(data).hexdigest()
 
     def host_tool(self, name, text):
         """A PATH for the host with this script in front, standing in for one of its tools."""
@@ -233,11 +293,11 @@ class InstallTest(RemoteCase):
     def assert_new_copy(self):
         with open(self.installed, "rb") as copy, open(LXDTOP_PATH, "rb") as original:
             self.assertEqual(copy.read(), original.read())
-        self.assertFalse(os.path.lexists(self.new))
+        self.assertEqual(self.leftovers(), [])
 
     def assert_refused(self, result, old, says, status=1):
         self.assertEqual(self.state(), old)                 # ~/bin/lxdtop exactly as it was
-        self.assertFalse(os.path.lexists(self.new))         # and nothing left beside it
+        self.assertEqual(self.leftovers(), [])              # and nothing left beside it
         self.assertEqual(result.returncode, status, result.stderr)
         self.assertIn(says, result.stderr)
         self.assertNotIn("installed", result.stdout)
@@ -306,10 +366,11 @@ class InstallTest(RemoteCase):
         self.assert_new_copy()
         self.assertEqual(self.state(target), pointed_to)
 
-    def test_anything_left_at_lxdtop_new_is_replaced_not_written_through(self):
+    def test_anything_left_at_lxdtop_new_is_removed_not_written_through(self):
+        """~/bin/lxdtop.new is the one name earlier versions used for the new file."""
         notes = os.path.join(self.remote_home, "notes.txt")
         self.write(notes, "keep me\n")
-        os.symlink(notes, self.new)
+        os.symlink(notes, self.installed + ".new")
         result = self.install()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_new_copy()
@@ -323,15 +384,18 @@ class InstallTest(RemoteCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assert_new_copy()
         with open(os.path.join(self.remote_home, "sync-log")) as f:
-            # sync was asked to flush lxdtop.new alone, once, when it held the whole copy and
+            # sync was asked to flush the new file alone, once, when it held the whole copy and
             # ~/bin/lxdtop was still the old one: before the rename
-            self.assertEqual(f.read().splitlines(), [f"sync {self.new}", f"{SHA256}  -", f"{old}  -"])
+            synced, *held = f.read().splitlines()
+        self.assertRegex(synced, f"^sync {re.escape(self.installed)}\\.new\\.[^/]{{6}}$")
+        self.assertEqual(held, [f"{SHA256}  -", f"{old}  -"])
 
     def test_a_copy_that_cannot_be_flushed_leaves_the_old_one(self):
         failing = "#!/bin/sh\necho \"sync: error syncing '$1': Input/output error\" >&2\nexit 1\n"
         old = self.state()
         result = self.install(FAKE_SSH_REMOTE_PATH=self.host_tool("sync", failing))
-        self.assert_refused(result, old, "could not flush ~/bin/lxdtop.new to disk; ~/bin/lxdtop was not changed")
+        self.assert_refused(result, old, "; ~/bin/lxdtop was not changed")
+        self.assertRegex(result.stderr, r"could not flush ~/bin/lxdtop\.new\.[^/]{6} to disk; ")
 
     def test_a_directory_at_bin_lxdtop_is_left_alone(self):
         os.remove(self.installed)
@@ -340,7 +404,92 @@ class InstallTest(RemoteCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("can not replace ~/bin/lxdtop: it is a directory, or a link to one", result.stderr)
         self.assertEqual(os.listdir(self.installed), [])            # mv would have moved the copy into it
-        self.assertFalse(os.path.lexists(self.new))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_two_installs_at_once_each_rename_their_own_copy(self):
+        """#12: two installs at once shared ~/bin/lxdtop.new, so one could rename the other's unfinished copy.
+
+        The first has its whole copy, checked, and waits at sync. The second starts, and part of
+        its copy arrives. Then the first renames its copy into place: that must be its own, not
+        the second's unfinished one. The rest of the second's copy then arrives, and it installs
+        that: a pause in the copy isn't a dropped connection.
+        """
+        other = os.path.join(self.dir, "other")                             # another version
+        with open(LXDTOP_PATH) as f:
+            text = f.read().replace(f'\nVERSION = "{lxdtop.VERSION}"\n', '\nVERSION = "9.9.9 (other)"\n')
+        self.write(other, text, 0o755)
+        at_sync, go, resume = (os.path.join(self.dir, name) for name in ("at-sync", "go", "resume"))
+        first = self.start_install(FAKE_SSH_REMOTE_PATH=self.host_tool("sync", PAUSE_AT_SYNC), AT_SYNC=at_sync, GO=go)
+        self.addCleanup(self.touch, go)                 # let it go on, whatever happens, before waiting for it
+        self.wait_until(lambda: os.path.exists(at_sync), "the first install to reach sync")
+        second = self.start_install(LXDTOP=other, FAKE_SSH_STALL_AFTER="1000", FAKE_SSH_RESUME=resume)
+        self.addCleanup(self.touch, resume)
+        bin_ = os.path.dirname(self.installed)
+        self.wait_until(lambda: 1000 in [os.path.getsize(os.path.join(bin_, name)) for name in self.leftovers()],
+                        "part of the second copy to arrive")
+        self.touch(go)
+        out, err = first.communicate(timeout=60)
+        self.assertEqual((first.returncode, out.splitlines()[1:]),
+                         (0, [f"installed lxdtop {lxdtop.VERSION}", f"SHA-256 {SHA256}, checked on the host"]), err)
+        self.assertEqual(self.copy_there(), (os.path.getsize(LXDTOP_PATH), SHA256))       # the first's own copy
+        self.touch(resume)
+        out, err = second.communicate(timeout=60)
+        self.assertEqual(second.returncode, 0, err)
+        self.assertIn("installed lxdtop 9.9.9 (other)\n", out)
+        self.assertEqual(self.copy_there(), (len(text.encode()), hashlib.sha256(text.encode()).hexdigest()))
+        self.assertEqual(self.leftovers(), [])
+
+    def test_a_connection_that_goes_quiet_ends_the_install_within_a_minute(self):
+        """#12: a connection that dropped without a word left lxdtop.new, and cat waiting for more, on the host.
+
+        sshd notices such a drop only when TCP keepalive gives up, about two hours on with Ubuntu's
+        defaults. Now the host stops once nothing more has arrived for a minute. Its sleep returns
+        at once here, so that minute passes at once.
+        """
+        old = self.state()
+        result = self.install(FAKE_SSH_STALL_AFTER="1000", FAKE_SSH_REMOTE_PATH=self.host_tool("sleep", NO_WAIT))
+        with open(self.log + ".host") as f:
+            host = json.load(f)
+        self.assertTrue(host["ended"], "the install on the host was still waiting after 20 seconds")
+        self.assertFalse(host["input_read"], "something on the host still reads the connection")
+        self.assertEqual(host["stderr"], "lxdtop-remote: nothing more of the copy arrived for a minute; "
+                                         "~/bin/lxdtop was not changed\n")
+        self.assertEqual(self.state(), old)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(result.returncode, 255)
+        self.assertIn("ssh failed before me@lxdhost confirmed the install", result.stderr)
+
+    def test_what_an_install_killed_outright_left_is_removed(self):
+        """kill -9 or a power cut leaves an install's new file. The next removes those two days old, and lxdtop.new.
+
+        No install is still writing a file that old. ~/bin/lxdtop.new is the one name earlier
+        versions used.
+        """
+        bin_ = os.path.dirname(self.installed)
+        for name in ("lxdtop.new.Ab12Cd", "lxdtop.new.Ef34Gh", "lxdtop.new", "lxdtop.new.notes"):
+            self.write(os.path.join(bin_, name), "part of a copy\n")
+        three_days_ago = time.time() - 3 * 24 * 3600
+        for name in ("lxdtop.new.Ab12Cd", "lxdtop.new.notes"):
+            os.utime(os.path.join(bin_, name), (three_days_ago, three_days_ago))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # left: one another install may still be writing, and a file of the user's own
+        self.assertEqual(self.leftovers(), ["lxdtop.new.Ef34Gh", "lxdtop.new.notes"])
+
+    def test_says_when_the_console_service_is_still_running_the_old_copy(self):
+        """#12: the console service keeps running the copy it started with. install restarts nothing, but says so."""
+        path = self.host_tool("systemctl", SYSTEMCTL)
+        installed = [f"installed lxdtop {lxdtop.VERSION}", f"SHA-256 {SHA256}, checked on the host"]
+        for service, said in (("running", [STILL_RUNNING]), ("stopped", [])):
+            with self.subTest(service):
+                result = self.install(FAKE_SSH_REMOTE_PATH=path, CONSOLE_SERVICE=service)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[1:], installed + said)
+        refused = self.install(FAKE_SSH_REMOTE_PATH=path, CONSOLE_SERVICE="running", FAKE_SSH_FLIP_BYTE="5000")
+        self.assertEqual(refused.returncode, 1)
+        self.assertNotIn("lxdtop-console", refused.stdout + refused.stderr)
+        with open(os.path.join(self.remote_home, "systemctl-log")) as f:
+            self.assertEqual(f.read().splitlines(), ["is-active --quiet lxdtop-console"] * 2)   # nothing restarted
 
     def test_the_first_install_makes_bin(self):
         shutil.rmtree(os.path.join(self.remote_home, "bin"))
