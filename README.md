@@ -198,7 +198,7 @@ Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_
 | Throttling, limits, stalls and memory kills | The container's cgroup: `cpu.stat`, `cpu.max`, `cpuset.cpus.effective`, `memory.max`, `pids.max`, `memory.events` and the three `*.pressure` files |
 | VM limits | `limits.cpu` and `limits.memory` in the VM's expanded config, which LXD's instance list already includes, worked out as LXD does when it starts the VM. lxdtop reads no other key of an instance's config |
 | ZFS pool health | `/proc/spl/kstat/zfs/<pool>/state`, beside the objset counters |
-| Names, addresses, stopped instances, snapshots, versions and pool usage | LXD's REST API over its local socket every 15 seconds (GET requests only) |
+| Names, addresses, stopped instances, snapshots, versions and pool usage | LXD's REST API over its local socket every 15 seconds (GET requests only), waiting up to 5 seconds for each answer. On a cluster member, it waits up to 30, since listing instances asks every member, and reads each ZFS pool's config for this member (`?target=<member>`), as the cluster-wide list leaves out `zfs.pool_name` |
 | Event feed | LXD's lifecycle event stream, a websocket on the same socket |
 
 Network traffic is shown in bits per second and data in bytes: bandwidth is in bits, data is in bytes.

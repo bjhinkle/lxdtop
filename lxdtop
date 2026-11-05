@@ -66,6 +66,8 @@ ZFS_STATE_GLOB = "/proc/spl/kstat/zfs/*/state"
 LXD_SOCKETS = ([os.path.join(os.environ["LXD_DIR"], "unix.socket")] if os.environ.get("LXD_DIR") else []) + [
     "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/lxd/unix.socket"]
 API_EVERY = 15                     # seconds between LXD API refreshes
+API_TIMEOUT = 5                    # seconds to wait for each answer from LXD's API
+CLUSTER_API_TIMEOUT = 30           # the same on a cluster member, where listing instances asks every member
 EVENT_TIMEOUT = 60                 # seconds without a frame, pings included, before the event stream reconnects
 EVENT_FRAME_MAX = 16 * 1024 ** 2   # the longest event frame read, in bytes. LXD's are a few KB, so a longer one means
                                    # the stream is broken: it reconnects instead of making a buffer that size
@@ -704,6 +706,7 @@ class LxdApi:
 
     def __init__(self, socket_path):
         self.socket_path = socket_path
+        self.timeout = API_TIMEOUT    # CLUSTER_API_TIMEOUT once fetch_server() finds a cluster
         self.lock = threading.Lock()
         self.instances = {}           # cgroup name -> {name, status, veths, ipv4}
         self.server = {}              # LXD version, OS, kernel, cluster member name, where its ZFS pools keep datasets
@@ -715,7 +718,7 @@ class LxdApi:
         self.vm_disks = None                   # (when, vm_disk_totals()) at the last metrics reading
 
     def get(self, path):
-        conn = UnixHTTPConnection(self.socket_path)
+        conn = UnixHTTPConnection(self.socket_path, self.timeout)
         try:
             conn.request("GET", path)
             reply = conn.getresponse()
@@ -794,6 +797,15 @@ class LxdApi:
                       zpools={}, member=env.get("server_name", "") if env.get("server_clustered") else "")
         pools = []
         for pool in self.get("/1.0/storage-pools?recursion=1") or []:
+            if server["member"] and pool.get("driver") == "zfs":
+                # On a cluster the list leaves out the config that can differ between members, such as
+                # zfs.pool_name (LXD's NodeSpecificStorageConfig). This member's own has it.
+                quote = urllib.parse.quote
+                own = f"/1.0/storage-pools/{quote(pool['name'])}?target={quote(server['member'])}"
+                try:
+                    pool = self.get(own) or pool
+                except ValueError:
+                    pass                                 # as before: the pool's name stands for its dataset
             if pool.get("driver") == "zfs":              # the dataset its volumes live in (zfs.pool_name)
                 server["zfs_roots"].append((pool.get("config") or {}).get("zfs.pool_name") or pool["name"])
                 server["zpools"][pool["name"]] = server["zfs_roots"][-1].split("/")[0]     # the zpool it's in
@@ -804,6 +816,7 @@ class LxdApi:
                 continue
             if space.get("total"):
                 pools.append((pool["name"], space.get("used", 0), space["total"]))
+        self.timeout = CLUSTER_API_TIMEOUT if server["member"] else API_TIMEOUT
         return server, pools
 
     def fetch(self):
