@@ -327,6 +327,40 @@ class SortTest(unittest.TestCase):
         self.assertEqual(order("net"), ["c", "b", "a", "d", "z"])
         self.assertEqual(order("name"), ["a", "b", "c", "d", "z"])
 
+    def test_by_the_wide_screen_columns_throttled_and_waiting(self):
+        # The most held back, or the most stalled, first; no reading counts as none. Stopped last, by name.
+        mon = monitor([row("a", throttled=5.0, cpu_max=1.0, waiting=("io", 2.0)),
+                       row("b", throttled=None, cpu_max=None, waiting=None),                  # no CPU limit
+                       row("c", throttled=60.0, cpu_max=2.0, waiting=("mem", 0.5)),
+                       row("d", throttled=0.0, cpu_max=4.0, waiting=("cpu", 41.0)),
+                       row("e", vm=True, cpu_max=2, waiting=None),                           # a VM: neither
+                       row("z", live=False, state="Stopped"), row("y", live=False, state="Stopped")])
+        order = lambda mode: [r["name"] for r in lxdtop.sort_rows(mon, mode)]
+        self.assertEqual(order("throttled"), ["c", "a", "b", "d", "e", "y", "z"])
+        self.assertEqual(order("waiting"), ["d", "a", "c", "b", "e", "y", "z"])
+
+    def test_s_steps_through_every_sort_and_back_to_cpu(self):
+        ui = lxdtop.new_ui(2)
+        seen = [ui.sort]
+        for _ in lxdtop.SORTS:
+            lxdtop.handle_key(ord("s"), monitor([row("web")]), ui)
+            seen.append(ui.sort)
+        self.assertEqual(seen, ["cpu", "mem", "disk", "net", "name", "throttled", "waiting", "cpu"])
+
+    def test_the_header_marks_throttled_and_waiting_where_they_show(self):
+        mon = monitor([row("web", throttled=30.0, cpu_max=2.0, waiting=("io", 30.0))])
+        for mode, label in (("throttled", "THROTTLED↓"), ("waiting", "WAITING↓")):
+            with self.subTest(mode):
+                header = header_line(render(mon, 240, 60, sort=mode))
+                self.assertIn(label, header)
+                self.assertEqual(header.count("↓"), 1)
+                self.assertNotIn("↓", header_line(render(mon, 160, 45, sort=mode)))     # not on screen at 160
+                for width, height in ((70, 12), (80, 24), (160, 45), (240, 60)):
+                    top = next(line for line in render(mon, width, height, sort=mode).text().splitlines()
+                               if "sorted by" in line)
+                    self.assertTrue(top.endswith(f"┐sorted by {mode}┌─╮"), f"{width}x{height}: {top}")
+                    self.assertEqual(len(top), width)
+
 
 class GraphLegendTest(unittest.TestCase):
     """The CPU graph's legend: whole words only. Where it doesn't fit, "other instances" and "host itself"

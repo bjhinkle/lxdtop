@@ -55,8 +55,9 @@ class RunLoopTest(unittest.TestCase):
         self.assertEqual(frames, [("cpu", 2), ("mem", 2), ("disk", 2), ("disk", 3), ("disk", 5), ("disk", 3)])
 
     def test_sort_cycles_back_to_cpu(self):
-        frames, _, _ = self.run_keys([ord("s"), ord("S"), ord("s"), ord("s"), ord("s")])
-        self.assertEqual([sort for sort, _ in frames], ["cpu", "mem", "disk", "net", "name", "cpu"])
+        frames, _, _ = self.run_keys([ord("s"), ord("S"), ord("s"), ord("s"), ord("s"), ord("S"), ord("s")])
+        self.assertEqual([sort for sort, _ in frames], ["cpu", "mem", "disk", "net", "name", "throttled", "waiting",
+                                                        "cpu"])
 
     def test_interval_stays_between_1_and_10_seconds(self):
         frames, _, _ = self.run_keys([ord("+"), ord("="), ord("+")], interval=5)

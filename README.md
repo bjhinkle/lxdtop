@@ -44,6 +44,8 @@ On screens wider than 160 columns, the table adds these columns after IPV4, in t
 
 These come from a running container's cgroup, so stopped instances and VMs leave them empty (a VM's limits are inside its guest). LAST SNAP and MEM KILLS still show for a stopped container. A file the kernel doesn't provide, or a feature it has turned off (such as pressure stall information with `psi=0`), leaves its cell empty too.
 
+`s` sorts by THROTTLED and WAITING too, most held back or most stalled first, at any width: where the columns don't fit, the table's top edge still says `sorted by throttled` or `sorted by waiting`.
+
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
 ## What's new in 1.8.2
@@ -107,7 +109,7 @@ From a clone, `install -m 755 lxdtop ~/bin/lxdtop` does the same.
 
 Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
 
-Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, name), and `-` and `+` change the refresh interval (1 to 10 seconds). `/` filters the table by name (Enter keeps the filter, Esc clears it), the up and down arrows highlight a row, and Enter opens a page with everything lxdtop has on the highlighted instance, its recent events included (Esc or `q` goes back). No key changes anything on the host.
+Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, name, then the wide-screen columns throttled and waiting), and `-` and `+` change the refresh interval (1 to 10 seconds). `/` filters the table by name (Enter keeps the filter, Esc clears it), the up and down arrows highlight a row, and Enter opens a page with everything lxdtop has on the highlighted instance, its recent events included (Esc or `q` goes back). No key changes anything on the host.
 
 | Option | Effect |
 |---|---|
