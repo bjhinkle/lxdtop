@@ -363,7 +363,8 @@ def busy_pct(now, before):
 
 
 def read_meminfo():
-    info = dict.fromkeys(("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"), 0)
+    """The host's memory and swap in bytes; None for a line that couldn't be read, so it isn't taken for 0."""
+    info = dict.fromkeys(("MemTotal", "MemAvailable", "SwapTotal", "SwapFree"))
     for line in (read("/proc/meminfo") or "").splitlines():
         name, _, rest = line.partition(":")
         if name in info:
@@ -391,13 +392,13 @@ def read_vm_process(pid):
 
     LXD runs each VM as a QEMU process on the host, outside any container
     cgroup. Returns None if that process is gone or the PID now belongs to
-    something else.
+    something else. The memory is None if its status file couldn't be read.
     """
     stat = read(f"/proc/{pid}/stat") if pid else None
     if not stat or "(qemu" not in stat:
         return None
     fields = stat[stat.rfind(")") + 2:].split()
-    rss = 0
+    rss = None
     for line in (read(f"/proc/{pid}/status") or "").splitlines():
         if line.startswith("VmRSS:"):
             rss = int(line.split()[1]) * 1024
@@ -830,15 +831,18 @@ class Monitor:
             root_total, root_used = root.f_blocks * root.f_frsize, (root.f_blocks - root.f_bfree) * root.f_frsize
         except OSError:
             root_total = root_used = 0
+        # A reading that couldn't be taken stays None (see read_meminfo()), and so does one worked out from it.
         self.host = dict(
             cpu=cpu, threads=per_thread,
             temp=temp / 1000 if temp else None,                         # millidegrees
             mhz=sum(speeds) / len(speeds) / 1000 if speeds else None,   # kHz
             mem_total=mem["MemTotal"], mem_free=mem["MemAvailable"], arc=arc,
-            mem_used=max(0, mem["MemTotal"] - mem["MemAvailable"] - arc),
-            swap_total=mem["SwapTotal"], swap_used=mem["SwapTotal"] - mem["SwapFree"],
+            mem_used=(None if None in (mem["MemTotal"], mem["MemAvailable"])
+                      else max(0, mem["MemTotal"] - mem["MemAvailable"] - arc)),
+            swap_total=mem["SwapTotal"],
+            swap_used=None if None in (mem["SwapTotal"], mem["SwapFree"]) else mem["SwapTotal"] - mem["SwapFree"],
             root_total=root_total, root_used=root_used,
-            load=(read("/proc/loadavg") or "0 0 0").split()[:3], uptime=uptime, zpools=read_zpool_states())
+            load=(read("/proc/loadavg") or "").split()[:3], uptime=uptime, zpools=read_zpool_states())
 
     def sample_network(self, now):
         if now - self.nics_checked > 60:
@@ -874,10 +878,11 @@ class Monitor:
             # memory.current includes file cache the kernel can drop at any time.
             # Like `docker stats`, subtract the inactive part of that cache to show
             # what the container is actually holding on to.
-            current = read_int(path + "/memory.current") or 0
+            current = read_int(path + "/memory.current")          # None if it couldn't be read
             inactive = read_fields(path + "/memory.stat", ("inactive_file",)).get("inactive_file", 0)
             started = self.procs.started.get(cg)
-            row = new_row(cg, inst, mem=max(0, current - inactive), tasks=read_int(path + "/pids.current"),
+            row = new_row(cg, inst, mem=max(0, current - inactive) if current is not None else None,
+                          tasks=read_int(path + "/pids.current"),
                           top=self.procs.top.get(cg),
                           up=uptime - started / CLOCK_TICKS if started is not None else None)
             row.update(read_cgroup_limits(path))
@@ -1386,9 +1391,9 @@ def draw_cpu_panel(cv, y, x, h, w, mon):
 
 def draw_mem_panel(cv, y, x, h, w, mon):
     host = mon.host
-    total = host.get("mem_total") or 1
+    total = host.get("mem_total")                # None if /proc/meminfo couldn't be read: no meter fills then
     box(cv, y, x, h, w, "b_mem", title=[[("memory", "title")]],
-        right=[[(human(host.get("mem_total")), "text"), (" total", "dim")]])
+        right=[[(human(total), "text"), (" total", "dim")]] if total else [])
     ix, iw = x + 2, w - 4
     meters = [("used", host["mem_used"], total, "mem"), ("zfs", host["arc"], total, "arc"),
               ("free", host["mem_free"], total, "free")]
@@ -1403,7 +1408,8 @@ def draw_mem_panel(cv, y, x, h, w, mon):
         color_at = heat if FINE and style in ("mem", "swap") else (lambda _, s=style: s)
         put_cells(cv, row, ix + 6, meter_cells(meter_w, value, scale, color_at))
         cv.put(row, ix + 6 + meter_w, human(value).rjust(6), style)
-        cv.put(row, ix + 12 + meter_w, f"{value / scale * 100:4.0f}%", "text")
+        if value is not None and scale:
+            cv.put(row, ix + 12 + meter_w, f"{value / scale * 100:4.0f}%", "text")
     # Bottom row: storage pools from LXD, then the root filesystem. A ZFS pool that isn't ONLINE
     # shows its state in red: after the LXD pool of the same name, or on its own before root.
     sick = {pool: state for pool, state in host.get("zpools", {}).items() if state != "ONLINE"}

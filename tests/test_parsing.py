@@ -99,9 +99,17 @@ class HostCountersTest(unittest.TestCase):
         self.assertEqual(info, dict(MemTotal=65536000 * 1024, MemAvailable=32768000 * 1024,
                                     SwapTotal=8388604 * 1024, SwapFree=8000000 * 1024))
 
-    def test_read_meminfo_missing_is_all_zero(self):
+    def test_read_meminfo_missing_is_no_reading(self):
+        # None, not 0: --dump --json says null for a reading lxdtop couldn't take.
         with self.host.installed():
-            self.assertEqual(set(lxdtop.read_meminfo().values()), {0})
+            self.assertEqual(set(lxdtop.read_meminfo().values()), {None})
+
+    def test_read_meminfo_a_missing_line_is_no_reading(self):
+        self.host.write("/proc/meminfo", "MemTotal:       65536000 kB\nMemAvailable:   32768000 kB\n")
+        with self.host.installed():
+            info = lxdtop.read_meminfo()
+        self.assertEqual(info, dict(MemTotal=65536000 * 1024, MemAvailable=32768000 * 1024,
+                                    SwapTotal=None, SwapFree=None))
 
     def test_arc_size_from_arcstats(self):
         self.host.copy_fixture("zfs-arcstats.txt", lxdtop.ZFS_ARCSTATS)
@@ -175,6 +183,13 @@ class InstanceCountersTest(unittest.TestCase):
         self.assertEqual(cpu_usec, (360000 + 90000) * 1_000_000 // lxdtop.CLOCK_TICKS)
         self.assertEqual(rss, 2097152 * 1024)
         self.assertEqual(start, 1234500)
+
+    def test_read_vm_process_without_its_status_file_has_no_memory_reading(self):
+        self.host.copy_fixture("pid-stat-qemu.txt", "/proc/5151/stat")       # and no /proc/5151/status
+        with self.host.installed():
+            cpu_usec, rss, start = lxdtop.read_vm_process(5151)
+        self.assertEqual((cpu_usec, start), ((360000 + 90000) * 1_000_000 // lxdtop.CLOCK_TICKS, 1234500))
+        self.assertIsNone(rss)
 
     def test_read_vm_process_rejects_other_processes_and_no_pid(self):
         self.host.add_process(5151, "bash")                # the PID now belongs to something else
