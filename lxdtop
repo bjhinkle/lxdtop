@@ -11,7 +11,7 @@ is dropped; a narrower one drops panels, then columns. It uses only the Python
 standard library: copy this one file to the host (for example ~/bin/lxdtop)
 and run it.
 
-    lxdtop            run it (q quits, s changes the sort, - and + change speed)
+    lxdtop            run it (? lists the keys: q quits, s sorts, / filters, Enter shows details)
     lxdtop --dump     print one frame as plain text and exit (for testing)
     lxdtop --dump --json    print one reading as a JSON document, for scripts
 
@@ -55,7 +55,7 @@ import types
 import unicodedata
 import urllib.parse
 
-VERSION = "1.6.0 (2026-11-05)"
+VERSION = "1.7.0 (2026-11-05)"
 TIMEZONE = None      # the clock's default (None = the system's); TZ overrides it
 CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
@@ -140,7 +140,10 @@ STYLES = {
     "ev_delete": ("red", True),
     "ev_snap": ("magenta", True),
     "ev_exec": ("cyan", True),
+    # The highlighted row: in reverse video, which the Linux console has too.
+    "sel": ("white", True),
 }
+REVERSE = {"sel"}
 
 # Terminals with 256 colors (macOS Terminal, iTerm2) get these instead, as
 # (color number, bold). On the Linux console bold black is a readable mid grey,
@@ -1027,11 +1030,22 @@ class TextCanvas(Canvas):
             for ch, style in row:
                 if style != current:
                     color_name, bold = STYLES.get(style, ("white", False))
-                    out.append(f"\x1b[0;{'1;' if bold else ''}{30 + COLORS.index(color_name)}m")
+                    out.append(f"\x1b[0;{'7;' if style in REVERSE else ''}{'1;' if bold else ''}"
+                               f"{30 + COLORS.index(color_name)}m")
                     current = style
                 out.append(ch)
             lines.append("".join(out) + "\x1b[0m")
         return "\n".join(lines)
+
+
+class Styled:
+    """Draws on another canvas, all of it in one style: how the highlighted row is drawn."""
+
+    def __init__(self, cv, style):
+        self.cv, self.style, self.h, self.w = cv, style, cv.h, cv.w
+
+    def put(self, y, x, text, style="text", right=None):
+        return self.cv.put(y, x, text, self.style, right)
 
 
 def put_cells(cv, y, x, cells, right=None):
@@ -1637,12 +1651,21 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
     noun, alerts = instance_noun(mon), warnings(mon)
     title = [[(noun, "title")]]
     edge = w - len(noun) - len("sorted by " + ui.sort) - 13   # the top edge between the title and the sort
+    if ui.filter:                                      # a filter is on: say so, and how many it leaves
+        matched = [row for row in rows if name_matches(row, ui.filter)]
+        title.append([("filter ", "dim"), (ui.filter, "key"), (f"  {len(matched)} of {len(rows)}", "text")])
+        edge -= sum(len(text) for text, _ in title[-1]) + 3
+        rows = matched
     if alerts and edge >= 8:
         title.append(warning_parts(alerts, edge))
+    footer = [[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")],
+              [("- +", "key"), (f" every {ui.interval:g}s", "text")]]
+    if ui.view == "typing":                            # the filter being typed, along the bottom
+        footer = [[("/ ", "key"), (ui.filter, "bright"), ("_", "key")],
+                  [("Enter", "key"), (" keep", "text")], [("Esc", "key"), (" clear", "text")]]
     box(cv, y, x, h, w, "b_table", title=title,
         right=[[("sorted by ", "dim"), (ui.sort, "key")]],
-        footer=[[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")],
-                [("- +", "key"), (f" every {ui.interval:g}s", "text")]],
+        footer=footer,
         footer_right=[[("lxd api ", "dim"), (mon.api_status, "lo" if sources_ok else "mid")],
                       [("disk ", "dim"), ("zfs" if mon.zfs else "io.stat", "dim")]])
     ix, iw = x + 2, w - 4
@@ -1650,6 +1673,12 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
     draw_header(cv, y + 1, ix, layout, ui)
     marked = {cg for *_, cg in alerts if cg}           # rows to mark in red
     room = h - 3
+    if ui.filter and not rows:
+        cv.put(y + 2, ix, f'no instance name contains "{ui.filter}"   (Esc clears the filter)', "dim", ix + iw)
+        return
+    if ui.selected in {row["cg"] for row in rows}:     # a highlighted row: see draw_scrolled()
+        draw_scrolled(cv, y + 2, ix, iw, room, layout, rows, mon, ui, marked)
+        return
     live = [row for row in rows if row["live"]]
     if shown is None or (shown >= len(live) and not fold):     # a row for every instance, as always
         for i, row in enumerate(rows[:room]):
@@ -1674,6 +1703,27 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
             parts.append(((", " if i else "") + row["name"], "hi" if row["cg"] in marked else "dim"))
         if put_parts(cv, line, ix, parts, ix + iw) > ix + iw:
             cv.put(line, ix + iw - 1, G["more"], "dim")   # cut to fit: say so
+
+
+def draw_scrolled(cv, y, ix, iw, room, layout, rows, mon, ui, marked):
+    """With a row highlighted: a row for every listed instance, scrolled just enough to keep the
+    highlighted one in view, with ▲ and ▼ in the right edge when rows are out of view above or below."""
+    at = [row["cg"] for row in rows].index(ui.selected)
+    if at < ui.scroll:
+        ui.scroll = at
+    elif at >= ui.scroll + room:
+        ui.scroll = at - room + 1
+    ui.scroll = max(0, min(ui.scroll, len(rows) - room))
+    for i, row in enumerate(rows[ui.scroll:ui.scroll + room]):
+        if row["cg"] == ui.selected:                   # in reverse video, across the whole width
+            cv.put(y + i, ix - 1, " " * (iw + 2), "sel")
+            draw_row(Styled(cv, "sel"), y + i, ix, layout, row, mon, marked)
+        else:
+            draw_row(cv, y + i, ix, layout, row, mon, marked)
+    if ui.scroll > 0:
+        cv.put(y, ix + iw + 1, G["up"], "key")
+    if ui.scroll + room < len(rows):
+        cv.put(y + room - 1, ix + iw + 1, G["down"], "key")
 
 
 def fit_layout(width, height, running, stopped):
@@ -1701,10 +1751,22 @@ def fit_layout(width, height, running, stopped):
 
 
 def draw(cv, mon, ui):
-    """Lay the panels out to fit the screen: fit_layout() says how tall each one is."""
+    """Lay the panels out to fit the screen: fit_layout() says how tall each one is. The help screen
+    goes over whichever view it was opened from, and the detail view takes the screen below the
+    status line."""
     if cv.w < 70 or cv.h < 12:
         cv.put(0, 0, f"lxdtop needs at least 70x12 (this is {cv.w}x{cv.h})", "hi")
         return
+    if (ui.back if ui.view == "help" else ui.view) == "detail":
+        draw_status(cv, 0, mon)
+        draw_detail(cv, 1, mon, ui)
+    else:
+        draw_main(cv, mon, ui)
+    if ui.view == "help":
+        draw_help(cv)
+
+
+def draw_main(cv, mon, ui):
     rows = sort_rows(mon, ui.sort)
     draw_status(cv, 0, mon)
     y = 1
@@ -1723,6 +1785,115 @@ def draw(cv, mon, ui):
             draw_events_panel(cv, y, cv.w - events_w, mid_h, events_w, mon)
         y += mid_h
     draw_table_panel(cv, y, 0, cv.h - y, cv.w, rows, mon, ui, shown, fold)
+
+
+# --- The help screen and the detail view ------------------------------------------
+
+def draw_help(cv):
+    """Every key, from KEYS, in a box over the middle of the screen."""
+    w = min(cv.w - 4, 11 + max(len(text) for _, _, text, _ in KEYS) + 3)
+    h = min(cv.h - 2, len(KEYS) + 5)
+    x, y = (cv.w - w) // 2, max(1, (cv.h - h) // 2)
+    for row in range(y, y + h):
+        cv.put(row, x, " " * w)                        # the box covers what's behind it
+    box(cv, y, x, h, w, "b_events", title=[[("keys", "title")]],
+        right=[[(f"lxdtop {VERSION.split()[0]}", "dim")]], footer=[[("any key", "key"), (" closes this", "text")]])
+    for i, (label, _, text, _) in enumerate(KEYS[:h - 5]):
+        cv.put(y + 2 + i, x + 3, label, "key")
+        cv.put(y + 2 + i, x + 11, text, "text", x + w - 2)
+    cv.put(y + h - 2, x + 3, "lxdtop only reads: no key starts, stops or changes anything", "dim", x + w - 2)
+
+
+def detail_lines(row, mon, gone):
+    """The detail view's lines: (label, [(text, style), ...]), from what lxdtop already has."""
+    dash, kills = [("-", "dim")], mon.kills.get(row["cg"])
+    live, vm = row["live"] and not gone, row["vm"]
+    where = mon.server.get("member") or socket.gethostname()
+    if gone:
+        state = [("gone", "hi"), (": no longer on this host, last seen " + row["state"].lower(), "text")]
+    else:
+        state = [(row["state"].lower(), "lo" if live else "dim")]
+    lines = [("state", state + [(f"   {'virtual machine' if vm else 'container'} on {where}", "dim")]),
+             ("address", [(row["ip"], "ip")] if row["ip"] else dash),
+             ("up", [(fmt_uptime(row["up"]), "text")] if row["up"] is not None else dash)]
+    cpu = [(fmt_pct(row["cpu"]), cpu_style(row["cpu"])), (" of one core", "dim")] if row["cpu"] is not None else dash
+    if row["cpu_max"] is not None:
+        cpu = cpu + [("   limit ", "dim"), (f"{row['cpu_max']:.3g} cores", "text")]
+    if row["throttled"] is not None and row["cpu_max"] is not None:
+        cpu = cpu + [("   throttled ", "dim"), (f"{row['throttled']:.0f}%", "mid" if row["throttled"] >= THROTTLED_PCT
+                                                 else "text"), (" of its periods", "dim")]
+    lines.append(("cpu", cpu))
+    for label, used, limit, show in (("memory", row["mem"], row["mem_max"], human),
+                                     ("processes", row["tasks"], row["tasks_max"], str)):
+        parts = [(show(used), "text")] if used is not None else dash
+        if limit is not None:
+            share = used / limit * 100 if used is not None and limit else None
+            parts = parts + [("   limit ", "dim"), (show(limit) if label == "memory" else fmt_count(limit), "text")]
+            parts += [(f" ({share:.0f}%)", "mid" if share >= NEAR_LIMIT_PCT else "dim")] if share is not None else []
+        lines.append((label, [("inside the guest", "dim")] if vm and label == "processes" else parts))
+    top = row["top"]
+    lines.append(("busiest", [("inside the guest", "dim")] if vm else
+                  [(top[0], "text"), (" " + fmt_pct(top[1]), cpu_style(top[1]))] if top else dash))
+    past = mon.past.get(row["cg"])
+    source = {"zfs": "zfs", "io": "io.stat"}.get(past[-1]["disk_src"]) if past and past[-1]["disk"] else None
+    lines.append(("disk", [("read ", "dim"), (human(row["rd"]) + "/s", "text"), ("   write ", "dim"),
+                           (human(row["wr"]) + "/s", "text"), (f"   from {source}" if source else "", "dim")]
+                  if row["rd"] is not None else dash))
+    net = [("in ", "dim"), (fmt_mbps(mbps(row["net_in"])) + " Mb/s", "text"), ("   out ", "dim"),
+           (fmt_mbps(mbps(row["net_out"])) + " Mb/s", "text")] if row["net_in"] is not None else dash
+    lines.append(("network", net))
+    if row["waiting"]:
+        resource, share = row["waiting"]
+        lines.append(("waiting", [(f"{resource} {share:.0f}%", "hi" if share >= PRESSURE_PCT else "text"),
+                                  (" of the last 10 s, some of its tasks stalled", "dim")]))
+    else:
+        lines.append(("waiting", dash))
+    if kills and kills[1]:
+        ago = time.monotonic() - kills[2]
+        lines.append(("mem kills", [(f"{kills[1]}", "hi" if ago < RECENT_KILL else "text"),
+                                    (f" since lxdtop started, the last {fmt_age(ago)} ago", "dim")]))
+    else:
+        lines.append(("mem kills", [("none since lxdtop started", "dim")] if kills else dash))
+    taken = row["snapshot"]
+    lines.append(("snapshot", [(fmt_age(time.time() - taken) + " ago", "text"),
+                               (time.strftime("   %Y-%m-%d %H:%M", time.localtime(taken)), "dim")] if taken
+                  else [("none", "dim")]))
+    return lines
+
+
+def draw_detail(cv, y, mon, ui):
+    """One instance on a page of its own: everything lxdtop has for it, then its lines from the event
+    feed. If it goes away, the page says so and keeps what was last seen."""
+    row = next((r for r in mon.rows if r["cg"] == ui.detail), None)
+    gone = row is None
+    row = ui.last if gone else row
+    ui.last = row
+    h, w = cv.h - y, cv.w
+    box(cv, y, 0, h, w, "b_table", title=[[(row["name"], "title")]],
+        footer=[[("Esc", "key"), (" back", "text")], [("q", "key"), (" back", "text")],
+                [("?", "key"), (" keys", "text")]],
+        footer_right=[[("lxd api ", "dim"), (mon.api_status, "lo" if mon.api_status == "ok" else "mid")]])
+    ix, right, line = 2, w - 2, y + 1
+    for label, parts in detail_lines(row, mon, gone):
+        cv.put(line, ix, label, "bright")
+        put_parts(cv, line, ix + 12, parts, right)
+        line += 1
+    history = list(mon.cpu_history.get(row["cg"], ()))[-(right - ix - 12):]
+    cv.put(line, ix, "cpu history", "bright")
+    put_cells(cv, line, ix + 12, [spark(value) for value in history], right)
+    line += 2
+    feed, _ = mon.events.snapshot() if mon.events else ([], "off")
+    mine = [event for event in feed if event["name"] == row["name"]]
+    cv.put(line, ix, "events", "bright")
+    if not mine:
+        put_parts(cv, line, ix + 12, [("none since lxdtop started" if mon.events else "no event feed", "dim")], right)
+    for event in mine[:y + h - 1 - line]:
+        label, style = EVENT_LABELS.get(event["action"], (event["action"].replace("instance-", ""), "text"))
+        tail = " ".join(part for part in (event["detail"], event["user"]) if part)
+        count = f"  {G['times']}{event['count']}" if event["count"] > 1 else ""
+        put_parts(cv, line, ix + 12, [(time.strftime("%H:%M:%S", time.localtime(event["t"])), "text"),
+                                      ("  " + label[:9].ljust(10), style), (tail, "dim"), (count, "key")], right)
+        line += 1
 
 
 # --- One reading as JSON (--dump --json) ----------------------------------------
@@ -1892,7 +2063,7 @@ def curses_attrs():
         number = COLORS.index(color)
         if rich and name in STYLES_256:
             number, bold = STYLES_256[name]
-        attr = curses.A_BOLD if bold else curses.A_NORMAL
+        attr = (curses.A_BOLD if bold else curses.A_NORMAL) | (curses.A_REVERSE if name in REVERSE else 0)
         if has_color:
             if number not in pairs:
                 pairs[number] = len(pairs) + 1
@@ -1902,9 +2073,124 @@ def curses_attrs():
     return attrs
 
 
+# Every key lxdtop answers to: (what the help calls it, its key codes, what it does, its action).
+# The help screen (?) and --help list this table, and handle_key() looks keys up in it, so what
+# they say and what the keys do can't drift apart. No key changes anything on the host.
+KEYS = (
+    ("q", (ord("q"), ord("Q")), "quit; on the help or detail screen, go back", "quit"),
+    ("?", (ord("?"),), "this help; any key closes it", "help"),
+    ("s", (ord("s"), ord("S")), "sort by the next column: " + ", ".join(SORTS), "sort"),
+    ("+", (ord("+"), ord("=")), "refresh less often (up to every 10 s)", "slower"),
+    ("-", (ord("-"), ord("_")), "refresh more often (down to every second)", "faster"),
+    ("/", (ord("/"),), "filter by name; Enter keeps the filter, Esc clears it", "filter"),
+    ("Esc", (27,), "clear the filter, then the highlight; on details, go back", "escape"),
+    ("Up", (curses.KEY_UP,), "highlight the instance above", "up"),
+    ("Down", (curses.KEY_DOWN,), "highlight the instance below", "down"),
+    ("Enter", (10, 13, curses.KEY_ENTER), "details of the highlighted instance", "open"),
+)
+KEY_ACTIONS = {code: action for _, codes, _, action in KEYS for code in codes}
+BACKSPACE = (curses.KEY_BACKSPACE, 127, 8)      # while typing a filter
+ESC_DELAY_MS = 25                  # how long curses waits after Esc for more of a key's code (default 1000)
+QUIT = "quit"
+
+
+def keys_help(indent="  "):
+    """The key table as lines of text, for --help."""
+    return "\n".join(f"{indent}{label:<7}{text}" for label, _, text, _ in KEYS)
+
+
+def new_ui(interval):
+    """What the screen shows: the sort and refresh interval, which view ("main", "help", "typing" a
+    filter, or "detail"), the name filter, the highlighted instance (by cgroup name), and where the
+    table is scrolled to."""
+    return types.SimpleNamespace(interval=interval, sort="cpu", view="main", back="main", filter="",
+                                 selected=None, scroll=0, detail=None, last=None)
+
+
+def name_matches(row, text):
+    return text.casefold() in row["name"].casefold()
+
+
+def listed_rows(mon, ui):
+    """The table's rows in its order, those the filter leaves."""
+    return [row for row in sort_rows(mon, ui.sort) if name_matches(row, ui.filter)]
+
+
+def type_filter(key, ui):
+    """A key while the filter line is open: text, Backspace, Enter (keep it) or Esc (clear it)."""
+    action = KEY_ACTIONS.get(key)
+    if action == "open":
+        ui.view = "main"
+    elif action == "escape":
+        ui.view, ui.filter = "main", ""
+    elif key in BACKSPACE:
+        ui.filter = ui.filter[:-1]
+    elif 32 <= key < 127 and len(ui.filter) < 40:
+        ui.filter += chr(key)
+    else:
+        return False
+    return True
+
+
+def handle_key(key, mon, ui):
+    """Act on one key press: QUIT to end lxdtop, True when the screen needs drawing again, False
+    when the key does nothing here."""
+    if key == -1:
+        return False
+    if key == curses.KEY_RESIZE:
+        return True
+    if ui.view == "help":                            # any key closes the help
+        ui.view = ui.back
+        return True
+    if ui.view == "typing":
+        return type_filter(key, ui)
+    action = KEY_ACTIONS.get(key)
+    if action == "help":
+        ui.view, ui.back = "help", ui.view
+    elif action == "slower":
+        ui.interval = next((i for i in INTERVALS if i > ui.interval), INTERVALS[-1])
+    elif action == "faster":
+        ui.interval = next((i for i in reversed(INTERVALS) if i < ui.interval), INTERVALS[0])
+    elif ui.view == "detail":
+        if action not in ("quit", "escape"):
+            return False                             # the rest are for the table
+        ui.view = "main"
+    elif action == "quit":
+        return QUIT
+    elif action == "sort":
+        ui.sort = SORTS[(SORTS.index(ui.sort) + 1) % len(SORTS)]
+    elif action == "filter":
+        ui.view = "typing"
+    elif action == "escape":
+        if not (ui.filter or ui.selected):
+            return False
+        ui.filter, ui.selected = ("", ui.selected) if ui.filter else ("", None)
+    elif action in ("up", "down"):
+        rows = [row["cg"] for row in listed_rows(mon, ui)]
+        if not rows:
+            return False
+        if ui.selected in rows:                      # one step, stopping at either end
+            at = min(max(rows.index(ui.selected) + (1 if action == "down" else -1), 0), len(rows) - 1)
+        else:                                        # nothing highlighted yet: start at the top or bottom
+            at = 0 if action == "down" else len(rows) - 1
+        ui.selected = rows[at]
+    elif action == "open":
+        row = next((row for row in listed_rows(mon, ui) if row["cg"] == ui.selected), None)
+        if row is None:
+            return False
+        ui.view, ui.detail, ui.last = "detail", row["cg"], row
+    else:
+        return False
+    return True
+
+
 def run(screen, mon, ui, max_frames=0):
     try:
         curses.curs_set(0)
+    except curses.error:
+        pass
+    try:
+        curses.set_escdelay(ESC_DELAY_MS)  # so Esc acts at once
     except curses.error:
         pass
     screen.timeout(250)               # check the keyboard four times a second
@@ -1926,25 +2212,19 @@ def run(screen, mon, ui, max_frames=0):
             last_draw, frames = now, frames + 1
             if max_frames and frames >= max_frames:
                 return
-        key = screen.getch()
-        if key in (ord("q"), ord("Q")):
+        action = handle_key(screen.getch(), mon, ui)
+        if action == QUIT:
             return
-        if key in (ord("s"), ord("S")):
-            ui.sort = SORTS[(SORTS.index(ui.sort) + 1) % len(SORTS)]
-        elif key in (ord("+"), ord("=")):
-            ui.interval = next((i for i in INTERVALS if i > ui.interval), INTERVALS[-1])
-        elif key in (ord("-"), ord("_")):
-            ui.interval = next((i for i in reversed(INTERVALS) if i < ui.interval), INTERVALS[0])
-        elif key != curses.KEY_RESIZE:
-            continue
-        last_draw = 0.0                   # a key was pressed or the screen resized: redraw now
+        if action:
+            last_draw = 0.0               # a key did something, or the screen resized: redraw now
 
 
 def main():
     parser = argparse.ArgumentParser(
         description="Live, btop-style view of an LXD host, one row per container or VM. Read-only.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog=f"""keys: q quits, s cycles the sort (cpu, mem, disk, net, name), - and + change the refresh interval
+        epilog=f"""keys (? shows them in lxdtop too):
+{keys_help()}
 
 notes:
   CPU is shown as a share of one core: 100% = one core flat out.
@@ -1996,7 +2276,7 @@ needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3."""
         events = LxdEvents(socket_path, show_commands=args.show_commands)
         events.start()
     mon = Monitor(api, events)
-    ui = types.SimpleNamespace(interval=args.interval, sort="cpu")
+    ui = new_ui(args.interval)
 
     if args.dump:
         cols, rows = (int(n) for n in args.size.lower().split("x"))

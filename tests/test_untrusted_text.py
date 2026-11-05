@@ -163,7 +163,7 @@ class ControlCharacterTest(unittest.TestCase):
         screen = RecordingScreen()
         mon = monitor([row("web", top=("\rvictim", 50.0))])
         with glyphs(lxdtop.GLYPHS_UNICODE):
-            lxdtop.draw(lxdtop.CursesCanvas(screen, {}), mon, types.SimpleNamespace(sort="cpu", interval=2))
+            lxdtop.draw(lxdtop.CursesCanvas(screen, {}), mon, lxdtop.new_ui(2))
         self.assertIn("?victim", screen.strings)
         self.assertFalse(any("\r" in s for s in screen.strings))
 

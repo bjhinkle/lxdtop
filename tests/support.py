@@ -279,7 +279,9 @@ def monitor(rows=(), host=None, events=None, **attrs):
 
 
 def ui(sort="cpu", interval=2):
-    return types.SimpleNamespace(sort=sort, interval=interval)
+    view = lxdtop.new_ui(interval)
+    view.sort = sort
+    return view
 
 
 def render(mon, width=160, height=45, sort="cpu", interval=2):

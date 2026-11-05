@@ -43,7 +43,7 @@ class RunLoopTest(unittest.TestCase):
         frames = []
         mon = types.SimpleNamespace(samples=0)
         mon.sample = lambda: setattr(mon, "samples", mon.samples + 1)
-        ui = types.SimpleNamespace(interval=interval, sort="cpu")
+        ui = lxdtop.new_ui(interval)
         screen = FakeScreen(keys)
         with mock.patch.object(lxdtop, "curses_attrs", return_value={}), \
                 mock.patch.object(lxdtop, "draw", lambda cv, m, u: frames.append((u.sort, u.interval))):

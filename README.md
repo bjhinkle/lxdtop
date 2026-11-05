@@ -46,6 +46,10 @@ These come from a running container's cgroup, so stopped instances and VMs leave
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.7.0
+
+- **Keys for a closer look.** `?` lists every key. `/` filters the table by name, the arrows highlight a row, and Enter opens a page with everything lxdtop has on that instance: its readings and limits, throttling, pressure, memory kills, newest snapshot and recent events. Esc acts at once. All of it is read-only, and with nothing highlighted the screen is as before.
+
 ## What's new in 1.6.0
 
 - **`--dump --json`.** One reading as a single JSON document: everything the screen shows, as numbers in base units, for scripts, a monitoring check, or a view that gathers several hosts over ssh. See [One reading as JSON](#one-reading-as-json).
@@ -84,7 +88,7 @@ From a clone, `install -m 755 lxdtop ~/bin/lxdtop` does the same.
 
 Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
 
-Keys: `q` quits, `s` cycles the sort (cpu, mem, disk, net, name), and `-` and `+` change the refresh interval (1 to 10 seconds).
+Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, name), and `-` and `+` change the refresh interval (1 to 10 seconds). `/` filters the table by name (Enter keeps the filter, Esc clears it), the up and down arrows highlight a row, and Enter opens a page with everything lxdtop has on the highlighted instance, its recent events included (Esc or `q` goes back). No key changes anything on the host.
 
 | Option | Effect |
 |---|---|
