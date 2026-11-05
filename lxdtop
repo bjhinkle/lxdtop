@@ -56,7 +56,7 @@ import types
 import unicodedata
 import urllib.parse
 
-VERSION = "1.8.1 (2026-11-05)"
+VERSION = "1.8.2 (2026-11-05)"
 TIMEZONE = None      # the clock's default (None = the system's); TZ overrides it
 CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
@@ -1078,6 +1078,16 @@ class Styled:
         return self.cv.put(y, x, text, self.style, right)
 
 
+class Clipped:
+    """Draws on another canvas, but no lower than row `last`: how the detail view stays inside its box."""
+
+    def __init__(self, cv, last):
+        self.cv, self.last, self.h, self.w = cv, last, cv.h, cv.w
+
+    def put(self, y, x, text, style="text", right=None):
+        return self.cv.put(y, x, text, style, right) if y <= self.last else x + len(text)
+
+
 def put_cells(cv, y, x, cells, right=None):
     """Write a list of (character, style) pairs, joining runs of the same style."""
     run, run_style, run_x = [], None, x
@@ -1397,18 +1407,34 @@ def draw_mem_panel(cv, y, x, h, w, mon):
     # Bottom row: storage pools from LXD, then the root filesystem. A ZFS pool that isn't ONLINE
     # shows its state in red: after the LXD pool of the same name, or on its own before root.
     sick = {pool: state for pool, state in host.get("zpools", {}).items() if state != "ONLINE"}
-    disks = list(mon.pools) + [(pool, None, None) for pool in sorted(sick) if pool not in {p[0] for p in mon.pools}]
-    disks += [("root", host["root_used"], host["root_total"])] if host.get("root_total") else []
-    pos = ix
-    for name, used, size in disks:
+    pools = list(mon.pools) + [(pool, None, None) for pool in sorted(sick) if pool not in {p[0] for p in mon.pools}]
+    root = [("root", host["root_used"], host["root_total"])] if host.get("root_total") else []
+
+    def disk(name, used, size, short):
         parts = [(name + " ", "hi" if name in sick else "text")]
         if size is not None:
             share = used / size * 100 if size else 0
-            parts += [(human(used), "bright"), ("/" + human(size), "dim"),
-                      (f" {share:.0f}%", "mid" if share >= 80 else "dim")]
+            parts += [] if short else [(human(used), "bright"), ("/" + human(size), "dim")]
+            parts.append((("" if short else " ") + f"{share:.0f}%", "mid" if share >= 80 else "dim"))
         if name in sick:
             parts.append(((" " if size is not None else "") + sick[name], "hi"))
-        pos = put_parts(cv, y + h - 2, pos, parts + [("   ", "dim")], ix + iw)
+        return parts + [("   ", "dim")]
+
+    def disk_row(dropped, short):                  # the row without the `dropped` pools, "…" in their place
+        parts = []
+        for i, (name, used, size) in enumerate(pools):
+            parts += [] if i in dropped else disk(name, used, size, short)
+        parts += [(G["more"] + "   ", "dim")] if dropped else []
+        for name, used, size in root:
+            parts += disk(name, used, size, short)
+        return parts
+
+    # Where the row doesn't fit, the sizes go ("default 13%"), then healthy pools give way from the
+    # end. Root and a pool that isn't ONLINE always keep their place, and no word is cut short.
+    healthy = [i for i, (name, _, _) in enumerate(pools) if name not in sick]
+    tries = [disk_row((), False)] + [disk_row(healthy[n:], True) for n in range(len(healthy), -1, -1)]
+    parts = next((p for p in tries if sum(len(text) for text, _ in p) - 3 <= iw), tries[-1])
+    put_parts(cv, y + h - 2, ix, parts, ix + iw)
 
 
 def draw_net_panel(cv, y, x, h, w, mon):
@@ -1536,11 +1562,21 @@ def draw_graph_panel(cv, y, x, h, w, mon, ui):
     box(cv, y, x, h, w, "b_graph", title=[[(f"cpu by {noun[:-1]}", "title")], [(f"last {span}", "dim")]],
         right=[[("100% = one core", "dim")]])
     series = draw_graph(cv, y + 1, x + 2, w - 4, h - 3, mon)
-    pos, right = x + 2, x + w - 2
-    for cg in series:
-        pos = put_parts(cv, y + h - 2, pos, [(G["cell"] + " ", mon.series_style[cg]), (cg + "  ", "text")], right)
-    put_parts(cv, y + h - 2, pos, [(G["cell"] + " ", "other"), (f"other {noun}  ", "text"),
-                                   (G["cell"] + " ", "host"), ("host itself", "text")], right)
+
+    def legend(shown, short):                      # a swatch and a name for each series, then the rest
+        parts = []
+        for cg in shown:
+            parts += [(G["cell"] + " ", mon.series_style[cg]), (cg + "  ", "text")]
+        if len(shown) < len(series):
+            parts.append((G["more"] + "  ", "dim"))
+        return parts + [(G["cell"] + " ", "other"), ("other  " if short else f"other {noun}  ", "text"),
+                        (G["cell"] + " ", "host"), ("host" if short else "host itself", "text")]
+
+    # Where the legend doesn't fit, "other instances" and "host itself" shorten, then the least busy
+    # names give way to "…" (the table shows each name in its series' color), so no word is cut short.
+    tries = [legend(series, False)] + [legend(series[:n], True) for n in range(len(series), -1, -1)]
+    parts = next((p for p in tries if sum(len(text) for text, _ in p) <= w - 4), tries[-1])
+    put_parts(cv, y + h - 2, x + 2, parts, x + w - 2)
 
 
 def draw_events_panel(cv, y, x, h, w, mon):
@@ -2024,31 +2060,39 @@ def draw_detail(cv, y, mon, ui):
         footer=[[("Esc", "key"), (" back", "text")], [("q", "key"), (" back", "text")],
                 [("?", "key"), (" keys", "text")]],
         footer_right=[[("lxd api ", "dim"), (mon.api_status, "lo" if mon.api_status == "ok" else "mid")]])
-    ix, right, line = 2, w - 2, y + 1
-    for label, parts in detail_lines(row, mon, gone):
-        cv.put(line, ix, label, "bright")
-        put_parts(cv, line, ix + 12, parts, right)
+    ix, right, line, last = 2, w - 2, y + 1, y + h - 2      # last: the lowest row inside the box
+    lines = detail_lines(row, mon, gone)
+    # The page takes its lines, the cpu history, a gap and the events. In a window too short for all
+    # of that it's cut to fit inside the box, and its last row says how tall a window shows the rest.
+    needed, room = len(lines) + 3, last - line + 1
+    page = cv if needed <= room else Clipped(cv, last - 1)
+    if needed > room:
+        cv.put(last, ix, f"{G['more']} the rest needs a window {cv.h + needed - room} rows tall", "dim", right)
+    for label, parts in lines:
+        page.put(line, ix, label, "bright")
+        put_parts(page, line, ix + 12, parts, right)
         line += 1
     history = list(mon.cpu_history.get(row["cg"], ()))[-(right - ix - 12):]
-    cv.put(line, ix, "cpu history", "bright")
+    page.put(line, ix, "cpu history", "bright")
     if FINE:                                       # two samples a cell, from the left like the rest
         history = list(mon.cpu_history.get(row["cg"], ()))[-2 * (right - ix - 12):]
         history = [None] * (len(history) % 2) + history
-        put_cells(cv, line, ix + 12, [braille_spark(*history[i:i + 2]) for i in range(0, len(history), 2)], right)
+        put_cells(page, line, ix + 12, [braille_spark(*history[i:i + 2]) for i in range(0, len(history), 2)], right)
     else:
-        put_cells(cv, line, ix + 12, [spark(value) for value in history], right)
+        put_cells(page, line, ix + 12, [spark(value) for value in history], right)
     line += 2
     feed, _ = mon.events.snapshot() if mon.events else ([], "off")
     mine = [event for event in feed if event["name"] == row["name"]]
-    cv.put(line, ix, "events", "bright")
+    page.put(line, ix, "events", "bright")
     if not mine:
-        put_parts(cv, line, ix + 12, [("none since lxdtop started" if mon.events else "no event feed", "dim")], right)
-    for event in mine[:y + h - 1 - line]:
+        put_parts(page, line, ix + 12, [("none since lxdtop started" if mon.events else "no event feed", "dim")],
+                  right)
+    for event in mine[:max(0, last + 1 - line)]:            # as many as there are rows left in the box
         label, style = EVENT_LABELS.get(event["action"], (event["action"].replace("instance-", ""), "text"))
         tail = " ".join(part for part in (event["detail"], event["user"]) if part)
         count = f"  {G['times']}{event['count']}" if event["count"] > 1 else ""
-        put_parts(cv, line, ix + 12, [(time.strftime("%H:%M:%S", time.localtime(event["t"])), "text"),
-                                      ("  " + label[:9].ljust(10), style), (tail, "dim"), (count, "key")], right)
+        put_parts(page, line, ix + 12, [(time.strftime("%H:%M:%S", time.localtime(event["t"])), "text"),
+                                        ("  " + label[:9].ljust(10), style), (tail, "dim"), (count, "key")], right)
         line += 1
 
 

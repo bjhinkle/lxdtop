@@ -277,7 +277,7 @@ class PoolPanelTest(unittest.TestCase):
         mon = monitor([row("web")])
         mon.host["zpools"] = zpools
         canvas = render(mon, 160, 45)
-        y = next(i for i, line in enumerate(canvas.text().splitlines()) if "root 40G" in line)
+        y = next(i for i, line in enumerate(canvas.text().splitlines()) if "root 40" in line)
         return canvas, y
 
     def test_all_online_looks_as_before(self):
@@ -288,14 +288,14 @@ class PoolPanelTest(unittest.TestCase):
     def test_an_lxd_pool_that_is_degraded(self):
         canvas, y = self.pool_row({"default": "DEGRADED"})
         line = canvas.text().splitlines()[y]
-        self.assertIn("default 120G/900G 13% DEGRADED   root", line)
+        self.assertIn("default 13% DEGRADED   root 40%", line)        # the sizes go, so root fits whole
         start = line.index("default")
         self.assertEqual({canvas.cells[y][start][1], canvas.cells[y][line.index("DEGRADED")][1]}, {"hi"})
 
     def test_a_pool_lxd_doesnt_list(self):
         canvas, y = self.pool_row({"rpool": "FAULTED"})
         line = canvas.text().splitlines()[y]
-        self.assertIn("default 120G/900G 13%   rpool FAULTED   root", line)
+        self.assertIn("default 13%   rpool FAULTED   root 40%", line)
         self.assertEqual(canvas.cells[y][line.index("rpool")][1], "hi")
 
 
