@@ -1965,8 +1965,8 @@ def sort_rows(mon, mode):
         "throttled": lambda r: -(r["throttled"] or 0),
         "waiting": lambda r: -(r["waiting"][1] if r["waiting"] else 0),
     }
-    live = sorted((r for r in mon.rows if r["live"]), key=lambda r: (keys[mode](r), r["label"].lower()))
-    rest = sorted((r for r in mon.rows if not r["live"]), key=lambda r: r["label"].lower())
+    live = sorted((r for r in mon.rows if r["live"]), key=lambda r: (keys[mode](r), r["name"].lower()))
+    rest = sorted((r for r in mon.rows if not r["live"]), key=lambda r: r["name"].lower())
     return live + rest
 
 
