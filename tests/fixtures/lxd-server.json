@@ -16,6 +16,7 @@
       "os_name": "Ubuntu",
       "os_version": "24.04",
       "server": "lxd",
+      "server_clustered": false,
       "server_name": "lxdhost",
       "server_version": "6.9",
       "storage": "zfs"

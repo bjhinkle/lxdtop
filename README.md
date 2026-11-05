@@ -19,7 +19,7 @@ It is laid out for a 160x45 screen, such as a small console monitor or a large t
 ## Requirements
 
 - Linux with cgroup v2 (Ubuntu 22.04 or later)
-- LXD 5 or 6 (snap or package; `LXD_DIR` is honored)
+- LXD 5 or 6 (snap or package; `LXD_DIR` is honored). On a cluster member, it shows that member's instances and events.
 - Python 3
 - Membership in the `lxd` group, or root, for names, IP addresses, VMs, stopped instances and the event feed. Without it, lxdtop still shows each container's CPU, memory and disk.
 

@@ -338,6 +338,24 @@ class ZfsPoolTest(unittest.TestCase):
         self.assertEqual(db["rd"], 2000.0)                    # from io.stat, not from c1's leftover volume
 
 
+class ClusterMemberTest(unittest.TestCase):
+    def sample(self, server):
+        host = FakeHost(self)
+        host.set_basics()
+        host.set_cpu_times((100, 0, 900), [(25, 0, 225)] * 4)
+        events = lxdtop.LxdEvents("/unused")
+        with host.installed():
+            lxdtop.Monitor(FakeApi({}, server=server), events).sample()
+        return events
+
+    def test_the_event_feed_learns_this_cluster_member(self):
+        # SECURITY-REVIEW.md N-10: the feed keeps to the member the API says this host is.
+        self.assertEqual(self.sample(dict(version="6.9", member="m1")).member, "m1")
+
+    def test_standalone_the_feed_keeps_everything(self):
+        self.assertEqual(self.sample(dict(version="6.9", member="")).member, "")
+
+
 class SeriesTest(unittest.TestCase):
     def setUp(self):
         self.mon = types.SimpleNamespace(series_style={})

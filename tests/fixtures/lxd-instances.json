@@ -9,6 +9,7 @@
     {
       "name": "web",
       "project": "default",
+      "location": "none",
       "type": "container",
       "status": "Running",
       "status_code": 103,
@@ -49,6 +50,7 @@
     {
       "name": "db",
       "project": "default",
+      "location": "none",
       "type": "container",
       "status": "Running",
       "status_code": 103,
@@ -84,6 +86,7 @@
     {
       "name": "api",
       "project": "dev",
+      "location": "none",
       "type": "container",
       "status": "Running",
       "status_code": 103,
@@ -98,6 +101,7 @@
     {
       "name": "win",
       "project": "default",
+      "location": "none",
       "type": "virtual-machine",
       "status": "Running",
       "status_code": 103,
@@ -123,6 +127,7 @@
     {
       "name": "old",
       "project": "default",
+      "location": "none",
       "type": "container",
       "status": "Stopped",
       "status_code": 102,

@@ -482,7 +482,7 @@ class LxdApi:
         self.socket_path = socket_path
         self.lock = threading.Lock()
         self.instances = {}           # cgroup name -> {name, status, veths, ipv4}
-        self.server = {}              # LXD version, OS, kernel, where its ZFS pools keep datasets
+        self.server = {}              # LXD version, OS, kernel, cluster member name, where its ZFS pools keep datasets
         self.pools = []               # (pool name, bytes used, bytes total)
         self.status = "starting"
         self.rounds = 0
@@ -500,9 +500,11 @@ class LxdApi:
             raise ValueError(body.get("error") or f"HTTP {reply.status}")
         return body.get("metadata")
 
-    def fetch_instances(self):
+    def fetch_instances(self, member=None):
         found = {}
         for inst in self.get("/1.0/instances?recursion=2&all-projects=true") or []:
+            if member and inst.get("location") != member:
+                continue                                 # on another cluster member, not on this host
             project = inst.get("project") or "default"
             # Containers outside the default project get "<project>_" in their cgroup name.
             cg = inst["name"] if project == "default" else f"{project}_{inst['name']}"
@@ -522,7 +524,8 @@ class LxdApi:
     def fetch_server(self):
         env = (self.get("/1.0") or {}).get("environment") or {}
         server = dict(version=env.get("server_version", ""), kernel=env.get("kernel_version", ""),
-                      os=f"{env.get('os_name', '')} {env.get('os_version', '')}".strip(), zfs_roots=[])
+                      os=f"{env.get('os_name', '')} {env.get('os_version', '')}".strip(), zfs_roots=[],
+                      member=env.get("server_name", "") if env.get("server_clustered") else "")
         pools = []
         for pool in self.get("/1.0/storage-pools?recursion=1") or []:
             if pool.get("driver") == "zfs":              # the dataset its volumes live in (zfs.pool_name)
@@ -538,8 +541,8 @@ class LxdApi:
 
     def fetch(self):
         try:
-            instances = self.fetch_instances()
             server, pools = self.fetch_server() if self.rounds % 4 == 0 else (self.server, self.pools)
+            instances = self.fetch_instances(server.get("member"))     # on a cluster, this member's only
             status = "ok"
         except PermissionError:
             instances, status = None, "no access"        # not in the lxd group
@@ -581,6 +584,7 @@ class LxdEvents:
         self.lock = threading.Lock()
         self.feed = collections.deque(maxlen=50)     # newest first
         self.status = "connecting"
+        self.member = ""                             # on a cluster, this member's name (Monitor has it from the API)
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
@@ -639,6 +643,8 @@ class LxdEvents:
                     message = b""
 
     def _record(self, event):
+        if self.member and event.get("location", self.member) != self.member:
+            return                                   # it happened on another cluster member
         meta = event.get("metadata") or {}
         # Outside the default project, LXD adds "?project=<name>" to the source: leave it off.
         parts = urllib.parse.unquote(meta.get("source", "").partition("?")[0]).split("/")   # /1.0/instances/<name>/...
@@ -705,6 +711,8 @@ class Monitor:
         instances = {}
         if self.api:
             instances, self.api_status, self.server, self.pools = self.api.snapshot()
+            if self.events:
+                self.events.member = self.server.get("member", "")   # so the feed keeps to this cluster member
         uptime = float((read("/proc/uptime") or "0").split()[0])
         self.procs.sample(now)
         if now - self.zfs_checked > 30:          # after the processes: it reads each container's first one

@@ -31,6 +31,7 @@ class FetchTest(unittest.TestCase):
             "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0),
         })
         self.assertEqual(server, dict(version="6.9", kernel="6.8.0-45-generic", os="Ubuntu 24.04",
+                                      member="",                        # not a cluster member
                                       zfs_roots=["default"]))          # where the ZFS pool keeps its datasets
         self.assertEqual(pools, [("default", 128849018880, 966367641600)])   # "scratch" reports no size
 
@@ -51,6 +52,34 @@ class FetchTest(unittest.TestCase):
                 api.fetch()
                 counts.append(sum(1 for _, target, _ in lxd.requests if target == "/1.0"))
         self.assertEqual(counts, [1, 1, 1, 1, 2])
+
+    def test_on_a_cluster_only_this_members_instances(self):
+        """SECURITY-REVIEW.md N-10: on a cluster, every member's instances used to be listed.
+
+        LXD 5.21 and 6 list the instances of every cluster member, each with its
+        member as "location". Those on other members have no cgroup or QEMU
+        process here, so they showed as stopped rows and in the "stopped" count.
+        """
+        routes = lxd_routes()
+        routes["/1.0"][1]["metadata"]["environment"].update(server_clustered=True, server_name="m1")
+        for inst, member in zip(routes[INSTANCES][1]["metadata"], ("m1", "m2", "m1", "m2", "m2")):
+            inst["location"] = member                # web, db, api (project dev), win, old
+        with FakeLxd(routes) as lxd:
+            api = lxdtop.LxdApi(lxd.path)
+            api.fetch()
+        found, status, server, _ = api.snapshot()
+        self.assertEqual(status, "ok")
+        self.assertEqual(sorted(found), ["dev_api", "web"])
+        self.assertEqual(server["member"], "m1")
+
+    def test_standalone_lists_every_instance(self):
+        # Not clustered: LXD calls the one member "none", and every instance is on it.
+        routes = lxd_routes()
+        routes["/1.0"][1]["metadata"]["environment"]["server_name"] = "web"   # a hostname, not a member name
+        with FakeLxd(routes) as lxd:
+            api = lxdtop.LxdApi(lxd.path)
+            api.fetch()
+        self.assertEqual(sorted(api.snapshot()[0]), ["db", "dev_api", "old", "web", "win"])
 
     def test_where_each_zfs_pool_keeps_its_datasets(self):
         routes = lxd_routes()

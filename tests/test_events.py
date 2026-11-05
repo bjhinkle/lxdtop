@@ -348,6 +348,26 @@ class RecordTest(unittest.TestCase):
         self.record(source="/1.0/instances/web/snapshots/snap%3F1?project=dev")   # a "?" in a name stays
         self.assertEqual([(e["name"], e["detail"]) for e in self.events.feed], [("web", "snap?1"), ("api", "")])
 
+    def test_on_a_cluster_only_this_members_events(self):
+        """SECURITY-REVIEW.md N-10: on a cluster, every member's events used to reach the feed.
+
+        A client on one member of an LXD 5.21 or 6 cluster gets the events of
+        every member, each with its member as "location", while the table
+        shows only this member's instances.
+        """
+        self.events.member = "m1"
+        for location in ("m1", "m2"):
+            self.events._record(dict(location=location, metadata=dict(action="instance-started",
+                                                                      source=f"/1.0/instances/on-{location}")))
+        self.events._record(dict(metadata=dict(action="instance-started", source="/1.0/instances/unsaid")))
+        self.assertEqual([e["name"] for e in self.events.feed], ["unsaid", "on-m1"])
+
+    def test_standalone_keeps_every_event(self):
+        self.events.member = ""                        # what Monitor passes on when LXD isn't clustered
+        self.events._record(dict(location="none", metadata=dict(action="instance-started",
+                                                                source="/1.0/instances/web")))
+        self.assertEqual([e["name"] for e in self.events.feed], ["web"])
+
     def test_a_name_field_wins_over_the_source(self):
         self.events._record(dict(metadata=dict(action="instance-renamed", source="/1.0/instances/new",
                                                name="old")))
