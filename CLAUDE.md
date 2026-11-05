@@ -42,6 +42,7 @@ lxdtop is one Python file that shows a live view of an LXD host, using only the 
 ## How changes are made
 
 - **One PR per piece of work,** on a `claude/…` branch from main. Never merge; the owner does, often within minutes.
+- **Do the work you were asked for, then stop** and say what's left. Don't open pull requests nobody asked for, including for items in issue #16.
 - **Check that a PR is still open** right before pushing to its branch. If it has merged, start again from main.
 - **A fix comes with a test that fails before it.** Show that failure in the PR.
 - **Check the layout at 80x24, 160x45 and one larger size.** For drawing changes, compare frames from main and the branch, cell by cell and with colors, and say exactly what changed.
