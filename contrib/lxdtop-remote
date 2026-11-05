@@ -136,7 +136,13 @@ case "$1" in
         echo "lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the host" \
              "with sudo systemctl restart lxdtop-console"
       fi'
-    ssh -- "$dest" "want=$sum; $check" < "$LXDTOP"
+    # This end of a connection that dropped without a word waits too, until TCP gives up. With
+    # these, ssh asks the host's sshd for an answer once 15 seconds pass with nothing from it,
+    # then every 15 seconds, and gives up when a fourth ask is due with none of the three
+    # answered: a minute after the host went quiet, as the host waits. A working connection
+    # always answers, however long the copy and its checks take. They are the same for every
+    # host, and the host still comes after --, so nothing in its name can be read as an option.
+    ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- "$dest" "want=$sum; $check" < "$LXDTOP"
     status=$?
     # 255: ssh itself failed, and has said why. The host may or may not have got that far.
     if [ $status -eq 255 ]; then
