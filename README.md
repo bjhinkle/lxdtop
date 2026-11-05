@@ -52,9 +52,11 @@ Every threshold is a named constant near the top of `lxdtop`, with a comment say
 ## What's new in 1.9.0
 
 - **The busiest process never shows more CPU than its container.** Its figure was averaged with the reading before, so a process that had just gone quiet could show more than its whole container. Now it covers the last interval, as the container's does.
+- **A container that stops shows as stopped at the next refresh.** lxdtop asks LXD again as soon as a container's readings stop, where it showed a grey `running` row, counted as running, until LXD's next regular answer, up to 15 seconds later.
 - **The network graph is drawn in braille in the fine drawing,** two readings to a character, with traffic out filling down from the middle line. The classic drawing and `--ascii` are unchanged.
 - **VMs whose disks aren't on ZFS show disk reads and writes,** from LXD's metrics, which the `lxd` group can read: averaged over 15 seconds, and updated as often. The detail view and the JSON's `disk_source` say they come from `lxd`.
 - **VMs show their CPU and memory limits,** from LXD's `limits.cpu` and `limits.memory`: in THROTTLED (`@2c`) and MEM/LIMIT on screens wider than 160 columns, in the detail view and in the JSON. lxdtop reads no other key of an instance's config.
+- **A paused VM shows its readings and counts as running,** with a yellow dot, as a paused container does. It showed no readings and counted as stopped, though its QEMU process was still there.
 - **A running VM that lxdtop can't read counts as running, and says why.** It no longer adds to `N stopped`, and its row says, for example, `no readings: no access to QEMU process 5151`, with what may cause it in its detail view.
 - **`s` sorts by THROTTLED and WAITING too,** most held back or most stalled first.
 - **A container held to some of the host's CPUs shows that limit.** LXD applies a container's `limits.cpu` as a set of CPUs, so THROTTLED now shows `@2c` for one held to two, and the JSON's `cpu_limit_cores` says 2; with a quota too, the smaller. Without a quota there's no throttling, so `cpu_throttled_pct` is `null` there.

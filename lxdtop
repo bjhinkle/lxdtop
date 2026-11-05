@@ -448,7 +448,7 @@ def read_vm_process(pid):
 
 
 def vm_unread(pid):
-    """Why read_vm_process() had nothing for a VM that LXD says is running: (in a few words, a hint)."""
+    """Why read_vm_process() had nothing for a VM that LXD says is running or frozen: (in a few words, a hint)."""
     if not pid:
         return "LXD gave no QEMU process ID", ""
     if not os.path.exists(f"/proc/{pid}"):
@@ -514,6 +514,9 @@ def project_of(cg):
 def name_of(cg):
     """The name of a container known only by its cgroup name (see project_of())."""
     return cg.split("_", 1)[-1]
+
+
+RUNNING_OR_FROZEN = ("Running", "Frozen")    # LXD's states for an instance whose processes are there to read
 
 
 def new_row(cg, inst, **fields):
@@ -727,7 +730,7 @@ class LxdApi:
         self.pools = []               # (pool name, bytes used, bytes total)
         self.status = "starting"
         self.rounds = 0
-        self.wake = threading.Event()  # set this to refresh early (a new container appeared)
+        self.wake = threading.Event()  # set this to refresh early (a new container appeared, or one stopped)
         self.vm_disks_wanted = frozenset()     # running VMs the screen has no disk counters for (Monitor sets it)
         self.vm_disks = None                   # (when, vm_disk_totals()) at the last metrics reading
 
@@ -1168,7 +1171,7 @@ class Monitor:
         # host, so read that process instead (CPU time, resident memory, start time).
         wanted = set()                            # VMs with no disk counters here: see LxdApi.fetch_vm_disks()
         for cg, inst in instances.items():
-            if inst.get("type") != "virtual-machine" or inst["status"] != "Running" or cg in readings:
+            if inst.get("type") != "virtual-machine" or inst["status"] not in RUNNING_OR_FROZEN or cg in readings:
                 continue
             process = read_vm_process(inst.get("pid"))
             if not process:
@@ -1189,8 +1192,10 @@ class Monitor:
         # is_stopped() counts as running, and whose row says why: see vm_unread()).
         for cg, inst in instances.items():
             if cg not in readings:
-                vm = inst.get("type") == "virtual-machine"
-                unread = vm_unread(inst.get("pid")) if vm and inst.get("status") == "Running" else None
+                vm, running = inst.get("type") == "virtual-machine", inst.get("status") in RUNNING_OR_FROZEN
+                if self.api and running and cg in self.past:
+                    self.api.wake.set()           # its readings just stopped: ask LXD now whether it has
+                unread = vm_unread(inst.get("pid")) if vm and running else None
                 rows.append(new_row(cg, inst, live=False, vm=vm, unread=unread))
         for cg in list(self.cpu_history):
             if cg not in readings:
@@ -2118,9 +2123,9 @@ def draw_row(cv, y, x0, layout, row, mon, marked=()):
 
 
 def is_stopped(row):
-    """Stopped: no readings, and LXD doesn't say it's running. A running VM whose QEMU process
-    lxdtop can't read has no readings either, but it counts as running, as LXD says."""
-    return not row["live"] and row["state"] != "Running"
+    """Stopped: no readings, and LXD doesn't say it's running or frozen. A running or frozen VM whose
+    QEMU process lxdtop can't read has no readings either, but it counts as LXD says."""
+    return not row["live"] and row["state"] not in RUNNING_OR_FROZEN
 
 
 def sort_rows(mon, mode):
