@@ -109,21 +109,21 @@ On the LXD host, download `lxdtop` beside where it goes, check that it runs, and
 mkdir -p ~/bin
 curl -fsSL -o ~/bin/lxdtop.new https://raw.githubusercontent.com/bjhinkle/lxdtop/main/lxdtop
 chmod 755 ~/bin/lxdtop.new
-~/bin/lxdtop.new --version | grep '^lxdtop ' && mv ~/bin/lxdtop.new ~/bin/lxdtop
+~/bin/lxdtop.new --version | grep '^lxdtop ' && sync ~/bin/lxdtop.new && mv ~/bin/lxdtop.new ~/bin/lxdtop
 ~/bin/lxdtop
 ```
 
-The fourth line prints the version, and only if the download runs and says it is lxdtop does `mv` replace `~/bin/lxdtop`, in one step. A download cut partway never becomes `~/bin/lxdtop`, so the console service never restarts into a half-downloaded file.
+The fourth line prints the version. Only if the download runs and says it is lxdtop does it go on: `sync` flushes the copy to disk, so that a power cut just after can't leave an empty file, and `mv` replaces `~/bin/lxdtop` with it in one step. A download cut partway never becomes `~/bin/lxdtop`, so the console service never restarts into a half-downloaded file.
 
 From a clone, copy it the same way, beside where it goes, and rename it into place:
 
 ```bash
 mkdir -p ~/bin
 install -m 755 lxdtop ~/bin/lxdtop.new
-~/bin/lxdtop.new --version | grep '^lxdtop ' && mv ~/bin/lxdtop.new ~/bin/lxdtop
+~/bin/lxdtop.new --version | grep '^lxdtop ' && sync ~/bin/lxdtop.new && mv ~/bin/lxdtop.new ~/bin/lxdtop
 ```
 
-`install` straight onto `~/bin/lxdtop` would remove the old file before copying the new one, so for a moment there'd be no lxdtop there, or only part of one.
+`install` straight onto `~/bin/lxdtop` would remove the old file before copying the new one, so for a moment there'd be no lxdtop there, or only part of one. As above, `sync` flushes the copy to disk before `mv` renames it into place.
 
 Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
 
