@@ -64,14 +64,17 @@ Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12.
 
 ## Install and run
 
-On the LXD host, download `lxdtop` and make it executable:
+On the LXD host, download `lxdtop` beside where it goes, check that it runs, and move it into place:
 
 ```bash
 mkdir -p ~/bin
-curl -fsSL -o ~/bin/lxdtop https://raw.githubusercontent.com/bjhinkle/lxdtop/main/lxdtop
-chmod 755 ~/bin/lxdtop
+curl -fsSL -o ~/bin/lxdtop.new https://raw.githubusercontent.com/bjhinkle/lxdtop/main/lxdtop
+chmod 755 ~/bin/lxdtop.new
+~/bin/lxdtop.new --version | grep '^lxdtop ' && mv ~/bin/lxdtop.new ~/bin/lxdtop
 ~/bin/lxdtop
 ```
+
+The fourth line prints the version, and only if the download runs and says it is lxdtop does `mv` replace `~/bin/lxdtop`, in one step. A download cut partway never becomes `~/bin/lxdtop`, so the console service never restarts into a half-downloaded file.
 
 From a clone, `install -m 755 lxdtop ~/bin/lxdtop` does the same.
 
@@ -99,7 +102,7 @@ lxdtop-remote install myhost    # copy lxdtop to myhost:~/bin/lxdtop
 lxdtop-remote myhost            # run it in this terminal
 ```
 
-`install` copies lxdtop over one SSH connection to `~/bin/lxdtop.new` on the host and checks it there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and `lxdtop.new --version` must print lxdtop's version. Only then is it renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was, so the console service never restarts into a half-copied file. On success it prints the version and the SHA-256 it checked.
+`install` copies lxdtop over one SSH connection to `~/bin/lxdtop.new` on the host and checks it there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and `lxdtop.new --version` must print lxdtop's version. Only then is it flushed to disk and renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was, so the console service never restarts into a half-copied file. On success it prints the version and the SHA-256 it checked.
 
 On the host it runs `~/bin/lxdtop`, or the `lxdtop` on the host's PATH when `~/bin` has none, so a single copy in `/usr/local/bin` serves every user.
 

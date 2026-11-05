@@ -183,6 +183,12 @@ algorithm = sys.argv[2] if sys.argv[1:2] == ["-a"] else "1"
 print(hashlib.new("sha" + algorithm, sys.stdin.buffer.read()).hexdigest() + "  -")
 '''
 
+SYNC_RECORDER = """#!/bin/sh
+# Stands in for sync on the host: write down what it was asked to flush, and what that file
+# and ~/bin/lxdtop held at that moment.
+{ echo "sync $*"; sha256sum < "$1"; sha256sum < "$HOME/bin/lxdtop"; } >> "$HOME/sync-log"
+"""
+
 
 class InstallTest(RemoteCase):
     """`install` checks the copy as ~/bin/lxdtop.new on the host, then renames it over ~/bin/lxdtop.
@@ -194,17 +200,26 @@ class InstallTest(RemoteCase):
     one, checked.
     """
 
-    login_shell = "dash"                    # on the host; BashInstallTest runs these again with bash
+    login_shell = "dash"                    # on the host; the classes below run these again with others
 
     def setUp(self):
         super().setUp()
-        if not shutil.which(self.login_shell):
+        self.shell = shutil.which(self.login_shell)
+        if not self.shell:
             self.skipTest(f"needs {self.login_shell}")
+        self.host_path = os.environ.get("PATH", "/usr/bin:/bin")             # the PATH on the host
         self.installed = os.path.join(self.remote_home, "bin", "lxdtop")     # the old copy: STUB_LXDTOP
         self.new = self.installed + ".new"
 
     def install(self, **env):
-        return self.remote("install", "me@lxdhost", FAKE_SSH_LOGIN_SHELL=self.login_shell, **env)
+        env.setdefault("FAKE_SSH_REMOTE_PATH", self.host_path)
+        return self.remote("install", "me@lxdhost", FAKE_SSH_LOGIN_SHELL=self.shell, **env)
+
+    def host_tool(self, name, text):
+        """A PATH for the host with this script in front, standing in for one of its tools."""
+        path = self.mkdir("host-" + name)
+        self.write(os.path.join(path, name), text, 0o755)
+        return path + os.pathsep + self.host_path
 
     def state(self, path=None):
         """What a failed install must leave exactly as it was: the file or symlink at path, and what it holds."""
@@ -301,6 +316,23 @@ class InstallTest(RemoteCase):
         with open(notes) as f:
             self.assertEqual(f.read(), "keep me\n")
 
+    def test_the_copy_is_flushed_to_disk_before_the_rename(self):
+        with open(self.installed, "rb") as f:
+            old = hashlib.sha256(f.read()).hexdigest()
+        result = self.install(FAKE_SSH_REMOTE_PATH=self.host_tool("sync", SYNC_RECORDER))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_new_copy()
+        with open(os.path.join(self.remote_home, "sync-log")) as f:
+            # sync was asked to flush lxdtop.new alone, once, when it held the whole copy and
+            # ~/bin/lxdtop was still the old one: before the rename
+            self.assertEqual(f.read().splitlines(), [f"sync {self.new}", f"{SHA256}  -", f"{old}  -"])
+
+    def test_a_copy_that_cannot_be_flushed_leaves_the_old_one(self):
+        failing = "#!/bin/sh\necho \"sync: error syncing '$1': Input/output error\" >&2\nexit 1\n"
+        old = self.state()
+        result = self.install(FAKE_SSH_REMOTE_PATH=self.host_tool("sync", failing))
+        self.assert_refused(result, old, "could not flush ~/bin/lxdtop.new to disk; ~/bin/lxdtop was not changed")
+
     def test_a_directory_at_bin_lxdtop_is_left_alone(self):
         os.remove(self.installed)
         os.mkdir(self.installed)
@@ -327,7 +359,7 @@ class InstallTest(RemoteCase):
 
     def test_on_a_mac_shasum_works_out_the_sha256(self):
         mac = self.only("mac", ("shasum", SHASUM))                      # macOS has no sha256sum
-        result = self.install(PATH=mac, FAKE_SSH_REMOTE_PATH=os.environ.get("PATH", "/usr/bin:/bin"))
+        result = self.install(PATH=mac)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(f"SHA-256 {SHA256}, checked on the host", result.stdout)
         self.assert_new_copy()
@@ -350,6 +382,37 @@ class BashInstallTest(InstallTest):
     """The same, with bash as the login shell on the host."""
 
     login_shell = "bash"
+
+
+class BusyBoxInstallTest(InstallTest):
+    """The same, on a host whose shell and tools all come from BusyBox, as on Alpine.
+
+    Some BusyBox builds run their own applets before they search the PATH, among them Ubuntu's
+    busybox-static, which most Ubuntu systems (and CI's runners) have. A stand-in tool on the
+    host's PATH never runs there, so the tests that need one are skipped on those builds; the
+    rest still run BusyBox's own tools, sync included.
+    """
+
+    login_shell = "busybox"
+
+    def host_tool(self, name, text):
+        path = super().host_tool(name, text)
+        found = subprocess.run([self.shell, "-c", f"command -v {name}"], env=dict(PATH=path),
+                               capture_output=True, text=True, timeout=60).stdout.strip()
+        if found != os.path.join(path.split(os.pathsep)[0], name):
+            self.skipTest(f"this BusyBox's sh runs its own {name} before it searches the PATH ({found!r}), "
+                          f"so a stand-in {name} there never runs")
+        return path
+
+    def setUp(self):
+        super().setUp()
+        tools = self.mkdir("busybox")                   # BusyBox acts as the tool it is run as
+        names = subprocess.run([self.shell, "--list"], capture_output=True, text=True, check=True).stdout.split()
+        for name in names:
+            os.symlink(self.shell, os.path.join(tools, name))
+        os.symlink(sys.executable, os.path.join(tools, "python3"))       # for lxdtop itself
+        self.shell = os.path.join(tools, "sh")
+        self.host_path = tools
 
 
 if __name__ == "__main__":
