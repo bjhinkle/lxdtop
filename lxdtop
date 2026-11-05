@@ -1881,6 +1881,28 @@ def draw_graph_panel(cv, y, x, h, w, mon, ui):
     put_parts(cv, y + h - 2, x + 2, parts, x + w - 2)
 
 
+def event_words(event, mon):
+    """What a line of the event panel says happened, in which style, and what it happened to, as parts.
+
+    An instance's event has its label from EVENT_LABELS and the instance's name as the table shows it.
+    LXD also announces a network's, a profile's or a storage pool's changes, and names the kind of
+    thing in the action, as in "network-updated". Such a line gets the label of the same change to an
+    instance ("config" for updated), then the kind, dim, and the name, not bright, so that it isn't
+    taken for an instance's.
+    """
+    if event["instance"]:
+        label, style = EVENT_LABELS.get(event["action"], (event["action"].replace("instance-", ""), "text"))
+        return label, style, [(mon.label(event["project"], event["name"])[:14].ljust(15), "bright")]
+    kind, _, change = event["action"].rpartition("-")
+    label, style = EVENT_LABELS.get("instance-" + change, (change, "text"))
+    # "config-updated" is the server's own config; "storage-pool" and "storage-volume" say pool and volume
+    kind = "server" if kind == "config" else kind.removeprefix("storage-").replace("-", " ")
+    name = event["name"][:14] + " "
+    if not kind:
+        return label, style, [(name.ljust(15), "text")]
+    return label, style, [(kind + " ", "dim"), (name.ljust(14 - len(kind)), "text")]
+
+
 def draw_events_panel(cv, y, x, h, w, mon):
     feed, status = mon.events.snapshot() if mon.events else ([], "off")
     if len(status) > w - 20:                         # too long to fit beside the title: shorten the error's name
@@ -1895,14 +1917,12 @@ def draw_events_panel(cv, y, x, h, w, mon):
         return
     now = time.time()
     for i, event in enumerate(feed[:h - 2]):
-        label, style = EVENT_LABELS.get(event["action"], (event["action"].replace("instance-", ""), "text"))
+        label, style, what = event_words(event, mon)
         age = now - event["t"]
         clock_style = "bright" if age < 300 else "text" if age < 3600 else "dim"
         pos = put_parts(cv, y + 1 + i, ix, [
             (time.strftime("%H:%M:%S", time.localtime(event["t"])), clock_style),
-            ("  " + label[:9].ljust(10), style),
-            ((mon.label(event["project"], event["name"]) if event["instance"] else event["name"])[:14].ljust(15),
-             "bright")], right)
+            ("  " + label[:9].ljust(10), style)] + what, right)
         count = f"{G['times']}{event['count']}" if event["count"] > 1 else ""
         tail = " ".join(part for part in (event["detail"], event["user"]) if part)
         cv.put(y + 1 + i, pos, tail, "dim", right - len(count) - 1 if count else right)
@@ -2574,7 +2594,10 @@ def reading_json(mon, interval):
                      for serious, _, text, cg in warnings(mon)],
         "events": {
             "status": events_status,
-            "feed": [dict(time=iso_utc(event["t"]), action=event["action"], instance=event["name"] or None,
+            # instance: an instance's event's; subject: any other's, a network's, say, as its action names
+            "feed": [dict(time=iso_utc(event["t"]), action=event["action"],
+                          instance=(event["name"] or None) if event["instance"] else None,
+                          subject=None if event["instance"] else event["name"] or None,
                           project=event["project"] or None, detail=event["detail"] or None,
                           user=event["user"] or None, count=event["count"])
                      for event in feed],

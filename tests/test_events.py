@@ -481,5 +481,59 @@ class RecordTest(unittest.TestCase):
                     self.assertIsInstance(entry[key], str, key)
                 lxdtop.draw_events_panel(lxdtop.TextCanvas(14, 54), 0, 0, 14, 54, monitor(events=events))
 
+
+def lifecycle(action, source, project="default", **named):
+    """An event as LXD 5.21 and 6 send it: an instance's has its name and project in its metadata too, and
+    another kind's has them only in its source and the event (lxd/lifecycle/ in LXD's source). A storage
+    pool belongs to no project, and LXD sends its events with none."""
+    return dict(type="lifecycle", project=project, metadata=dict(action=action, source=source,
+                                                                 requestor=dict(username="admin"), **named))
+
+
+class OtherKindsTest(unittest.TestCase):
+    """#16: a network's, a profile's or a storage pool's events showed like an instance's, and the JSON
+    gave a network's name as the instance's."""
+
+    def setUp(self):
+        self.events = lxdtop.LxdEvents("/unused")
+        for event in (lifecycle("network-updated", "/1.0/networks/lxdbr0"),
+                      lifecycle("profile-updated", "/1.0/profiles/api"),           # a profile with an instance's name
+                      lifecycle("storage-pool-created", "/1.0/storage-pools/fast", project=""),
+                      lifecycle("instance-started", "/1.0/instances/api", name="api", project="default")):
+            self.events._record(event)
+
+    def panel(self):
+        canvas = lxdtop.TextCanvas(14, 54)
+        lxdtop.draw_events_panel(canvas, 0, 0, 14, 54, monitor(events=self.events))
+        return canvas
+
+    def test_the_panel_says_what_kind_they_are(self):
+        lines = [line[10:].rstrip("│ ") for line in self.panel().text().splitlines()[1:5]]    # after the time
+        self.assertEqual(lines, ["  started   api            admin",       # newest first
+                                 "  created   pool fast      admin",
+                                 "  config    profile api    admin",
+                                 "  config    network lxdbr0 admin"])
+
+    def test_only_an_instances_name_looks_like_one(self):
+        cells = self.panel().cells
+        self.assertEqual({style for _, style in cells[1][22:25]}, {"bright"})          # the instance api
+        self.assertEqual({style for _, style in cells[3][22:29]}, {"dim"})             # "profile "
+        self.assertEqual({style for _, style in cells[3][30:33]}, {"text"})            # its name, api
+
+    def test_the_json_gives_an_instance_only_for_an_instances_event(self):
+        feed = lxdtop.reading_json(monitor(events=self.events), 2)["events"]["feed"]
+        self.assertEqual([(e["action"], e["instance"], e["subject"], e["project"]) for e in feed], [
+            ("instance-started", "api", None, "default"),
+            ("storage-pool-created", None, "fast", None),
+            ("profile-updated", None, "api", "default"),
+            ("network-updated", None, "lxdbr0", "default")])
+
+    def test_a_kind_without_a_name_or_an_action_without_a_kind(self):
+        self.events._record(lifecycle("config-updated", "/1.0", project=""))        # the server's own config
+        self.events._record(lifecycle("odd", "/1.0/odd/x"))
+        lines = [line[10:].rstrip("│ ") for line in self.panel().text().splitlines()[1:3]]
+        self.assertEqual(lines, ["  odd       x              admin", "  config    server         admin"])
+
+
 if __name__ == "__main__":
     unittest.main()
