@@ -1,5 +1,6 @@
 """contrib/lxdtop-remote, run with a stand-in ssh (tests/fake_ssh.py) instead of a real host."""
 
+import hashlib
 import json
 import os
 import shutil
@@ -9,9 +10,10 @@ import sys
 import tempfile
 import unittest
 
-from tests.support import LXDTOP_PATH, REMOTE_PATH, ROOT
+from tests.support import LXDTOP_PATH, REMOTE_PATH, ROOT, lxdtop
 
 FAKE_SSH = os.path.join(ROOT, "tests", "fake_ssh.py")
+SH = shutil.which("sh")
 
 STUB_LXDTOP = """#!/bin/sh
 # Stands in for lxdtop on the host: write down how it was started.
@@ -19,8 +21,10 @@ STUB_LXDTOP = """#!/bin/sh
 """
 
 
-@unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
-class RemoteTest(unittest.TestCase):
+@unittest.skipUnless(SH, "needs a POSIX shell")
+class RemoteCase(unittest.TestCase):
+    """This machine (a $HOME and a PATH with the fake ssh on it) and the LXD host's home directory."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="lxdtop-remote-")
         self.addCleanup(tmp.cleanup)
@@ -50,7 +54,7 @@ class RemoteTest(unittest.TestCase):
         environ = dict(PATH=self.bin + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"), HOME=self.home,
                        FAKE_SSH_LOG=self.log, FAKE_SSH_REMOTE_HOME=self.remote_home, LANG="C.UTF-8")
         environ.update(env)
-        return subprocess.run(["sh", REMOTE_PATH, *args], input=stdin, capture_output=True, text=True,
+        return subprocess.run([SH, REMOTE_PATH, *args], input=stdin, capture_output=True, text=True,
                               env=environ, timeout=60)
 
     def ssh_runs(self):
@@ -67,6 +71,8 @@ class RemoteTest(unittest.TestCase):
         with open(os.path.join(self.remote_home, "lxdtop-ran")) as f:
             return f.read().splitlines()
 
+
+class RemoteTest(RemoteCase):
     def test_runs_lxdtop_on_the_host_with_its_options(self):
         result = self.remote("me@lxdhost", "--ascii", "--interval", "5")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -122,21 +128,6 @@ class RemoteTest(unittest.TestCase):
         self.assertEqual(result.returncode, 127)
         self.assertIn("lxdtop is not in ~/bin or on the PATH of", result.stderr)
 
-    def test_install_copies_lxdtop_and_shows_its_version(self):
-        result = self.remote("install", "me@lxdhost")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        installed = os.path.join(self.remote_home, "bin", "lxdtop")
-        with open(installed, "rb") as copy, open(LXDTOP_PATH, "rb") as original:
-            self.assertEqual(copy.read(), original.read())
-        self.assertEqual(stat.S_IMODE(os.stat(installed).st_mode), 0o755)
-        self.assertIn("lxdtop 1.5.0", result.stdout)
-        self.assertEqual(len(self.connections()), 1)           # one connection, one login
-
-    def test_install_needs_a_host(self):
-        result = self.remote("install")
-        self.assertEqual(result.returncode, 2)
-        self.assertEqual(self.ssh_runs(), [])
-
     def test_asks_for_a_username_once_and_remembers_it(self):
         first = self.remote("lxdhost", stdin="alice\n")
         self.assertIn("username on lxdhost: ", first.stderr)
@@ -180,6 +171,185 @@ class RemoteTest(unittest.TestCase):
                 self.assertFalse(os.path.exists(marker) or os.path.exists(marker + "@lxdhost"))
                 for run in self.ssh_runs():
                     self.assertNotIn("-o", [name for name, _ in run["options"]], run["argv"])
+
+
+with open(LXDTOP_PATH, "rb") as _f:
+    SHA256 = hashlib.sha256(_f.read()).hexdigest()
+
+SHASUM = f'''#!{sys.executable}
+"""Stands in for macOS's shasum: SHA-1 unless -a names another, and "<digest>  -" for its standard input."""
+import hashlib, sys
+algorithm = sys.argv[2] if sys.argv[1:2] == ["-a"] else "1"
+print(hashlib.new("sha" + algorithm, sys.stdin.buffer.read()).hexdigest() + "  -")
+'''
+
+
+class InstallTest(RemoteCase):
+    """`install` checks the copy as ~/bin/lxdtop.new on the host, then renames it over ~/bin/lxdtop.
+
+    SECURITY-REVIEW.md N-7: it used to write straight over ~/bin/lxdtop, so a
+    connection cut partway left a broken file there, which the console service
+    then restarted every 3 seconds, and a symlink there was written through.
+    Now ~/bin/lxdtop is either the old file, exactly as it was, or the whole new
+    one, checked.
+    """
+
+    login_shell = "dash"                    # on the host; BashInstallTest runs these again with bash
+
+    def setUp(self):
+        super().setUp()
+        if not shutil.which(self.login_shell):
+            self.skipTest(f"needs {self.login_shell}")
+        self.installed = os.path.join(self.remote_home, "bin", "lxdtop")     # the old copy: STUB_LXDTOP
+        self.new = self.installed + ".new"
+
+    def install(self, **env):
+        return self.remote("install", "me@lxdhost", FAKE_SSH_LOGIN_SHELL=self.login_shell, **env)
+
+    def state(self, path=None):
+        """What a failed install must leave exactly as it was: the file or symlink at path, and what it holds."""
+        path = path or self.installed
+        st = os.lstat(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        return dict(inode=st.st_ino, mode=st.st_mode, mtime=st.st_mtime_ns, ctime=st.st_ctime_ns, data=data,
+                    link=os.readlink(path) if stat.S_ISLNK(st.st_mode) else None)
+
+    def assert_new_copy(self):
+        with open(self.installed, "rb") as copy, open(LXDTOP_PATH, "rb") as original:
+            self.assertEqual(copy.read(), original.read())
+        self.assertFalse(os.path.lexists(self.new))
+
+    def assert_refused(self, result, old, says, status=1):
+        self.assertEqual(self.state(), old)                 # ~/bin/lxdtop exactly as it was
+        self.assertFalse(os.path.lexists(self.new))         # and nothing left beside it
+        self.assertEqual(result.returncode, status, result.stderr)
+        self.assertIn(says, result.stderr)
+        self.assertNotIn("installed", result.stdout)
+
+    def test_install_checks_the_copy_then_renames_it_into_place(self):
+        old = self.state()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[1:], [f"installed lxdtop {lxdtop.VERSION}",
+                                                          f"SHA-256 {SHA256}, checked on the host"])
+        self.assert_new_copy()
+        new = os.lstat(self.installed)
+        self.assertTrue(stat.S_ISREG(new.st_mode))
+        self.assertEqual(stat.S_IMODE(new.st_mode), 0o755)
+        self.assertNotEqual(new.st_ino, old["inode"])        # renamed into place, not written over the old one
+        self.assertEqual(len(self.connections()), 1)         # one connection, one login
+
+    def test_a_copy_cut_off_partway_leaves_the_old_one(self):
+        old = self.state()
+        size = os.path.getsize(LXDTOP_PATH)
+        for after in (0, 1000, size // 2, size - 1):
+            with self.subTest(after=after):
+                result = self.install(FAKE_SSH_DROP_AFTER=str(after))
+                self.assert_refused(result, old, "ssh failed before me@lxdhost confirmed the install; its "
+                                    "~/bin/lxdtop is unchanged unless the whole copy arrived", status=255)
+                self.assertIn("Broken pipe", result.stderr)              # what ssh says
+
+    def test_a_drop_after_the_whole_copy_arrived_installs_it_whole(self):
+        """The host can't tell this drop from the copy's normal end: it checks the copy and installs it."""
+        result = self.install(FAKE_SSH_DROP_AFTER=str(os.path.getsize(LXDTOP_PATH)))
+        self.assertEqual(result.returncode, 255)
+        self.assertIn("unless the whole copy arrived and passed its checks", result.stderr)
+        self.assert_new_copy()
+
+    def test_a_copy_that_arrives_damaged_leaves_the_old_one(self):
+        old = self.state()
+        result = self.install(FAKE_SSH_FLIP_BYTE="5000")
+        self.assert_refused(result, old, "the copy that arrived is incomplete or damaged: its SHA-256 is ")
+        self.assertIn(f", not {SHA256}; ~/bin/lxdtop was not changed", result.stderr)
+
+    def test_a_file_that_does_not_run_leaves_the_old_one(self):
+        with open(LXDTOP_PATH) as f:
+            conflict = f.read().replace("\ndef main():", "\n<<<<<<< HEAD\ndef main():")   # a merge left half done
+        cases = [
+            ("conflict", conflict, "the copy does not run: its --version exited with status 1"),
+            ("no python", "#!/usr/bin/env python3.0\n", "the copy does not run: its --version exited with status 127"),
+            ("not lxdtop", "#!/bin/sh\necho 'top 4.0'\n", 'the copy is not lxdtop: its --version printed "top 4.0"'),
+        ]
+        old = self.state()
+        for name, text, says in cases:
+            with self.subTest(name):
+                path = os.path.join(self.dir, name)
+                self.write(path, text)
+                self.assert_refused(self.install(LXDTOP=path), old, says)
+
+    def test_a_symlink_at_bin_lxdtop_is_replaced_not_written_through(self):
+        target = os.path.join(self.remote_home, "src", "lxdtop", "lxdtop")        # say, a clone on the host
+        self.write(target, STUB_LXDTOP, 0o755)
+        os.remove(self.installed)
+        os.symlink(target, self.installed)
+        link, pointed_to = self.state(), self.state(target)
+        self.assert_refused(self.install(FAKE_SSH_FLIP_BYTE="5000"), link, "incomplete or damaged")
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(os.path.islink(self.installed))
+        self.assert_new_copy()
+        self.assertEqual(self.state(target), pointed_to)
+
+    def test_anything_left_at_lxdtop_new_is_replaced_not_written_through(self):
+        notes = os.path.join(self.remote_home, "notes.txt")
+        self.write(notes, "keep me\n")
+        os.symlink(notes, self.new)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_new_copy()
+        with open(notes) as f:
+            self.assertEqual(f.read(), "keep me\n")
+
+    def test_a_directory_at_bin_lxdtop_is_left_alone(self):
+        os.remove(self.installed)
+        os.mkdir(self.installed)
+        result = self.install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("can not replace ~/bin/lxdtop: it is a directory, or a link to one", result.stderr)
+        self.assertEqual(os.listdir(self.installed), [])            # mv would have moved the copy into it
+        self.assertFalse(os.path.lexists(self.new))
+
+    def test_the_first_install_makes_bin(self):
+        shutil.rmtree(os.path.join(self.remote_home, "bin"))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_new_copy()
+
+    def only(self, name, *tools):
+        """A PATH with just the fake ssh, dirname and these tools on it, as a computer without the rest."""
+        path = self.mkdir(name)
+        os.symlink(os.path.join(self.bin, "ssh"), os.path.join(path, "ssh"))
+        os.symlink(shutil.which("dirname"), os.path.join(path, "dirname"))
+        for tool, text in tools:
+            self.write(os.path.join(path, tool), text, 0o755)
+        return path
+
+    def test_on_a_mac_shasum_works_out_the_sha256(self):
+        mac = self.only("mac", ("shasum", SHASUM))                      # macOS has no sha256sum
+        result = self.install(PATH=mac, FAKE_SSH_REMOTE_PATH=os.environ.get("PATH", "/usr/bin:/bin"))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"SHA-256 {SHA256}, checked on the host", result.stdout)
+        self.assert_new_copy()
+
+    def test_without_sha256sum_or_shasum_nothing_is_sent(self):
+        old = self.state()
+        result = self.install(PATH=self.only("bare"))
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("can't work out the SHA-256 of", result.stderr)
+        self.assertEqual(self.ssh_runs(), [])
+        self.assertEqual(self.state(), old)
+
+    def test_install_needs_a_host(self):
+        result = self.remote("install")
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.ssh_runs(), [])
+
+
+class BashInstallTest(InstallTest):
+    """The same, with bash as the login shell on the host."""
+
+    login_shell = "bash"
 
 
 if __name__ == "__main__":
