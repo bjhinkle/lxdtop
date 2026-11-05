@@ -251,6 +251,31 @@ class DetailViewTest(unittest.TestCase):
         keys(mon, ui, ENTER)
         return ui, draw(mon, ui, width, height).text()
 
+    def test_a_short_window_cuts_the_page_to_fit_inside_its_box(self):
+        # The page takes 15 rows inside its box, so a window under 18 rows can't show it all.
+        mon = monitor(rows("web"))
+        for width, height in itertools.product((70, 80), range(12, 21)):
+            _, text = self.open(mon, "web", width, height)
+            lines = text.splitlines()
+            where = f"{width}x{height}"
+            self.assertEqual(len(lines), height, where)
+            self.assertTrue(lines[-1].startswith("╰─┘Esc back└─┘q back└─┘? keys└"), f"{where}: {lines[-1]}")
+            last = lines[-2].strip("│ ")                             # the last row inside the box
+            if height < 18:
+                self.assertEqual(last, "… the rest needs a window 18 rows tall", where)
+            else:
+                self.assertTrue(last.startswith("events") or last == "", f"{where}: {last}")
+                self.assertIn("events", text)
+        with glyphs(lxdtop.GLYPHS_ASCII):
+            ui = lxdtop.new_ui(2)
+            ui.view, ui.detail = "detail", "web"
+            canvas = lxdtop.TextCanvas(12, 70)
+            with mock.patch.object(lxdtop.socket, "gethostname", return_value="lxdhost"):
+                lxdtop.draw(canvas, mon, ui)
+        lines = canvas.text().splitlines()
+        self.assertTrue(lines[-1].startswith("+-[Esc back]-[q back]-[? keys]"), lines[-1])
+        self.assertEqual(lines[-2].strip("| "), "~ the rest needs a window 18 rows tall")
+
     def test_a_container_with_everything_lxdtop_has(self):
         web = row("web", cpu_max=2.0, throttled=45.0, mem_max=4096 * MiB, tasks_max=500, waiting=("mem", 34.0),
                   snapshot=time.time() - 3 * 3600)
