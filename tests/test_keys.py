@@ -349,6 +349,14 @@ class HelpViewTest(unittest.TestCase):
                 self.assertIn(description, text)                     # nothing cut short
             self.assertEqual(text.isascii(), ascii)
 
+    def test_every_sort_is_listed_whole_even_at_70x12(self):
+        ui = lxdtop.new_ui(2)
+        ui.view = "help"
+        description = next(text for _, _, text, action in lxdtop.KEYS if action == "sort")
+        self.assertTrue(description.endswith(", ".join(lxdtop.SORTS)), description)
+        for width, height in ((70, 12), (80, 24)):
+            self.assertRegex(draw(monitor(rows("web")), ui, width, height).text(), rf"s +{re.escape(description)} +│")
+
 
 class HelpTabTest(unittest.TestCase):
     """The "? keys" tab in the table's bottom edge: after the other keys, where it fits."""
