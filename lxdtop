@@ -17,10 +17,12 @@ CPU, memory and network; CPU use stacked by instance beside a live feed of
 LXD events; then one row per container or VM.
 
 Everything it does is read-only. Each refresh it reads:
-    /sys/fs/cgroup/lxc.payload.<name>/      CPU, memory and task counters per container
+    /sys/fs/cgroup/lxc.payload.<name>/      CPU, memory and task counters per container, and its
+                                            limits, stalls (*.pressure) and memory kills
     /proc/<pid>/stat, /proc/<pid>/cgroup    the busiest process inside each container,
                                             and each VM's QEMU process (CPU, memory)
     /proc/spl/kstat/zfs/<pool>/objset-*     disk reads and writes per instance (ZFS)
+    /proc/spl/kstat/zfs/<pool>/state        each ZFS pool's health (ONLINE, DEGRADED, ...)
     /sys/class/net/<nic>/statistics/        network bytes per instance (veth/tap) and host port
     /proc/stat, /proc/meminfo, hwmon, ...   host totals, temperature, clock speed
 It also talks to LXD over its local socket, GET requests and an event stream

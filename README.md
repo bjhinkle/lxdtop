@@ -8,13 +8,43 @@ lxdtop is a single Python file that needs nothing beyond the standard library. I
 
 - **Status line**: LXD version, OS and kernel, a clock, and how many instances are running or stopped.
 - **CPU panel**: total use, a small bar per CPU thread, CPU temperature and clock speed, and the load average.
-- **Memory panel**: used memory, the ZFS cache (ARC) shown separately, free memory, swap, and storage pool and root disk usage.
+- **Memory panel**: used memory, the ZFS cache (ARC) shown separately, free memory, swap, and storage pool and root disk usage. A ZFS pool that isn't ONLINE shows its state there in red.
 - **Network panel**: traffic through the host's physical ports in Mb/s, with traffic in drawn upward and traffic out drawn downward, plus each port's rate, busiest first.
 - **CPU by instance**: a stacked graph of the last few minutes, one color for each of the busiest instances, then everything else and the host itself.
-- **LXD events**: a live feed of starts, stops, snapshots, `exec` sessions and file transfers. An event that repeats within 10 minutes stays on one line with a count.
-- **Instance table**: uptime, CPU, CPU history, the busiest process inside each container, memory, disk reads and writes, network in and out (Mb/s), task count and IPv4 address.
+- **LXD events**: a live feed of starts, stops, snapshots, `exec` sessions and file transfers. An event that repeats within 10 minutes stays on one line with a count. The panel's corner says `live`, or `reconnecting` with the name of the error it's recovering from, such as `reconnecting (TimeoutError)`.
+- **Instance table**: uptime, CPU, CPU history, the busiest process inside each container, memory, disk reads and writes, network in and out (Mb/s), task count and IPv4 address. Screens wider than 160 columns add the columns under [Warnings and wide screens](#warnings-and-wide-screens).
+- **Warnings**: when an instance is struggling rather than just busy, or a ZFS pool isn't ONLINE, a short line in the table's top edge says so, most serious first, for example `web1: memory kill 12m ago · tank DEGRADED`. The instance's marker (● or ■) turns red.
 
 It is laid out for a 160x45 screen, such as a small console monitor or a large terminal window, and adapts to smaller windows by dropping panels, then columns.
+
+## Warnings and wide screens
+
+Busy isn't the same as struggling: a container at 180% CPU may be fine, while one at 20% may be stuck behind its CPU limit or waiting on disk. lxdtop reads a few more counters from each container's cgroup to tell them apart.
+
+The warning line sits in the instance table's top edge, between its title and `sorted by`. It shows as many warnings as fit, most serious first, then `+N more`. Pools and memory kills are in red, the rest in yellow:
+
+| Warning | What it means | When |
+|---|---|---|
+| `fast SUSPENDED` | A ZFS pool is down: FAULTED, SUSPENDED, UNAVAIL, OFFLINE or REMOVED | Always |
+| `web1: memory kill 12m ago` | The kernel killed a process in `web1` because it ran out of memory (an OOM kill). `2 memory kills, last 3m ago` when there were more | For an hour after it (`RECENT_KILL`), counting only kills since lxdtop started |
+| `tank DEGRADED` | A ZFS pool has lost redundancy but still works | Always |
+| `db: waiting on mem 42%` | Some of `db`'s tasks were stalled waiting for memory (or `cpu`, or `io` for disk) during 42% of the last 10 seconds: Linux pressure stall information, "some avg10" | From 25% (`PRESSURE_PCT`) |
+| `web1: throttled 45% @2c` | `web1` hit its CPU limit of 2 cores in 45% of the limit's 100 ms periods during the last interval, so it had to wait | From 20% (`THROTTLED_PCT`) |
+
+On screens wider than 160 columns, the table adds these columns after IPV4, in this order as space allows. Up to 160 columns the table is unchanged.
+
+| Column | Shows | From |
+|---|---|---|
+| THROTTLED | `45% @2c`: the share of its CPU limit's periods in the last interval in which it was held back, then the limit in cores. Yellow from 20%. `-` means no CPU limit | `cpu.stat` (`nr_periods`, `nr_throttled`) and `cpu.max` |
+| MEM/LIMIT | `62% of 4.0G`: MEM as a share of its memory limit. Yellow from 90% (`NEAR_LIMIT_PCT`). `-` means no limit | `memory.max` |
+| WAITING | `mem 34%`: the worst of its CPU, memory and disk stalls, as in the warning. Red from 25%. `-` below 1% | `cpu.pressure`, `memory.pressure`, `io.pressure` |
+| MEM KILLS | `2 12m ago`: processes the kernel has killed for memory since lxdtop started, and how long ago the last was. Red for an hour. `-` means none | `memory.events` (`oom_kill`) |
+| PROCS/LIMIT | `96% of 500`: TASKS as a share of its process limit. Yellow from 90%. `-` means no limit | `pids.max` |
+| LAST SNAP | `3h`: how old its newest snapshot is, or `never` | LXD's API: `GET /1.0/instances?recursion=2` already includes each instance's snapshots |
+
+These come from a running container's cgroup, so stopped instances and VMs leave them empty (a VM's limits are inside its guest). LAST SNAP and MEM KILLS still show for a stopped container. A file the kernel doesn't provide, or a feature it has turned off (such as pressure stall information with `psi=0`), leaves its cell empty too.
+
+Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
 ## Requirements
 
@@ -81,7 +111,9 @@ Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time
 | Disk reads and writes | ZFS per-dataset counters (`/proc/spl/kstat/zfs/<pool>/objset-*`), which include reads served from cache; cgroup `io.stat` on other storage |
 | Network in and out | Host-side veth and tap interface counters, in megabits per second |
 | Host panels | `/proc/stat`, `/proc/meminfo`, ZFS `arcstats`, hwmon temperature, cpufreq and physical port counters |
-| Names, addresses, stopped instances, versions and pool usage | LXD's REST API over its local socket every 15 seconds (GET requests only) |
+| Throttling, limits, stalls and memory kills | The container's cgroup: `cpu.stat`, `cpu.max`, `memory.max`, `pids.max`, `memory.events` and the three `*.pressure` files |
+| ZFS pool health | `/proc/spl/kstat/zfs/<pool>/state`, beside the objset counters |
+| Names, addresses, stopped instances, snapshots, versions and pool usage | LXD's REST API over its local socket every 15 seconds (GET requests only) |
 | Event feed | LXD's lifecycle event stream, a websocket on the same socket |
 
 Network traffic is shown in bits per second and data in bytes: bandwidth is in bits, data is in bytes.
