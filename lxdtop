@@ -599,8 +599,8 @@ class LxdEvents:
                 self._listen(sock)
             except PermissionError:
                 self.status = "no access"
-            except Exception:                        # whatever went wrong, try again in 5 seconds
-                self.status = "reconnecting"
+            except Exception as err:                 # whatever went wrong, try again in 5 seconds
+                self.status = f"reconnecting ({type(err).__name__})"     # named, like the API footer's errors
             finally:
                 sock.close()
             time.sleep(5)
@@ -1293,6 +1293,8 @@ def draw_graph_panel(cv, y, x, h, w, mon, ui):
 
 def draw_events_panel(cv, y, x, h, w, mon):
     feed, status = mon.events.snapshot() if mon.events else ([], "off")
+    if len(status) > w - 20:                         # too long to fit beside the title: shorten the error's name
+        status = status.replace("Error)", ")")
     box(cv, y, x, h, w, "b_events", title=[[("lxd events", "title")]],
         right=[[(status, "lo" if status == "live" else "mid")]])
     ix, right = x + 2, x + w - 2
