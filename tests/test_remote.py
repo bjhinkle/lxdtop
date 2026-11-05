@@ -129,7 +129,7 @@ class RemoteTest(unittest.TestCase):
         with open(installed, "rb") as copy, open(LXDTOP_PATH, "rb") as original:
             self.assertEqual(copy.read(), original.read())
         self.assertEqual(stat.S_IMODE(os.stat(installed).st_mode), 0o755)
-        self.assertIn("lxdtop 1.4.0", result.stdout)
+        self.assertIn("lxdtop 1.5.0", result.stdout)
         self.assertEqual(len(self.connections()), 1)           # one connection, one login
 
     def test_install_needs_a_host(self):
