@@ -1968,10 +1968,7 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
         return
     live = [row for row in rows if row["live"]]
     if shown is None or (shown >= len(live) and not fold):     # a row for every instance, as always
-        for i, row in enumerate(rows[:room]):
-            if i == room - 1 and len(rows) > room:
-                cv.put(y + 2 + i, ix, f"{G['more']} {len(rows) - i} more", "dim")
-                break
+        for i, row in enumerate(rows[:room]):                   # (fit_layout() left room for them all)
             draw_row(cv, y + 2 + i, ix, layout, row, mon, marked)
         return
     # A short screen (see fit_layout()): the top running instances in the sort order, "+N more"
