@@ -17,10 +17,12 @@ CPU, memory and network; CPU use stacked by instance beside a live feed of
 LXD events; then one row per container or VM.
 
 Everything it does is read-only. Each refresh it reads:
-    /sys/fs/cgroup/lxc.payload.<name>/      CPU, memory and task counters per container
+    /sys/fs/cgroup/lxc.payload.<name>/      CPU, memory and task counters per container, and its
+                                            limits, stalls (*.pressure) and memory kills
     /proc/<pid>/stat, /proc/<pid>/cgroup    the busiest process inside each container,
                                             and each VM's QEMU process (CPU, memory)
     /proc/spl/kstat/zfs/<pool>/objset-*     disk reads and writes per instance (ZFS)
+    /proc/spl/kstat/zfs/<pool>/state        each ZFS pool's health (ONLINE, DEGRADED, ...)
     /sys/class/net/<nic>/statistics/        network bytes per instance (veth/tap) and host port
     /proc/stat, /proc/meminfo, hwmon, ...   host totals, temperature, clock speed
 It also talks to LXD over its local socket, GET requests and an event stream
@@ -37,6 +39,7 @@ import argparse
 import base64
 import collections
 import curses
+import datetime
 import glob
 import http.client
 import json
@@ -46,6 +49,7 @@ import socket
 import threading
 import time
 import types
+import unicodedata
 import urllib.parse
 
 VERSION = "1.4.0 (2026-10-01)"
@@ -54,12 +58,26 @@ CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
 ZFS_KSTAT_GLOB = "/proc/spl/kstat/zfs/*/objset-*"
 ZFS_ARCSTATS = "/proc/spl/kstat/zfs/arcstats"
+ZFS_STATE_GLOB = "/proc/spl/kstat/zfs/*/state"
 LXD_SOCKETS = ([os.path.join(os.environ["LXD_DIR"], "unix.socket")] if os.environ.get("LXD_DIR") else []) + [
     "/var/snap/lxd/common/lxd/unix.socket", "/var/lib/lxd/unix.socket"]
 API_EVERY = 15                     # seconds between LXD API refreshes
 EVENT_TIMEOUT = 60                 # seconds without a frame, pings included, before the event stream reconnects
 REPEAT_WINDOW = 600                # an event seen again within 10 minutes joins its earlier line
 CLOCK_TICKS = os.sysconf("SC_CLK_TCK")   # unit of the CPU times in /proc/<pid>/stat (100 a second)
+
+# When an instance is struggling, not just busy. Each of these puts a short warning in the top
+# edge of the instance table, most serious first, and marks the instance's row in red. A ZFS pool
+# that isn't ONLINE always does. The extra columns on screens wider than 160 use the same figures.
+THROTTLED_PCT = 20       # throttled: held back by its CPU limit in at least this % of the limit's
+                         # periods (100 ms each, by default) during the last reading interval
+PRESSURE_PCT = 25        # high pressure: some of its tasks were stalled waiting for CPU, memory or disk
+                         # at least this % of the last 10 seconds (the kernel's "some avg10" figure)
+RECENT_KILL = 3600       # a recent memory kill: the kernel killed one of its processes for memory
+                         # (oom_kill) less than this many seconds ago, counting kills since lxdtop started
+NEAR_LIMIT_PCT = 90      # near a limit: memory or processes at this % of their limit or more (shown in
+                         # yellow in the wide-screen columns; no warning)
+OPS_FROM = 160           # screens wider than this many columns get the extra columns (see OPS_COLUMNS)
 
 HISTORY = 900                      # samples kept per graph (30 min at 2 s)
 RATE_WINDOW = 4                    # disk and network rates average over the last 3 intervals
@@ -143,6 +161,7 @@ GLYPHS_ASCII = dict(full="#", mid="=", low="-", cell="#", cell_off=".", idle="."
                     tab_l="[", tab_r="]", foot_l="[", foot_r="]",
                     up="^", down="v", sorted="v", more="~", deg="", times="x")
 G = GLYPHS_UNICODE
+ONE_CELL = frozenset("".join(GLYPHS_UNICODE.values()) + "".join(map(chr, range(32, 127))))   # glyphs, ASCII
 
 EVENT_LABELS = {
     "instance-started": ("started", "ev_start"),
@@ -226,6 +245,31 @@ def read_io_stat(path):
             elif key == "wbytes":
                 wr += int(value)
     return rd, wr
+
+
+def read_cgroup_limits(path):
+    """An instance's limits, and how long its tasks waited, from its cgroup (v2) directory.
+
+    cpu.max is "<quota> <period>" in microseconds, so quota / period is its CPU limit in
+    cores, or "max <period>" for none. memory.max and pids.max are a number or "max". Each
+    *.pressure file says what share of the recent past some of its tasks spent stalled,
+    waiting for that resource; "some avg10" covers the last 10 seconds. A file that is
+    missing, or that the kernel has turned off, leaves its reading out (None).
+    """
+    quota, _, period = (read(path + "/cpu.max") or "").strip().partition(" ")
+    waiting = {}
+    for resource, label in (("cpu", "cpu"), ("memory", "mem"), ("io", "io")):
+        for line in (read(f"{path}/{resource}.pressure") or "").splitlines():
+            if line.startswith("some "):                     # "some avg10=12.34 avg60=... total=..."
+                waiting[label] = float(line.split()[1].partition("=")[2])
+    return dict(cpu_max=int(quota) / int(period) if quota.isdigit() and period.isdigit() else None,
+                mem_max=read_int(path + "/memory.max"), tasks_max=read_int(path + "/pids.max"),
+                waiting=max(waiting.items(), key=lambda item: item[1], default=None))   # the worst one
+
+
+def read_zpool_states():
+    """Each ZFS pool's health, the way `zpool status` says it: ONLINE, DEGRADED, FAULTED, ..."""
+    return {path.split("/")[-2]: (read(path) or "").strip() for path in glob.glob(ZFS_STATE_GLOB)}
 
 
 def find_zfs_datasets(roots=None, own=None):
@@ -380,7 +424,8 @@ def new_row(cg, inst, **fields):
     """One table row; fields not given stay empty until a reading fills them."""
     row = dict(cg=cg, name=inst.get("name", cg), state=inst.get("status", "Running"), live=True,
                vm=False, ip=inst.get("ipv4", ""), mem=None, tasks=None, top=None, up=None,
-               cpu=None, rd=None, wr=None, net_in=None, net_out=None)
+               cpu=None, rd=None, wr=None, net_in=None, net_out=None, snapshot=inst.get("snapshot"),
+               throttled=None, cpu_max=None, mem_max=None, tasks_max=None, waiting=None)
     row.update(fields)
     return row
 
@@ -457,6 +502,17 @@ class ProcessTable:
 
 # --- LXD's API and event stream -------------------------------------------------
 
+def parse_time(text):
+    """Seconds since 1970 from a time as LXD writes it, e.g. 2026-11-04T09:00:05.123456789Z or
+    2021-03-23T20:00:00-04:00. None if it isn't one."""
+    try:
+        zone = text[19:].lstrip(".0123456789")             # after the seconds: a fraction, then the zone
+        when = datetime.datetime.fromisoformat(text[:19] + ("+00:00" if zone in ("", "Z") else zone))
+        return when.timestamp()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
 class UnixHTTPConnection(http.client.HTTPConnection):
     """Plain HTTP, but over LXD's local unix socket instead of a TCP port."""
 
@@ -517,8 +573,10 @@ class LxdApi:
                 for addr in nic.get("addresses") or []:
                     if not ipv4 and addr.get("family") == "inet" and addr.get("scope") == "global":
                         ipv4 = addr.get("address", "")
+            taken = [parse_time(snap.get("created_at")) for snap in inst.get("snapshots") or []]
             found[cg] = dict(name=inst["name"], status=inst.get("status", "?"), veths=veths, ipv4=ipv4,
-                             type=inst.get("type", "container"), pid=(inst.get("state") or {}).get("pid"))
+                             type=inst.get("type", "container"), pid=(inst.get("state") or {}).get("pid"),
+                             snapshot=max(filter(None, taken), default=None))   # when the newest was taken
         return found
 
     def fetch_server(self):
@@ -597,8 +655,8 @@ class LxdEvents:
                 self._listen(sock)
             except PermissionError:
                 self.status = "no access"
-            except Exception:                        # whatever went wrong, try again in 5 seconds
-                self.status = "reconnecting"
+            except Exception as err:                 # whatever went wrong, try again in 5 seconds
+                self.status = f"reconnecting ({type(err).__name__})"     # named, like the API footer's errors
             finally:
                 sock.close()
             time.sleep(5)
@@ -702,6 +760,7 @@ class Monitor:
         self.nics, self.nics_checked, self.prev_nics = [], 0.0, {}
         self.prev_cpu = None
         self.asked = set()             # new containers we've already asked LXD about
+        self.kills = {}                # container -> (its oom_kill count, kills seen since start, when the last was)
         self.series_style = {}         # container -> graph color, kept steady between frames
         self.temp_file = find_cpu_temp_sensor()
         self.freq_files = glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq/scaling_cur_freq")
@@ -747,7 +806,7 @@ class Monitor:
             mem_used=max(0, mem["MemTotal"] - mem["MemAvailable"] - arc),
             swap_total=mem["SwapTotal"], swap_used=mem["SwapTotal"] - mem["SwapFree"],
             root_total=root_total, root_used=root_used,
-            load=(read("/proc/loadavg") or "0 0 0").split()[:3], uptime=uptime)
+            load=(read("/proc/loadavg") or "0 0 0").split()[:3], uptime=uptime, zpools=read_zpool_states())
 
     def sample_network(self, now):
         if now - self.nics_checked > 60:
@@ -772,7 +831,8 @@ class Monitor:
         rows, readings = [], {}
         for path in sorted(glob.glob(CGROUP_GLOB)):
             cg = os.path.basename(path)[len(CGROUP_PREFIX):]
-            cpu_usec = read_fields(path + "/cpu.stat", ("usage_usec",)).get("usage_usec")
+            cpu = read_fields(path + "/cpu.stat", ("usage_usec", "nr_periods", "nr_throttled"))
+            cpu_usec = cpu.get("usage_usec")
             if cpu_usec is None:
                 continue                          # it stopped between listing and reading
             inst = instances.get(cg, {})
@@ -788,8 +848,11 @@ class Monitor:
             row = new_row(cg, inst, mem=max(0, current - inactive), tasks=read_int(path + "/pids.current"),
                           top=self.procs.top.get(cg),
                           up=uptime - started / CLOCK_TICKS if started is not None else None)
+            row.update(read_cgroup_limits(path))
+            self.count_kills(cg, read_fields(path + "/memory.events", ("oom_kill",)).get("oom_kill"), now)
             disk, disk_src = self.read_disk(cg, path)
-            self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings)
+            self.measure(row, now, cpu_usec, disk, disk_src, read_net(inst.get("veths", ())), readings,
+                         periods=(cpu.get("nr_periods"), cpu.get("nr_throttled")))
             rows.append(row)
 
         # VMs have no container cgroup: LXD runs each one as a QEMU process on the
@@ -813,6 +876,9 @@ class Monitor:
         for cg in list(self.cpu_history):
             if cg not in readings:
                 del self.cpu_history[cg]
+        for cg, (_, _, when) in list(self.kills.items()):
+            if cg not in readings and (when is None or now - when >= RECENT_KILL):
+                del self.kills[cg]            # gone, with no recent kill to remember it by
         self.past, self.rows = readings, rows
 
         if self.host.get("cpu") is not None:
@@ -833,7 +899,17 @@ class Monitor:
             return read_io_stat(cgroup_path + "/io.stat"), "io"
         return None, None
 
-    def measure(self, row, now, cpu_usec, disk, disk_src, net, readings):
+    def count_kills(self, cg, total, now):
+        """Keep count of the memory kills seen since lxdtop started, and when the latest was seen."""
+        if total is None:
+            return
+        seen, count, when = self.kills.get(cg, (total, 0, None))      # kills before lxdtop started don't count
+        added = total - seen if total >= seen else total              # the count starts again on a restart
+        if added:
+            count, when = count + added, now
+        self.kills[cg] = (total, count, when)
+
+    def measure(self, row, now, cpu_usec, disk, disk_src, net, readings, periods=None):
         """Work out rates against this instance's recent readings, then keep this one."""
         cg = row["cg"]
         past = self.past.get(cg) or collections.deque(maxlen=RATE_WINDOW)
@@ -850,7 +926,11 @@ class Monitor:
             if net and oldest["net"]:
                 row["net_in"] = rate(net[0], oldest["net"][0], secs)
                 row["net_out"] = rate(net[1], oldest["net"][1], secs)
-        past.append(dict(t=now, cpu=cpu_usec, disk=disk, disk_src=disk_src, net=net))
+            if periods and None not in periods and last.get("periods"):
+                # Of its CPU limit's periods in the last interval, the share in which it was held back.
+                ran, held = periods[0] - last["periods"][0], periods[1] - last["periods"][1]
+                row["throttled"] = min(100.0, max(0, held) / ran * 100) if ran > 0 else 0.0
+        past.append(dict(t=now, cpu=cpu_usec, disk=disk, disk_src=disk_src, net=net, periods=periods))
         readings[cg] = past
         self.cpu_history.setdefault(cg, collections.deque(maxlen=HISTORY)).append(row["cpu"])
 
@@ -884,6 +964,12 @@ class Canvas:
         """Write text at (y, x), stopping at column `right`. Returns the column after it."""
         if not text.isprintable():           # names from inside containers can hold escape sequences
             text = "".join(ch if ch.isprintable() else "?" for ch in text)
+        if not text.isascii() and not ONE_CELL.issuperset(text):
+            # Each character gets one cell, but a wide one (CJK, emoji) takes two on most terminals and a
+            # combining one none, which would shift the rest of the line: those become "?" too.
+            text = "".join("?" if unicodedata.east_asian_width(ch) in ("W", "F")
+                           or unicodedata.category(ch) in ("Mn", "Me") else ch
+                           for ch in unicodedata.normalize("NFC", text))
         end = x + len(text)
         right = self.w if right is None else min(right, self.w)
         if 0 <= y < self.h and text and x < right:
@@ -1002,6 +1088,11 @@ def human(n):
     if unit == "B":
         return f"{value:.0f}B"
     return f"{value:.1f}{unit}" if value < 10 else f"{value:.0f}{unit}"
+
+
+def fmt_count(n):
+    """A count in about 4 characters: 500, 9999, 42k, 4.2M."""
+    return str(n) if n < 10_000 else f"{n / 1000:.0f}k" if n < 1_000_000 else f"{n / 1_000_000:.1f}M"
 
 
 def fmt_pct(value):
@@ -1184,14 +1275,21 @@ def draw_mem_panel(cv, y, x, h, w, mon):
         put_cells(cv, row, ix + 6, meter_cells(meter_w, value, scale, lambda _, s=style: s))
         cv.put(row, ix + 6 + meter_w, human(value).rjust(6), style)
         cv.put(row, ix + 12 + meter_w, f"{value / scale * 100:4.0f}%", "text")
-    # Bottom row: storage pools from LXD, then the root filesystem.
-    disks = list(mon.pools) + ([("root", host["root_used"], host["root_total"])] if host.get("root_total") else [])
+    # Bottom row: storage pools from LXD, then the root filesystem. A ZFS pool that isn't ONLINE
+    # shows its state in red: after the LXD pool of the same name, or on its own before root.
+    sick = {pool: state for pool, state in host.get("zpools", {}).items() if state != "ONLINE"}
+    disks = list(mon.pools) + [(pool, None, None) for pool in sorted(sick) if pool not in {p[0] for p in mon.pools}]
+    disks += [("root", host["root_used"], host["root_total"])] if host.get("root_total") else []
     pos = ix
     for name, used, size in disks:
-        share = used / size * 100 if size else 0
-        pos = put_parts(cv, y + h - 2, pos, [
-            (name + " ", "text"), (human(used), "bright"), ("/" + human(size), "dim"),
-            (f" {share:.0f}%", "mid" if share >= 80 else "dim"), ("   ", "dim")], ix + iw)
+        parts = [(name + " ", "hi" if name in sick else "text")]
+        if size is not None:
+            share = used / size * 100 if size else 0
+            parts += [(human(used), "bright"), ("/" + human(size), "dim"),
+                      (f" {share:.0f}%", "mid" if share >= 80 else "dim")]
+        if name in sick:
+            parts.append(((" " if size is not None else "") + sick[name], "hi"))
+        pos = put_parts(cv, y + h - 2, pos, parts + [("   ", "dim")], ix + iw)
 
 
 def draw_net_panel(cv, y, x, h, w, mon):
@@ -1285,6 +1383,8 @@ def draw_graph_panel(cv, y, x, h, w, mon, ui):
 
 def draw_events_panel(cv, y, x, h, w, mon):
     feed, status = mon.events.snapshot() if mon.events else ([], "off")
+    if len(status) > w - 20:                         # too long to fit beside the title: shorten the error's name
+        status = status.replace("Error)", ")")
     box(cv, y, x, h, w, "b_events", title=[[("lxd events", "title")]],
         right=[[(status, "lo" if status == "live" else "mid")]])
     ix, right = x + 2, x + w - 2
@@ -1306,6 +1406,14 @@ def draw_events_panel(cv, y, x, h, w, mon):
         cv.put(y + 1 + i, pos, tail, "dim", right - len(count) - 1 if count else right)
         if count:
             cv.put(y + 1 + i, right - len(count), count, "key")
+
+
+# The extra columns on screens wider than OPS_FROM, added in this order while they fit:
+# THROTTLED (share of the CPU limit's periods held back @ the limit in cores), MEM/LIMIT (MEM as
+# a share of memory.max), WAITING (its worst stall: cpu, mem or io), MEM KILLS (memory kills since
+# lxdtop started, and how long ago the last was), PROCS/LIMIT (TASKS as a share of pids.max) and
+# LAST SNAP (how old its newest snapshot is). (column, width)
+OPS_COLUMNS = (("thr", 10), ("mem_pct", 12), ("wait", 8), ("kills", 10), ("tasks_pct", 11), ("snap", 9))
 
 
 def table_layout(width):
@@ -1332,6 +1440,12 @@ def table_layout(width):
             cols.append(("tasks", 5, 2))
         if "ip" not in drop:
             cols.append(("ip", 15, 2))
+        room = width - (OPS_FROM - 4)                  # what a screen wider than OPS_FROM adds (table: 4 narrower)
+        for name, w in OPS_COLUMNS if n_drop == 0 else ():
+            if w + 2 > room:
+                break                                  # in order: a later one never jumps ahead
+            cols.append((name, w, 2))
+            room -= w + 2
         spare = width - sum(w + gap for _, w, gap in cols)
         if spare >= 16 or n_drop == len(optional):
             layout, x = {}, 0
@@ -1346,7 +1460,9 @@ def table_layout(width):
 
 HEADERS = (("name", "NAME", "<"), ("up", "UP", ">"), ("cpu", "CPU", ">"), ("top", "BUSIEST PROCESS", "<"),
            ("mem", "MEM", ">"), ("rd", "DISK R", ">"), ("wr", "DISK W", ">"), ("net_in", "IN Mb/s", ">"),
-           ("net_out", "OUT Mb/s", ">"), ("tasks", "TASKS", ">"), ("ip", "IPV4", "<"))
+           ("net_out", "OUT Mb/s", ">"), ("tasks", "TASKS", ">"), ("ip", "IPV4", "<"),
+           ("thr", "THROTTLED", ">"), ("mem_pct", "MEM/LIMIT", ">"), ("wait", "WAITING", ">"),
+           ("kills", "MEM KILLS", ">"), ("tasks_pct", "PROCS/LIMIT", ">"), ("snap", "LAST SNAP", ">"))
 
 
 def draw_header(cv, y, x0, layout, ui):
@@ -1363,7 +1479,39 @@ def draw_header(cv, y, x0, layout, ui):
     cv.put(y, x0 + x, (label if len(label) <= w else "CPU HISTORY")[:w], "bright")
 
 
-def draw_row(cv, y, x0, layout, row, mon):
+def ops_cells(row, mon):
+    """The extra columns' (text, style) for one row: {column: (text, style)}. "-" means no limit
+    (or no kill), and a cell left out means no reading: VMs and stopped instances have no cgroup here."""
+    cells, seen = {}, mon.kills.get(row["cg"])
+    if seen and seen[1]:
+        ago = time.monotonic() - seen[2]
+        cells["kills"] = (f"{seen[1]} {fmt_age(ago)} ago", "hi" if ago < RECENT_KILL else "text")
+    elif seen:
+        cells["kills"] = ("-", "dim")
+    taken = row["snapshot"]
+    cells["snap"] = (fmt_age(time.time() - taken), "text") if taken else ("never", "dim")
+    if not row["live"] or row["vm"]:
+        return cells
+    held, cap = row["throttled"], row["cpu_max"]
+    if cap is None:
+        cells["thr"] = ("-", "dim")
+    elif held is not None:
+        cells["thr"] = (f"{held:.0f}% @{cap:.3g}c", "mid" if held >= THROTTLED_PCT else "text" if held >= 1 else "dim")
+    for col, used, limit, show in (("mem_pct", row["mem"], row["mem_max"], human),
+                                   ("tasks_pct", row["tasks"], row["tasks_max"], fmt_count)):
+        if limit is None:
+            cells[col] = ("-", "dim")
+        elif used is not None:
+            share = used / limit * 100 if limit else 100.0
+            cells[col] = (f"{share:.0f}% of {show(limit)}", "mid" if share >= NEAR_LIMIT_PCT else "text")
+    if row["waiting"]:
+        resource, share = row["waiting"]
+        cells["wait"] = ("-", "dim") if share < 1 else (f"{resource} {share:.0f}%",
+                                                       "hi" if share >= PRESSURE_PCT else "text")
+    return cells
+
+
+def draw_row(cv, y, x0, layout, row, mon, marked=()):
     def at(col):
         return x0 + layout[col][0]
 
@@ -1374,12 +1522,16 @@ def draw_row(cv, y, x0, layout, row, mon):
     if len(name) > width("name"):
         name = name[:width("name") - 1] + G["more"]
     marker = G["vm"] if row["vm"] else G["dot"]
+    if "thr" in layout:                                 # the extra columns, on screens wider than OPS_FROM
+        for col, (text, style) in ops_cells(row, mon).items():
+            if col in layout:
+                cv.put(y, at(col), text.rjust(width(col))[:width(col)], style)
     if not row["live"]:
-        cv.put(y, at("dot"), marker, "dim")
+        cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "dim")      # red: see the warning
         cv.put(y, at("name"), name, "dim")
         cv.put(y, at("up") if "up" in layout else at("cpu"), row["state"].lower(), "dim")
         return
-    cv.put(y, at("dot"), marker, "mid" if row["state"] == "Frozen" else "lo")
+    cv.put(y, at("dot"), marker, "hi" if row["cg"] in marked else "mid" if row["state"] == "Frozen" else "lo")
     cv.put(y, at("name"), name, mon.series_style.get(row["cg"], "bright"))
     if "up" in layout and row["up"] is not None:
         # Recently (re)started containers stand out in yellow for their first hour.
@@ -1426,9 +1578,60 @@ def sort_rows(mon, mode):
     return live + rest
 
 
+def warnings(mon):
+    """What's wrong right now, most serious first: [(how serious, order, text, container or None)].
+
+    A ZFS pool that is down, then a recent memory kill, then a DEGRADED pool, then high pressure,
+    then throttling, by the thresholds at the top of the file; within each, the worst first.
+    """
+    found, now = [], time.monotonic()
+    names = {row["cg"]: row["name"] for row in mon.rows}
+    for pool, state in sorted(mon.host.get("zpools", {}).items()):
+        if state != "ONLINE":
+            found.append((3 if state == "DEGRADED" else 5, 0, f"{pool} {state}", None))
+    for cg, (_, count, when) in mon.kills.items():
+        if count and now - when < RECENT_KILL:
+            ago = fmt_age(now - when)
+            what = f"memory kill {ago} ago" if count == 1 else f"{count} memory kills, last {ago} ago"
+            found.append((4, now - when, f"{names.get(cg, cg)}: {what}", cg))
+    for row in mon.rows:
+        if row["waiting"] and row["waiting"][1] >= PRESSURE_PCT:
+            resource, share = row["waiting"]
+            found.append((2, -share, f"{row['name']}: waiting on {resource} {share:.0f}%", row["cg"]))
+        if row["cpu_max"] and row["throttled"] is not None and row["throttled"] >= THROTTLED_PCT:
+            what = f"throttled {row['throttled']:.0f}% @{row['cpu_max']:.3g}c"
+            found.append((1, -row["throttled"], f"{row['name']}: {what}", row["cg"]))
+    return sorted(found, key=lambda item: (-item[0], item[1]))
+
+
+def warning_parts(alerts, room):
+    """The warnings as (text, style) pieces for one line of at most `room` characters: as many
+    as fit, then how many more there are. Pools and memory kills in red, the rest in yellow."""
+    texts, sep = [(text, "hi" if serious >= 3 else "mid") for serious, _, text, _ in alerts], f" {G['idle']} "
+    shown, used = 0, -len(sep)                          # (no separator before the first)
+    for text, _ in texts:
+        rest = len(texts) - shown - 1                   # how many would be left over if this one shows
+        if used + len(sep) + len(text) + (len(sep) + len(f"+{rest} more") if rest else 0) > room:
+            break
+        shown, used = shown + 1, used + len(sep) + len(text)
+    if shown:
+        more = [(f"+{len(texts) - shown} more", "dim")] if shown < len(texts) else []
+    else:                                               # not even one fits: cut the most serious short
+        texts, more, shown = [(texts[0][0][:room - 1] + G["more"], texts[0][1])], [], 1
+    parts = []
+    for text, style in texts[:shown] + more:
+        parts += ([(sep, "dim")] if parts else []) + [(text, style)]
+    return parts
+
+
 def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
     sources_ok = mon.api_status == "ok"
-    box(cv, y, x, h, w, "b_table", title=[[(instance_noun(mon), "title")]],
+    noun, alerts = instance_noun(mon), warnings(mon)
+    title = [[(noun, "title")]]
+    edge = w - len(noun) - len("sorted by " + ui.sort) - 13   # the top edge between the title and the sort
+    if alerts and edge >= 8:
+        title.append(warning_parts(alerts, edge))
+    box(cv, y, x, h, w, "b_table", title=title,
         right=[[("sorted by ", "dim"), (ui.sort, "key")]],
         footer=[[("q", "key"), (" quit", "text")], [("s", "key"), (" sort", "text")],
                 [("- +", "key"), (f" every {ui.interval:g}s", "text")]],
@@ -1437,12 +1640,13 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
     ix, iw = x + 2, w - 4
     layout = table_layout(iw)
     draw_header(cv, y + 1, ix, layout, ui)
+    marked = {cg for *_, cg in alerts if cg}           # rows to mark in red
     room = h - 3
     for i, row in enumerate(rows[:room]):
         if i == room - 1 and len(rows) > room:
             cv.put(y + 2 + i, ix, f"{G['more']} {len(rows) - i} more", "dim")
             break
-        draw_row(cv, y + 2 + i, ix, layout, row, mon)
+        draw_row(cv, y + 2 + i, ix, layout, row, mon, marked)
 
 
 def draw(cv, mon, ui):

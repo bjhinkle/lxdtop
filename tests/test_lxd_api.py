@@ -1,5 +1,6 @@
 """LXD's REST API over its unix socket, answered by a fake LXD (tests.support.FakeLxd)."""
 
+import datetime
 import os
 import unittest
 from unittest import mock
@@ -7,6 +8,7 @@ from unittest import mock
 from tests.support import FakeLxd, lxd_routes, lxdtop
 
 INSTANCES = "/1.0/instances?recursion=2&all-projects=true"
+NIGHTLY = datetime.datetime(2026, 11, 4, 7, 0, tzinfo=datetime.timezone.utc).timestamp()
 EVERY_PATH = {INSTANCES, "/1.0", "/1.0/storage-pools?recursion=1", "/1.0/storage-pools/default/resources",
               "/1.0/storage-pools/scratch/resources"}
 
@@ -20,15 +22,17 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(status, "ok")
         self.assertEqual(found, {
             # The first global IPv4 address; link-local and loopback addresses are skipped.
+            # recursion=2 includes snapshots: web's newest is "nightly", 03:00 at UTC-4, so 07:00 UTC.
             "web": dict(name="web", status="Running", veths=["veth1a2b3c4d"], ipv4="10.10.10.21",
-                        type="container", pid=4242),
+                        type="container", pid=4242, snapshot=NIGHTLY),
             "db": dict(name="db", status="Running", veths=["veth22220000", "veth22221111"],
-                       ipv4="192.168.50.12", type="container", pid=4300),
+                       ipv4="192.168.50.12", type="container", pid=4300, snapshot=None),
             # Outside the default project, the cgroup is named "<project>_<name>".
-            "dev_api": dict(name="api", status="Running", veths=[], ipv4="", type="container", pid=4400),
+            "dev_api": dict(name="api", status="Running", veths=[], ipv4="", type="container", pid=4400,
+                            snapshot=None),
             "win": dict(name="win", status="Running", veths=["tap0f1e2d3c"], ipv4="10.10.10.30",
-                        type="virtual-machine", pid=5151),
-            "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0),
+                        type="virtual-machine", pid=5151, snapshot=None),
+            "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0, snapshot=None),
         })
         self.assertEqual(server, dict(version="6.9", kernel="6.8.0-45-generic", os="Ubuntu 24.04",
                                       member="",                        # not a cluster member

@@ -1,6 +1,6 @@
 # Security review: lxdtop 1.4.0 and lxdtop-remote
 
-Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** Fixes made since then have moved later lines in `lxdtop` down by up to 64, and each finding also names its function.
+Reviewed: `lxdtop` and `contrib/lxdtop-remote` at commit `cf50ad6` (2026-10-07). **Line numbers below refer to that commit.** Fixes made since then have moved later lines in `lxdtop` down by up to 268 (the ops signals added most of that, after the review was finished), and each finding also names its function.
 
 lxdtop runs with access to LXD's socket, which is equivalent to root on the host, and it draws text that people inside containers choose. So this review asks four things: does it only read, can container-chosen text break out of its place on the terminal, can `lxdtop-remote` be made to run something it shouldn't, and what happens when the event stream is slow, closed or malformed.
 
@@ -10,7 +10,7 @@ lxdtop runs with access to LXD's socket, which is equivalent to root on the host
 |---|---|---|---|
 | [L-1](#l-1-a-process-name-that-isnt-utf-8-ends-lxdtop) | A process name that isn't valid UTF-8 ends lxdtop | Medium | Fixed in `5eb660b` |
 | [L-2](#l-2---dump-prints-escape-sequences-from-containers-unchanged) | `--dump` prints escape sequences from containers unchanged | Medium | Fixed in `8726a25` |
-| [L-3](#l-3-in-the-live-view-r-b-and-n-move-the-cursor) | In the live view, `\r`, `\b` and `\n` in a name move the cursor, and format characters pass through | Low | Fixed in `8726a25` |
+| [L-3](#l-3-in-the-live-view-r-b-and-n-move-the-cursor) | In the live view, `\r`, `\b` and `\n` in a name move the cursor, and format characters pass through | Low | Fixed in `8726a25`; wide characters in `681c31e` |
 | [L-4](#l-4-unexpected-input-ends-the-event-listener-for-good) | Unexpected input ends the event listener for good, while the panel still says "live" | Low | Fixed in `85b8719` |
 | [L-5](#l-5-a-null-or-non-string-event-field-crashes-lxdtop) | A `null` or non-string event field crashes lxdtop when it is drawn | Low | Fixed in `a93f240` |
 | [L-6](#l-6-no-timeouts-on-the-event-socket) | No timeouts on the event socket, so a stalled LXD still looks "live" | Low | Fixed in `a057527` |
@@ -25,7 +25,7 @@ Nothing reached High. Four bugs that aren't security issues were also fixed: lxd
 
 **Severity scale.** *High*: someone could change the host, run code as the lxdtop user, or read secrets. *Medium*: an unprivileged process in any container can stop lxdtop or send control sequences to the operator's terminal. *Low*: needs an unusual setup, a non-default option, a second foothold, or input only the operator or root controls, or it only misleads the display. *Info*: no security impact.
 
-**Nothing is left open.** Every finding here is fixed, and the test suite has no expected failures left. No daemon was available here, but the ZFS disk mapping ([L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters)) has since been checked on a real host (LXD 6.7, standalone). Two fixes still need checking once on a real LXD host: the event timeout ([L-6](#l-6-no-timeouts-on-the-event-socket)), and events from other projects ([N-1](#n-1-not-security-events-came-from-the-default-project-only)), which that host can't show because it has only the default project. The cluster fix ([N-10](#n-10-not-security-on-an-lxd-cluster-every-members-instances-and-events-showed)) needs an LXD cluster, and none was available.
+**The review is finished, and nothing is left open.** Every finding here is fixed, and the test suite has no expected failures left. No daemon was available here, so the fixes were checked against a real host afterwards: LexLab (LXD 6.7, standalone, default project only) confirmed the ZFS disk mapping ([L-8](#l-8-a-delegated-zfs-dataset-can-take-another-instances-disk-counters)). The event timeout ([L-6](#l-6-no-timeouts-on-the-event-socket)) is a passive check there: its desk screen's event panel should never flip to `reconnecting`. Events from other projects ([N-1](#n-1-not-security-events-came-from-the-default-project-only)) are not checkable on LexLab, which has only the default project, and the cluster fix ([N-10](#n-10-not-security-on-an-lxd-cluster-every-members-instances-and-events-showed)) needs an LXD cluster, and none was available.
 
 **Method.** I read all of both files. Each claim below was then checked by running something, either a test in `tests/` or a one-off run described under *How confirmed*, on Ubuntu 24.04 (Linux 6.18, Python 3.10 to 3.13, ncurses 6.5, OpenSSH 9.6p1). CI also runs the suite on Python 3.10, 3.12 and 3.15. No LXD daemon was available, so LXD's side (its validation rules, and what a VM's agent can report) comes from LXD's documentation and is marked where I couldn't check it. For N-1 and N-9, I read LXD's source on its `stable-5.21` and `main` branches, which cover LXD 5.21 and 6.
 
@@ -106,7 +106,7 @@ Before this branch, nothing between those reads and the screen filtered the text
 - **How confirmed.** One-off run under real curses in a pseudo-terminal: `addstr(2, 20, "abc\rXY")` left `XY` in columns 0–1 of row 2; `\b\b` overwrote earlier cells; ESC became `^[`; U+009B and U+009D were not sent; U+202E was. After the fix, the same run through lxdtop's `CursesCanvas` gives `abc?XY` in place, and U+202E is not sent. In the suite, `ControlCharacterTest.test_curses_never_gets_them` and `test_a_carriage_return_in_a_process_name_stays_in_its_column` fail on `cf50ad6`.
 - **Smallest fix (applied).** The L-2 change.
 
-What's left: wide characters (CJK, emoji) are printable but take two cells. They can shift the rest of a row in `--dump` output and misalign columns. That's cosmetic, with no control effect.
+Wide characters (CJK, emoji) are printable but take two cells, and combining ones none, so they shifted the rest of a row and misaligned the columns after them. That was cosmetic, with no control effect. Fixed in `681c31e`: `Canvas.put()` shows any character that isn't one cell wide as `?`, after composing what composes (NFC). Ubuntu's console font has no CJK or emoji glyphs, and terminals disagree on emoji widths, so one cell per character is the only rule that lines up everywhere. `test_wide_and_combining_characters_take_one_cell_each` and `test_a_wide_process_name_keeps_the_columns_in_place` fail before it.
 
 ## 3. contrib/lxdtop-remote
 
@@ -136,7 +136,7 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 
 ## 4. The event websocket: slow, closed or malformed
 
-`LxdEvents` runs in its own daemon thread (538–539). The screen only copies the feed under a lock (624–626), so a slow or stuck event stream can't freeze the display. What happens in each case:
+`LxdEvents` runs in its own daemon thread (538–539). The screen only copies the feed under a lock (624–626), so a slow or stuck event stream can't freeze the display. What happens in each case (since `da1017c`, the panel's `reconnecting` also names the error, as in `reconnecting (TimeoutError)`, the way the API footer names its errors, so a failure that repeats can't loop quietly):
 
 | Case | What happens | Panel status |
 |---|---|---|
@@ -181,7 +181,7 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 - **Where.** The socket made at 543 never gets a timeout, so `connect` (555), the reply `readline()` calls (561, 563) and the frame reads (568–577) can wait forever.
 - **Impact.** If LXD hangs with the connection open, the feed keeps showing "connecting" or "live". The display itself is unaffected, and the table footer's `lxd api` status shows an error within one refresh, because API calls do time out after 5 s (421).
 - **How confirmed.** By reading the code, and by `test_status_is_live_once_upgraded`: after the 101 reply, with nothing more sent, the status is "live" until the server closes. `test_a_silent_stream_reconnects` fails on `main` before the fix: with the timeout shortened to 0.3 s, lxdtop still waited the full 3 s until the fake LXD closed. With the fix it gives up after 0.3 s. `test_pings_keep_a_quiet_stream_open` checks that the timeout applies to each read: pings 0.6 s apart keep a 1 s timeout from firing over 2.4 s.
-- **Smallest fix (applied).** A named constant, `EVENT_TIMEOUT = 60`, and `sock.settimeout(EVENT_TIMEOUT)` where `_loop()` makes the socket (543). That's rather than in `_listen()`, as first suggested, so the tests that call `_listen()` directly keep their own timeout. A timeout raises `TimeoutError`, an `OSError`, so `_loop()` reconnects. LXD pings its event listeners and drops ones that don't answer, which is why lxdtop answers pings. I couldn't measure the interval without a daemon, so check once on a real host: on a quiet host the panel should stay "live" for several minutes.
+- **Smallest fix (applied).** A named constant, `EVENT_TIMEOUT = 60`, and `sock.settimeout(EVENT_TIMEOUT)` where `_loop()` makes the socket (543). That's rather than in `_listen()`, as first suggested, so the tests that call `_listen()` directly keep their own timeout. A timeout raises `TimeoutError`, an `OSError`, so `_loop()` reconnects. LXD pings its event listeners and drops ones that don't answer, which is why lxdtop answers pings. I couldn't measure the interval without a daemon. On LexLab this is a passive check: the desk screen's event panel should stay "live" on a quiet host, and never flip to "reconnecting".
 
 ## 5. Other findings
 
@@ -219,7 +219,7 @@ ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. 
 
 Line 557 asked for `/1.0/events?type=lifecycle` with no `project` or `all-projects=true`, and LXD then sends only the default project's events. So on a host with more than one project, nothing that happened in the others reached the feed, though the table lists their instances (463). Fixed in `1bba705` by asking for `&all-projects=true`, which LXD 5.21 and 6 both accept. Outside the default project, LXD also adds `?project=<name>` to each event's source, and snapshot events have no name field, so `_record()` now leaves the query off before splitting the path (594). Otherwise a snapshot would show as `nightly?project=dev`.
 
-Checked in LXD's source on its `stable-5.21` and `main` branches: `request.ProjectParams()` treats a request with no project as `default`, the events server skips other projects' events for such a listener, and `api.URL.Project()` adds the query. `test_events_from_every_project` and `test_the_project_after_the_source_is_left_off` fail before the fix. This widens which API users' text reaches the screen, which is safe now that L-2 and L-3 are fixed. Still to check once on a real host: start or snapshot an instance in another project, and it should appear in the feed.
+Checked in LXD's source on its `stable-5.21` and `main` branches: `request.ProjectParams()` treats a request with no project as `default`, the events server skips other projects' events for such a listener, and `api.URL.Project()` adds the query. `test_events_from_every_project` and `test_the_project_after_the_source_is_left_off` fail before the fix. This widens which API users' text reaches the screen, which is safe now that L-2 and L-3 are fixed. Not checkable on LexLab, which has only the default project. On a host with another project: start or snapshot an instance in it, and it should appear in the feed.
 
 ### N-2 Secrets stay off the screen
 

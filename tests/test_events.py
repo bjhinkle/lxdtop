@@ -2,14 +2,16 @@
 
 import base64
 import json
+import os
 import socket
+import tempfile
 import time
 import types
 import unittest
 import urllib.parse
 from unittest import mock
 
-from tests.support import FakeLxd, lifecycle_events, lxdtop, ws_frame
+from tests.support import FakeLxd, lifecycle_events, lxdtop, monitor, render, ws_frame
 
 
 def frames(*events):
@@ -212,17 +214,26 @@ class LoopTest(unittest.TestCase):
     """_loop() reconnects every 5 seconds and shows why in the panel's corner."""
 
     def test_no_socket(self):
-        self.assertEqual(run_loop("/nonexistent/unix.socket").status, "reconnecting")
+        self.assertEqual(run_loop("/nonexistent/unix.socket").status, "reconnecting (FileNotFoundError)")
+
+    def test_lxd_stopped_with_its_socket_left_behind(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "unix.socket")
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.bind(path)                         # the file exists, but nothing listens on it
+            self.assertEqual(run_loop(path).status, "reconnecting (ConnectionRefusedError)")
 
     def test_no_access(self):
         with mock.patch.object(socket.socket, "connect", side_effect=PermissionError(13, "denied")):
             self.assertEqual(run_loop("/var/snap/lxd/common/lxd/unix.socket").status, "no access")
 
     def test_refused_closed_or_garbled_streams_reconnect(self):
-        for kwargs in (dict(events_status=403), dict(script=[]), dict(script=[ws_frame(1, b"{not json")]),
-                       dict(script=[ws_frame(8)])):
+        # The status names what went wrong, the way the API footer does, so a bug can't loop quietly.
+        for kwargs, error in ((dict(events_status=403), "ConnectionError"), (dict(script=[]), "ConnectionError"),
+                              (dict(script=[ws_frame(1, b"{not json")]), "JSONDecodeError"),
+                              (dict(script=[ws_frame(8)]), "ConnectionError")):
             with self.subTest(**{k: repr(v)[:40] for k, v in kwargs.items()}), FakeLxd(**kwargs) as lxd:
-                self.assertEqual(run_loop(lxd.path).status, "reconnecting")
+                self.assertEqual(run_loop(lxd.path).status, f"reconnecting ({error})")
 
     def test_a_silent_stream_reconnects(self):
         """SECURITY-REVIEW.md L-6: a stream that went quiet used to look "live" forever.
@@ -238,7 +249,7 @@ class LoopTest(unittest.TestCase):
             events = run_loop(lxd.path)
             waited = time.monotonic() - started
         self.assertIsNone(events.ended)
-        self.assertEqual(events.status, "reconnecting")
+        self.assertEqual(events.status, "reconnecting (TimeoutError)")
         self.assertLess(waited, 2)                              # the timeout, not the fake closing
 
     def test_pings_keep_a_quiet_stream_open(self):
@@ -276,21 +287,43 @@ class LoopTest(unittest.TestCase):
         itself always sends event objects, so this needs something other than
         LXD on the socket.
         """
-        for payload in (b"[]", b'{"metadata": "x"}', b'{"metadata": {"source": null}}',
-                        b"[" * 100000 + b"]" * 100000):
+        # Since Python 3.14 the parser's depth limit is the real stack, so 100000 levels may parse after
+        # all (a large or unlimited stack), and then the list is just JSON that isn't an event.
+        for payload, errors in ((b"[]", {"AttributeError"}), (b'{"metadata": "x"}', {"AttributeError"}),
+                                (b'{"metadata": {"source": null}}', {"AttributeError"}),
+                                (b"[" * 100000 + b"]" * 100000, {"RecursionError", "AttributeError"})):
             with self.subTest(payload=payload[:30]), FakeLxd(script=[ws_frame(1, payload)]) as lxd:
                 events = run_loop(lxd.path)
                 self.assertIsNone(events.ended)                # the listener is still running
-                self.assertEqual(events.status, "reconnecting")
+                self.assertIn(events.status, {f"reconnecting ({error})" for error in errors})
 
     def test_an_impossible_frame_length_reconnects(self):
         """SECURITY-REVIEW.md L-4: a length of 2**63 raised OverflowError, and 2**40 MemoryError."""
-        for length in (1 << 63, 1 << 40):
+        for length, error in ((1 << 63, "OverflowError"), (1 << 40, "MemoryError")):
             with self.subTest(length=length), \
                     FakeLxd(script=[bytes([0x81, 127]) + length.to_bytes(8, "big")]) as lxd:
                 events = run_loop(lxd.path)
                 self.assertIsNone(events.ended)
-                self.assertEqual(events.status, "reconnecting")
+                self.assertEqual(events.status, f"reconnecting ({error})")
+
+
+class PanelStatusTest(unittest.TestCase):
+    def corner(self, status):
+        """The status in the events panel's top edge, as drawn at 160x45."""
+        feed = types.SimpleNamespace(snapshot=lambda: ([], status))
+        top = render(monitor(events=feed)).text().splitlines()[8]
+        return top[top.index("lxd events") + len("lxd events"):]
+
+    def test_the_reconnect_error_shows_beside_reconnecting(self):
+        self.assertIn("reconnecting (TimeoutError)", self.corner("reconnecting (TimeoutError)"))
+
+    def test_a_long_error_name_still_fits(self):
+        # The panel is 54 columns wide: "reconnecting (ConnectionRefusedError)" is 3 too many.
+        self.assertIn("reconnecting (ConnectionRefused)", self.corner("reconnecting (ConnectionRefusedError)"))
+
+    def test_live_and_no_access_are_unchanged(self):
+        for status in ("live", "no access", "connecting"):
+            self.assertIn(f"┐{status}┌", self.corner(status))
 
 
 class RecordTest(unittest.TestCase):

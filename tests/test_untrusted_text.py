@@ -11,6 +11,7 @@ import os
 import tempfile
 import time
 import types
+import unicodedata
 import unittest
 
 from tests.support import FakeHost, glyphs, lxdtop, monitor, pid_stat, render, row
@@ -106,13 +107,50 @@ class ControlCharacterTest(unittest.TestCase):
         self.assertTrue(all(s.isprintable() for s in screen.strings), screen.strings)
 
     def test_glyphs_and_ordinary_text_are_unchanged(self):
-        samples = ["web-01", "nginx: worker", "(sd-pam)", "10.10.10.21", "Größe 東京", "\\xff\\xfe"]
+        samples = ["web-01", "nginx: worker", "(sd-pam)", "10.10.10.21", "Größe ÅÉÎõü", "\\xff\\xfe"]
         for table in (lxdtop.GLYPHS_UNICODE, lxdtop.GLYPHS_ASCII):
             samples += list(table.values())
         for text in samples:
             cv = lxdtop.TextCanvas(1, 40)
             cv.put(0, 0, text)
             self.assertEqual(cv.text(), text.rstrip())
+
+    def test_wide_and_combining_characters_take_one_cell_each(self):
+        """SECURITY-REVIEW.md L-3: a character that isn't one cell wide used to shift the rest of its line.
+
+        lxdtop gives every character one cell. A wide one (CJK, emoji) takes
+        two on most terminals and a combining one none, so the rest of the line
+        moved. They become "?", one for one, after combining what composes.
+        """
+        cases = {"東京": "??", "web🙂": "web?", "été": "été",          # decomposed é composes
+                 "a⃝": "a?", "❤️": "❤?", "ｗｅｂ": "???",         # enclosing mark, emoji selector
+                 "ﾊﾝ": "ﾊﾝ"}                                  # half-width katakana: one cell
+        for text, shown in cases.items():
+            with self.subTest(text):
+                cv = lxdtop.TextCanvas(1, 20)
+                self.assertEqual(cv.put(0, 0, text), len(shown))
+                self.assertEqual(cv.text(), shown)
+
+    def test_a_wide_process_name_keeps_the_columns_in_place(self):
+        def on_screen(line, text):                     # the terminal column text starts at
+            return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+                       for ch in line[:line.index(text)])
+
+        rows = [row("web", top=("东方红🙂", 50.0)), row("db", top=("nginx", 50.0))]
+        lines = {name: line for line in render(monitor(rows)).text().splitlines()
+                 for name in ("web", "db") if f"● {name} " in line}
+        self.assertEqual(on_screen(lines["web"], "384M"), on_screen(lines["db"], "384M"))   # MEM, after it
+        self.assertIn("????", lines["web"])
+
+    def test_curses_never_gets_a_wide_character(self):
+        screen = RecordingScreen()
+        cv = lxdtop.CursesCanvas(screen, {})
+        for text in ("东京", "🙂", "é", "❤️"):
+            cv.put(0, 0, text)
+        self.assertTrue(screen.strings)
+        for string in screen.strings:
+            self.assertFalse([ch for ch in string if unicodedata.east_asian_width(ch) in ("W", "F")
+                              or unicodedata.category(ch) in ("Mn", "Me")], string)
 
     def test_a_process_name_in_dump_output(self):
         canvas = render(monitor([row("web", top=("\x1b]0;pwned\x07", 50.0))]))
