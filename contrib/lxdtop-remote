@@ -55,6 +55,15 @@ login_for() {
   echo "$name@$1"
 }
 
+# ssh to the host, and give up once it has gone quiet for a minute. A connection that drops
+# without a word otherwise leaves ssh waiting until TCP gives up, which can take hours, and the
+# view frozen. With these, ssh asks the host's sshd for an answer once 15 seconds pass with
+# nothing from it, then every 15 seconds, and gives up when a fourth ask is due with none of the
+# three answered: a minute after the host went quiet. A working connection always answers,
+# however long the host takes. They are the same for every host, and each call puts the host
+# after --, so nothing in its name can be read as an option.
+ssh_keepalive() { ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$@"; }
+
 case "$1" in
   screen)
     host=${2:-${SCREEN_HOST:-$DEFAULT_HOST}}
@@ -63,7 +72,8 @@ case "$1" in
     # shellcheck disable=SC2086 # split "1 8" into $1 and $2
     set -- $SCREEN_VTS
     # Needs `sudo chvt` without a password on the host.
-    exec ssh -- "$dest" "if [ \"\$(cat /sys/class/tty/tty0/active)\" = tty$2 ]; then sudo -n chvt $1 && echo \"console: tty$1\"; else sudo -n chvt $2 && echo \"console: tty$2\"; fi" ;;
+    ssh_keepalive -- "$dest" "if [ \"\$(cat /sys/class/tty/tty0/active)\" = tty$2 ]; then sudo -n chvt $1 && echo \"console: tty$1\"; else sudo -n chvt $2 && echo \"console: tty$2\"; fi"
+    exit ;;
   install)
     [ -n "$2" ] || { echo "usage: lxdtop-remote install <host>" >&2; exit 2; }
     [ -f "$LXDTOP" ] || { echo "lxdtop-remote: can't find $LXDTOP" >&2; exit 1; }
@@ -136,13 +146,8 @@ case "$1" in
         echo "lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the host" \
              "with sudo systemctl restart lxdtop-console"
       fi'
-    # This end of a connection that dropped without a word waits too, until TCP gives up. With
-    # these, ssh asks the host's sshd for an answer once 15 seconds pass with nothing from it,
-    # then every 15 seconds, and gives up when a fourth ask is due with none of the three
-    # answered: a minute after the host went quiet, as the host waits. A working connection
-    # always answers, however long the copy and its checks take. They are the same for every
-    # host, and the host still comes after --, so nothing in its name can be read as an option.
-    ssh -o ServerAliveInterval=15 -o ServerAliveCountMax=3 -- "$dest" "want=$sum; $check" < "$LXDTOP"
+    # This end gives up on a quiet connection a minute after the host went quiet, as the host does.
+    ssh_keepalive -- "$dest" "want=$sum; $check" < "$LXDTOP"
     status=$?
     # 255: ssh itself failed, and has said why. The host may or may not have got that far.
     if [ $status -eq 255 ]; then
@@ -167,7 +172,7 @@ run='p="$HOME/bin/lxdtop"; [ -x "$p" ] || p=$(command -v lxdtop) || { echo "lxdt
 # ssh hands the command to the host's shell as one string: quote each lxdtop option for it.
 args=
 for arg; do args="$args '$(printf '%s' "$arg" | sed "s/'/'\\\\''/g")'"; done
-ssh -t -- "$dest" "$run${REMOTE_TZ:+TZ=$REMOTE_TZ }\"\$p\"$args"
+ssh_keepalive -t -- "$dest" "$run${REMOTE_TZ:+TZ=$REMOTE_TZ }\"\$p\"$args"
 status=$?
 [ -n "$size" ] && printf '\033[8;%s;%st' "${size% *}" "${size#* }"
 exit $status

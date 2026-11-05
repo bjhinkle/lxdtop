@@ -150,6 +150,15 @@ class RemoteTest(RemoteCase):
         self.assertNotIn("username", result.stderr)
         self.assertEqual(self.connections()[-1]["destination"], "lxdhost")
 
+    def test_the_view_and_screen_give_up_on_a_quiet_connection_within_a_minute_too(self):
+        """#16: after a drop without a word, the view stayed frozen until TCP gave up, and screen could wait as
+        long. They get install's two keepalive options: see InstallTest's test of them."""
+        self.remote("me@lxdhost")
+        self.remote("screen", "me@lxdhost", FAKE_SSH_DRY="1")
+        view, screen = ([tuple(given) for given in run["options"]] for run in self.connections())
+        self.assertEqual(view, KEEPALIVE + [("-t", "")])
+        self.assertEqual(screen, KEEPALIVE)
+
     def test_screen_flips_between_two_consoles(self):
         result = self.remote("screen", "me@lxdhost", FAKE_SSH_DRY="1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -168,7 +177,7 @@ class RemoteTest(RemoteCase):
 
         The only options ssh gets are lxdtop-remote's own, the same whatever the
         host and user: -G to read the SSH config, -t for lxdtop's screen, and
-        install's two keepalive options (#16).
+        the two keepalive options every connection gets (#16).
         """
         marker = os.path.join(self.dir, "ran")
         option = f"-oProxyCommand=touch {marker}"

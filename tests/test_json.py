@@ -206,8 +206,8 @@ class JsonDumpTest(unittest.TestCase):
     def test_a_container(self):
         web = self.instance(self.reading(), "web")
         self.assertEqual(web, {
-            "name": "web", "project": "default", "type": "container", "state": "Running", "ipv4": "10.10.10.21",
-            "uptime_s": 123451.8, "cpu_pct": 25.0, "cpu_history_pct": [None, 25.0],
+            "name": "web", "project": "default", "type": "container", "state": "Running", "no_readings": None,
+            "ipv4": "10.10.10.21", "uptime_s": 123451.8, "cpu_pct": 25.0, "cpu_history_pct": [None, 25.0],
             "busiest_process": {"name": "nginx", "cpu_pct": 0.0}, "mem_bytes": 384 * MiB,
             "disk_read_bytes_per_s": 0.0, "disk_write_bytes_per_s": 0.0, "disk_source": "io.stat",
             "net_in_bits_per_s": 100_000.0, "net_out_bits_per_s": 20_000.0,
