@@ -108,7 +108,7 @@ def instances():
                     type="container", pid=4242),
         "dev_api": dict(name="api", status="Running", veths=[], ipv4="", type="container", pid=4400),
         "win": dict(name="win", status="Running", veths=["tap0f1e2d3c"], ipv4="10.10.10.30",
-                    type="virtual-machine", pid=5151),
+                    type="virtual-machine", pid=5151, cpu_max=2, mem_max=4 * GiB),
         "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0),
     }
 
@@ -195,6 +195,8 @@ class MonitorTest(unittest.TestCase):
         self.assertAlmostEqual(win["cpu"], 100.0)
         self.assertEqual(win["mem"], 2 * GiB)                 # VmRSS
         self.assertEqual(win["rd"], 0.0)
+        self.assertEqual((win["cpu_max"], win["mem_max"]), (2, 4 * GiB))     # LXD's limits.cpu and limits.memory
+        self.assertEqual((win["throttled"], win["tasks_max"], win["waiting"]), (None, None, None))
 
     def test_stopped_instance(self):
         old = self.rows["old"]

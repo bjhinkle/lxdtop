@@ -35,14 +35,14 @@ On screens wider than 160 columns, the table adds these columns after IPV4, in t
 
 | Column | Shows | From |
 |---|---|---|
-| THROTTLED | `45% @2c`: the share of its CPU limit's periods in the last interval in which it was held back, then the limit in cores. Yellow from 20%. `-` means no CPU limit | `cpu.stat` (`nr_periods`, `nr_throttled`) and `cpu.max` |
-| MEM/LIMIT | `62% of 4.0G`: MEM as a share of its memory limit. Yellow from 90% (`NEAR_LIMIT_PCT`). `-` means no limit | `memory.max` |
+| THROTTLED | `45% @2c`: the share of its CPU limit's periods in the last interval in which it was held back, then the limit in cores. Yellow from 20%. `-` means no CPU limit. A VM shows only its CPUs, `@2c` | `cpu.stat` (`nr_periods`, `nr_throttled`) and `cpu.max`; a VM's `limits.cpu` |
+| MEM/LIMIT | `62% of 4.0G`: MEM as a share of its memory limit. Yellow from 90% (`NEAR_LIMIT_PCT`). `-` means no limit | `memory.max`; a VM's `limits.memory` |
 | WAITING | `mem 34%`: the worst of its CPU, memory and disk stalls, as in the warning. Red from 25%. `-` below 1% | `cpu.pressure`, `memory.pressure`, `io.pressure` |
 | MEM KILLS | `2 12m ago`: processes the kernel has killed for memory since lxdtop started, and how long ago the last was. Red for an hour. `-` means none | `memory.events` (`oom_kill`) |
 | PROCS/LIMIT | `96% of 500`: TASKS as a share of its process limit. Yellow from 90%. `-` means no limit | `pids.max` |
 | LAST SNAP | `3h`: how old its newest snapshot is, or `never` | LXD's API: `GET /1.0/instances?recursion=2` already includes each instance's snapshots |
 
-These come from a running container's cgroup, so stopped instances and VMs leave them empty (a VM's limits are inside its guest). LAST SNAP and MEM KILLS still show for a stopped container. A file the kernel doesn't provide, or a feature it has turned off (such as pressure stall information with `psi=0`), leaves its cell empty too.
+These come from a running container's cgroup, so stopped instances leave them empty. A running VM has no cgroup here, so it shows only the limits LXD gives it, from its `limits.cpu` and `limits.memory`: THROTTLED shows its CPUs, as `@2c`, and MEM/LIMIT shows MEM (its QEMU process's) as a share of its memory. Where those aren't set, it has LXD's defaults, one CPU and 1 GiB, and lxdtop shows those. Its throttling, stalls and processes are inside its guest. LAST SNAP and MEM KILLS still show for a stopped container. A file the kernel doesn't provide, or a feature it has turned off (such as pressure stall information with `psi=0`), leaves its cell empty too.
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
@@ -149,7 +149,7 @@ Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time
 lxdtop --dump --json | python3 -c 'import json, sys; [print(i["name"], i["cpu_pct"]) for i in json.load(sys.stdin)["instances"]]'
 ```
 
-Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_s` (seconds), `_bytes_per_s` (disk), `_bits_per_s` (network, decimal) or `_pct`. CPU % means what it does on screen: an instance's or a process's 100 is one core, and the host's `busy_pct` is the share of the whole machine. A value lxdtop has no reading for is `null`, never `0`, and so is a limit that isn't set. As on screen, exec command lines appear only with `--show-commands`, and nothing comes from an instance's config. Text from inside containers is escaped (`\u001b`), never written raw.
+Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_s` (seconds), `_bytes_per_s` (disk), `_bits_per_s` (network, decimal) or `_pct`. CPU % means what it does on screen: an instance's or a process's 100 is one core, and the host's `busy_pct` is the share of the whole machine. A value lxdtop has no reading for is `null`, never `0`, and so is a limit that isn't set. As on screen, exec command lines appear only with `--show-commands`, and nothing comes from an instance's config but a VM's `limits.cpu` and `limits.memory`, as `cpu_limit_cores` and `mem_limit_bytes`. Text from inside containers is escaped (`\u001b`), never written raw.
 
 | Field | What it holds |
 |---|---|
@@ -174,6 +174,7 @@ Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_
 | Network in and out | Host-side veth and tap interface counters, in megabits per second |
 | Host panels | `/proc/stat`, `/proc/meminfo`, ZFS `arcstats`, hwmon temperature, cpufreq and physical port counters |
 | Throttling, limits, stalls and memory kills | The container's cgroup: `cpu.stat`, `cpu.max`, `memory.max`, `pids.max`, `memory.events` and the three `*.pressure` files |
+| VM limits | `limits.cpu` and `limits.memory` in the VM's expanded config, which LXD's instance list already includes, worked out as LXD does when it starts the VM. lxdtop reads no other key of an instance's config |
 | ZFS pool health | `/proc/spl/kstat/zfs/<pool>/state`, beside the objset counters |
 | Names, addresses, stopped instances, snapshots, versions and pool usage | LXD's REST API over its local socket every 15 seconds (GET requests only) |
 | Event feed | LXD's lifecycle event stream, a websocket on the same socket |

@@ -184,6 +184,18 @@ class JsonDumpTest(unittest.TestCase):
         for value in ("hunter2", "rack 7", "/srv/private", "DB_PASSWORD", "limits.memory"):
             self.assertNotIn(value, text)
 
+    def test_nothing_from_a_vms_config_but_its_limits(self):
+        win = next(i for i in self.routes[INSTANCES][1]["metadata"] if i["name"] == "win")
+        win["expanded_config"].update({"cloud-init.user-data": "#cloud-config\npassword: hunter2",
+                                       "environment.API_TOKEN": "s3cret", "user.note": "rack 7"})
+        for args in (("--dump", "--json"), ("--dump", "--size", "240x60"), ("--dump", "--size", "80x24")):
+            text = self.main(*args)
+            for value in ("hunter2", "s3cret", "rack 7", "API_TOKEN", "cloud-init", "limits.", "Windows",
+                          "5f0e3a52"):
+                self.assertNotIn(value, text, args)
+        win = self.instance(self.reading(), "win")
+        self.assertEqual((win["cpu_limit_cores"], win["mem_limit_bytes"]), (2, 4 * 1024 ** 3))
+
     def test_instances_in_the_tables_order(self):
         doc = self.reading()
         self.assertEqual([(i["name"], i["type"], i["state"]) for i in doc["instances"]], [
@@ -215,9 +227,25 @@ class JsonDumpTest(unittest.TestCase):
                          ("virtual-machine", 2 * 1024 ** 3, "10.10.10.30"))       # memory: QEMU's VmRSS
         self.assertIsNotNone(win["uptime_s"])
         self.assertEqual(win["cpu_history_pct"], [None, 0.0])
-        for key in ("busiest_process", "tasks", "tasks_limit", "cpu_limit_cores", "cpu_throttled_pct",
-                    "mem_limit_bytes", "waiting_on", "mem_kills", "mem_kills_total", "disk_read_bytes_per_s"):
+        # Its limits are LXD's limits.cpu and limits.memory: 2 and 4GiB in the fixture.
+        self.assertEqual((win["cpu_limit_cores"], win["mem_limit_bytes"], win["mem_of_limit_pct"]),
+                         (2, 4 * 1024 ** 3, 50.0))
+        for key in ("busiest_process", "tasks", "tasks_limit", "tasks_of_limit_pct", "cpu_throttled_pct",
+                    "waiting_on", "mem_kills", "mem_kills_total", "disk_read_bytes_per_s"):
             self.assertIsNone(win[key], key)                      # in the guest, or a cgroup it doesn't have
+
+    def test_a_vm_without_its_limits_set_has_lxds_defaults(self):
+        win = next(i for i in self.routes[INSTANCES][1]["metadata"] if i["name"] == "win")
+        del win["expanded_config"]["limits.cpu"], win["expanded_config"]["limits.memory"]
+        win = self.instance(self.reading(), "win")
+        self.assertEqual((win["cpu_limit_cores"], win["mem_limit_bytes"], win["mem_of_limit_pct"]),
+                         (1, 1024 ** 3, 200.0))                   # one CPU and 1 GiB, as LXD gives it
+
+    def test_a_stopped_vm_has_no_limits(self):
+        win = next(i for i in self.routes[INSTANCES][1]["metadata"] if i["name"] == "win")
+        win["status"], win["state"]["pid"] = "Stopped", 0
+        win = self.instance(self.reading(), "win")
+        self.assertEqual((win["state"], win["cpu_limit_cores"], win["mem_limit_bytes"]), ("Stopped", None, None))
 
     def test_a_stopped_instance_has_nulls_not_zeros(self):
         old = self.instance(self.reading(), "old")
