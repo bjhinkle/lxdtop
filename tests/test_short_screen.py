@@ -3,8 +3,8 @@
 fit_layout() shares the rows. When everything fits, the layout is the one lxdtop always had. When
 the screen is short, the CPU-by-instance graph shrinks to its smallest, then the stopped instances
 fold into one line, then only the top running instances keep a row, with "+N more" for the rest;
-the graph goes next, and the host panels last. LexLab's desk console is 160x45 with 29 instances
-(25 running, 4 stopped): tests/fixtures/lxd-instances-29.json is LXD's answer for them.
+the graph goes next, and the host panels last. The example here is a 160x45 console screen with 29
+instances (25 running, 4 stopped): tests/fixtures/lxd-instances-29.json is LXD's answer for them.
 """
 
 import contextlib
@@ -19,10 +19,10 @@ from unittest import mock
 from tests.support import MiB, FakeHost, FakeLxd, fixture_json, lxd_routes, lxdtop, monitor, render, row
 
 INSTANCES = "/1.0/instances?recursion=2&all-projects=true"
-LEXLAB = fixture_json("lxd-instances-29.json")
-RUNNING = [inst["name"] for inst in LEXLAB["metadata"] if inst["status"] == "Running"]   # busiest first
-STOPPED = ["auth-lex-old", "avimark", "isc-31", "isc-32"]
-FOLDED = "4 stopped: auth-lex-old, avimark, isc-31, isc-32"
+ANSWER_29 = fixture_json("lxd-instances-29.json")
+RUNNING = [inst["name"] for inst in ANSWER_29["metadata"] if inst["status"] == "Running"]   # busiest first
+STOPPED = ["auth-two-old", "billing", "web-31", "web-32"]
+FOLDED = "4 stopped: auth-two-old, billing, web-31, web-32"
 
 
 def todays_layout(width, height, rows):
@@ -48,7 +48,7 @@ class FitLayoutTest(unittest.TestCase):
                                              (*today, running, False), (width, height, running, stopped))
         self.assertGreater(checked, 10_000)
 
-    def test_lexlab_and_the_order_things_give_way(self):
+    def test_29_instances_and_the_order_things_give_way(self):
         fit = lxdtop.fit_layout
         self.assertEqual(fit(160, 45, 25, 4), (7, 8, 25, True))      # graph shrinks, the stopped fold: all fit
         self.assertEqual(fit(160, 45, 27, 0), (7, 7, 27, False))     # the graph shrinking is enough
@@ -104,12 +104,12 @@ class StoppedLineTest(unittest.TestCase):
         self.assertRegex(text, r"\| 12 stopped: old-instance-00, .*~ *\|")
 
     def test_a_stopped_instance_with_a_warning_stays_red(self):
-        rows = [row(f"run{i:02}") for i in range(30)] + [row("avimark", state="Stopped", live=False),
-                                                          row("isc-31", state="Stopped", live=False)]
-        canvas = render_short(rows, 160, 24, kills={"avimark": (1, 1, time.monotonic() - 60)})
+        rows = [row(f"run{i:02}") for i in range(30)] + [row("billing", state="Stopped", live=False),
+                                                          row("web-31", state="Stopped", live=False)]
+        canvas = render_short(rows, 160, 24, kills={"billing": (1, 1, time.monotonic() - 60)})
         y, line = self.stopped_line(canvas)
-        self.assertEqual(canvas.cells[y][line.index("avimark")][1], "hi")
-        self.assertEqual(canvas.cells[y][line.index("isc-31")][1], "dim")
+        self.assertEqual(canvas.cells[y][line.index("billing")][1], "hi")
+        self.assertEqual(canvas.cells[y][line.index("web-31")][1], "dim")
 
     def test_more_counts_the_running_ones_left_out(self):
         rows = [row(f"run{i:02}", cpu=float(100 - i)) for i in range(40)]
@@ -120,8 +120,8 @@ class StoppedLineTest(unittest.TestCase):
         self.assertNotIn(" stopped: ", text)
 
 
-class LexLabTest(unittest.TestCase):
-    """LexLab end to end: LXD's answer for 29 instances, and a host running 25 of them."""
+class EndToEndTest(unittest.TestCase):
+    """End to end: LXD's answer for 29 instances, and a host running 25 of them."""
 
     def frame(self, size, ascii=False):
         host = FakeHost(self)
@@ -130,7 +130,7 @@ class LexLabTest(unittest.TestCase):
         host.add_nic("eno1", 0, 0, physical=True)
         for i, name in enumerate(RUNNING):
             host.add_container(name, 1_000_000, memory=(256 + 8 * i) * MiB)
-            host.add_nic(f"veth{i:04x}lex", 0, 0)
+            host.add_nic(f"veth{i:04x}abc", 0, 0)
 
         def sleep(secs):                         # between --dump's readings: each one uses less CPU
             host.clock += secs
@@ -141,11 +141,11 @@ class LexLabTest(unittest.TestCase):
         args = ["lxdtop", "--dump", "--size", size] + (["--ascii"] if ascii else [])
         saved = lxdtop.G
         self.addCleanup(setattr, lxdtop, "G", saved)
-        with FakeLxd(lxd_routes(**{INSTANCES: (200, LEXLAB)})) as lxd, host.installed(), \
+        with FakeLxd(lxd_routes(**{INSTANCES: (200, ANSWER_29)})) as lxd, host.installed(), \
                 mock.patch.object(lxdtop.LxdApi, "start"), mock.patch.object(lxdtop.LxdEvents, "start"), \
                 mock.patch.object(sys, "argv", args + ["--socket", lxd.path]), \
                 mock.patch.object(lxdtop.time, "sleep", sleep), \
-                mock.patch.object(lxdtop.socket, "gethostname", return_value="lexlab"), \
+                mock.patch.object(lxdtop.socket, "gethostname", return_value="server"), \
                 contextlib.redirect_stdout(out):
             lxdtop.main()
         return out.getvalue().splitlines()

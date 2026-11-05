@@ -404,14 +404,14 @@ class GraphLegendTest(unittest.TestCase):
                          "│ ■ web  ■ db  ■ other containers  ■ host itself" + " " * 31 + "│")
 
     def test_at_80_columns_long_names_give_way_and_no_word_is_cut(self):
-        names = ["auth-lex-old", "avimark-db", "isc-31-web", "nextcloud", "unifi-ctrl"]
+        names = ["auth-two-old", "billing-db", "web-31-app", "nextcloud", "unifi-ctrl"]
         self.assertEqual(self.legend(names),
-                         "│ ■ auth-lex-old  ■ avimark-db  ■ isc-31-web  ■ nextcloud  …  ■ other  ■ host  │")
+                         "│ ■ auth-two-old  ■ billing-db  ■ web-31-app  ■ nextcloud  …  ■ other  ■ host  │")
         self.assertEqual(self.legend(names, ascii=True),
-                         "| # auth-lex-old  # avimark-db  # isc-31-web  # nextcloud  ~  # other  # host  |")
+                         "| # auth-two-old  # billing-db  # web-31-app  # nextcloud  ~  # other  # host  |")
 
     def test_shorter_words_before_any_name_goes(self):
-        line = self.legend(["auth-lex-old", "avimark-db", "isc-31-web", "nextcloud"])
+        line = self.legend(["auth-two-old", "billing-db", "web-31-app", "nextcloud"])
         self.assertTrue(line.endswith("■ nextcloud  ■ other  ■ host" + " " * 5 + "│"), line)
 
     def test_every_size_shows_other_and_host_and_whole_names(self):
