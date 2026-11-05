@@ -507,8 +507,10 @@ def name_of(cg):
 
 def new_row(cg, inst, **fields):
     """One table row; fields not given stay empty until a reading fills them. Its label is its name
-    as the screen shows it: see Monitor.set_labels()."""
-    row = dict(cg=cg, name=inst.get("name", cg), label=inst.get("name", cg),
+    as the screen shows it: see Monitor.set_labels(). Without LXD's word, its name and project come
+    from its cgroup name."""
+    name = inst.get("name") or name_of(cg)
+    row = dict(cg=cg, name=name, label=name,
                project=inst.get("project") or project_of(cg), state=inst.get("status", "Running"), live=True,
                vm=False, ip=inst.get("ipv4", ""), mem=None, tasks=None, top=None, up=None,
                cpu=None, rd=None, wr=None, net_in=None, net_out=None, snapshot=inst.get("snapshot"),

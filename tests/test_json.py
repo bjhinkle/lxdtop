@@ -292,7 +292,8 @@ class JsonDumpTest(unittest.TestCase):
         self.assertEqual((doc["host"]["lxd_version"], doc["host"]["os"], doc["host"]["cluster_member"]),
                          (None, None, None))
         self.assertEqual(doc["pools"], [dict(name="default", used_bytes=None, total_bytes=None, health="ONLINE")])
-        self.assertEqual([i["name"] for i in doc["instances"]], ["web", "db", "dev_api"])     # cgroups only
+        self.assertEqual([(i["name"], i["project"]) for i in doc["instances"]],               # cgroups only, named
+                         [("web", "default"), ("db", "default"), ("api", "dev")])           # as the API names them
         for inst in doc["instances"]:
             self.assertEqual((inst["type"], inst["ipv4"], inst["net_in_bits_per_s"], inst["newest_snapshot_at"]),
                              ("container", None, None, None), inst["name"])
