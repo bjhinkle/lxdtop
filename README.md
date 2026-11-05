@@ -48,6 +48,14 @@ These come from a running container's cgroup, so stopped instances leave them em
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.9.0
+
+- **`--dump --json` says `null` for a reading lxdtop couldn't take,** such as an unreadable `/proc/loadavg` or a container's `memory.current`, where it said `0`. On screen, those cells are left blank.
+- **VMs show their CPU and memory limits,** from LXD's `limits.cpu` and `limits.memory`: in THROTTLED (`@2c`) and MEM/LIMIT on screens wider than 160 columns, in the detail view and in the JSON. lxdtop reads no other key of an instance's config.
+- **`s` sorts by THROTTLED and WAITING too,** most held back or most stalled first.
+- **The network graph is drawn in braille in the fine drawing,** two readings to a character, with traffic out filling down from the middle line. The classic drawing and `--ascii` are unchanged.
+- **An event frame over 16 MiB is refused before it's read,** so a broken event stream can't make lxdtop ask for a huge buffer. The events panel says `reconnecting (FrameTooLargeError)` while it reconnects.
+
 ## What's new in 1.8.2
 
 - **The detail view fits a short window.** In a window under 18 rows, the page is cut to fit inside its box, and its last line says how tall a window shows the rest. Before, its lower lines were drawn over the box's bottom edge.
