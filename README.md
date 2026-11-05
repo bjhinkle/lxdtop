@@ -12,7 +12,7 @@ lxdtop is a single Python file that needs nothing beyond the standard library. I
 - **Network panel**: traffic through the host's physical ports in Mb/s, with traffic in drawn upward and traffic out drawn downward, plus each port's rate, busiest first.
 - **CPU by instance**: a stacked graph of the last few minutes, one color for each of the busiest instances, then everything else and the host itself.
 - **LXD events**: a live feed of starts, stops, snapshots, `exec` sessions and file transfers. An event that repeats within 10 minutes stays on one line with a count. The panel's corner says `live`, or `reconnecting` with the name of the error it's recovering from, such as `reconnecting (TimeoutError)`.
-- **Instance table**: uptime, CPU, CPU history, the busiest process inside each container, memory, disk reads and writes, network in and out (Mb/s), task count and IPv4 address. Screens wider than 160 columns add the columns under [Warnings and wide screens](#warnings-and-wide-screens).
+- **Instance table**: uptime, CPU, CPU history, the busiest process inside each container, memory, disk reads and writes, network in and out (Mb/s), task count and IPv4 address. Screens wider than 160 columns add the columns under [Warnings and wide screens](#warnings-and-wide-screens). Where two instances in different LXD projects have the same name, the one outside the default project shows as `<project>/<name>`, such as `dev/api`, here and everywhere else on screen.
 - **Warnings**: when an instance is struggling rather than just busy, or a ZFS pool isn't ONLINE, a short line in the table's top edge says so, most serious first, for example `web1: memory kill 12m ago · tank DEGRADED`. The instance's marker (● or ■) turns red.
 
 It is laid out for a 160x45 screen, such as a small console monitor or a large terminal window, and adapts to smaller windows. When the screen is short, the cpu, memory and network panels stay as long as they can: first the CPU graph shrinks to 7 rows, then the stopped instances share one line (`4 stopped: auth-two-old, billing, web-31, web-32`), then only the top running instances keep a row, with `+N more` for the rest. Only after that does the graph go, and the host panels last. A narrower screen drops panels, then columns.
@@ -126,7 +126,7 @@ install -m 755 lxdtop ~/bin/lxdtop.new
 
 Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
 
-Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, name, then the wide-screen columns throttled and waiting), and `-` and `+` change the refresh interval (1 to 10 seconds). `/` filters the table by name (Enter keeps the filter, Esc clears it), the up and down arrows highlight a row, and Enter opens a page with everything lxdtop has on the highlighted instance, its recent events included (Esc or `q` goes back). No key changes anything on the host.
+Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, name, then the wide-screen columns throttled and waiting), and `-` and `+` change the refresh interval (1 to 10 seconds). `/` filters the table by name (Enter keeps the filter, Esc clears it), the up and down arrows highlight a row, and Enter opens a page with everything lxdtop has on the highlighted instance, its recent events included: up to 50 of its own, however busy the rest of the host is (Esc or `q` goes back). No key changes anything on the host.
 
 | Option | Effect |
 |---|---|
@@ -170,7 +170,7 @@ Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time
 lxdtop --dump --json | python3 -c 'import json, sys; [print(i["name"], i["cpu_pct"]) for i in json.load(sys.stdin)["instances"]]'
 ```
 
-Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_s` (seconds), `_bytes_per_s` (disk), `_bits_per_s` (network, decimal) or `_pct`. CPU % means what it does on screen: an instance's or a process's 100 is one core, and the host's `busy_pct` is the share of the whole machine. A value lxdtop has no reading for is `null`, never `0`, and so is a limit that isn't set. As on screen, exec command lines appear only with `--show-commands`, and nothing comes from an instance's config but a VM's `limits.cpu` and `limits.memory`, as `cpu_limit_cores` and `mem_limit_bytes`. Text from inside containers is escaped (`\u001b`), never written raw.
+Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_s` (seconds), `_bytes_per_s` (disk), `_bits_per_s` (network, decimal) or `_pct`. CPU % means what it does on screen: an instance's or a process's 100 is one core, and the host's `busy_pct` is the share of the whole machine. A value lxdtop has no reading for is `null`, never `0`, and so is a limit that isn't set. Each instance, each warning about one and each event also has its LXD `project` (`default` for the default project's), since two projects can have instances of the same name. As on screen, exec command lines appear only with `--show-commands`, and nothing comes from an instance's config but a VM's `limits.cpu` and `limits.memory`, as `cpu_limit_cores` and `mem_limit_bytes`. Text from inside containers is escaped (`\u001b`), never written raw.
 
 | Field | What it holds |
 |---|---|

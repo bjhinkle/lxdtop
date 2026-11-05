@@ -23,18 +23,18 @@ class FetchTest(unittest.TestCase):
         self.assertEqual(found, {
             # The first global IPv4 address; link-local and loopback addresses are skipped.
             # recursion=2 includes snapshots: web's newest is "nightly", 03:00 at UTC-4, so 07:00 UTC.
-            "web": dict(name="web", status="Running", veths=["veth1a2b3c4d"], ipv4="10.10.10.21",
+            "web": dict(name="web", project="default", status="Running", veths=["veth1a2b3c4d"], ipv4="10.10.10.21",
                         type="container", pid=4242, snapshot=NIGHTLY, cpu_max=None, mem_max=None),
-            "db": dict(name="db", status="Running", veths=["veth22220000", "veth22221111"],
+            "db": dict(name="db", project="default", status="Running", veths=["veth22220000", "veth22221111"],
                        ipv4="192.168.50.12", type="container", pid=4300, snapshot=None, cpu_max=None, mem_max=None),
             # Outside the default project, the cgroup is named "<project>_<name>".
-            "dev_api": dict(name="api", status="Running", veths=[], ipv4="", type="container", pid=4400,
+            "dev_api": dict(name="api", project="dev", status="Running", veths=[], ipv4="", type="container", pid=4400,
                             snapshot=None, cpu_max=None, mem_max=None),
             # A VM's limits come from its config: limits.cpu and limits.memory (a container's are in its cgroup).
-            "win": dict(name="win", status="Running", veths=["tap0f1e2d3c"], ipv4="10.10.10.30",
+            "win": dict(name="win", project="default", status="Running", veths=["tap0f1e2d3c"], ipv4="10.10.10.30",
                         type="virtual-machine", pid=5151, snapshot=None, cpu_max=2, mem_max=4 * GiB),
-            "old": dict(name="old", status="Stopped", veths=[], ipv4="", type="container", pid=0, snapshot=None,
-                        cpu_max=None, mem_max=None),
+            "old": dict(name="old", project="default", status="Stopped", veths=[], ipv4="", type="container", pid=0,
+                        snapshot=None, cpu_max=None, mem_max=None),
         })
         self.assertEqual(server, dict(version="6.9", kernel="6.8.0-45-generic", os="Ubuntu 24.04",
                                       member="",                        # not a cluster member
