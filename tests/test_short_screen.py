@@ -9,6 +9,7 @@ the graph goes next, and the host panels last. LexLab's desk console is 160x45 w
 
 import contextlib
 import io
+import itertools
 import re
 import sys
 import time
@@ -210,6 +211,39 @@ class LexLabTest(unittest.TestCase):
         text = "\n".join(lines)
         self.assertTrue(text.isascii())
         self.assertIn(f"| {FOLDED} ", text)
+
+
+class EveryInstanceTest(unittest.TestCase):
+    """At any size, every instance listed has a row of its own, is counted in "+N more", or is named in
+    the stopped line: fit_layout() never gives the table fewer rows than that takes. (So the "… N more"
+    line draw_table_panel() had for a table that ran out of rows was never drawn.)"""
+
+    def draw(self, mon, width, height, text_filter=""):
+        ui = lxdtop.new_ui(2)
+        ui.filter = text_filter
+        canvas = lxdtop.TextCanvas(height, width)
+        with mock.patch.object(lxdtop.socket, "gethostname", return_value="lxdhost"):
+            lxdtop.draw(canvas, mon, ui)
+        lines = canvas.text().splitlines()
+        return lines[next(i for i, line in enumerate(lines) if " NAME " in line) + 1:]     # under the header
+
+    def test_every_size_and_count(self):
+        for running, stopped in ((0, 0), (1, 0), (5, 3), (12, 0), (25, 4), (40, 10), (0, 12)):
+            names = [f"c{i:02}" for i in range(running)] + [f"old{i:02}" for i in range(stopped)]
+            mon = monitor([row(name, cpu=float(running - i)) for i, name in enumerate(names[:running])]
+                          + [row(name, live=False, state="Stopped") for name in names[running:]])
+            for (width, height), text_filter in itertools.product(
+                    ((70, 12), (80, 24), (100, 18), (120, 30), (160, 45), (160, 20), (200, 60)), ("", "c1")):
+                where = f"{running} running, {stopped} stopped, {width}x{height}, filter {text_filter!r}"
+                text = "\n".join(self.draw(mon, width, height, text_filter))
+                listed = [name for name in names if text_filter in name]
+                rows = re.findall(r"^[│|] [●■*#] (\S+) ", text, re.M)
+                more = sum(int(n) for n in re.findall(r"^│ \+(\d+) more ", text, re.M))
+                folded = re.search(r"^│ (\d+) stopped: ", text, re.M)
+                self.assertEqual(len(set(rows)), len(rows), where)
+                self.assertEqual(len(rows) + more + (int(folded.group(1)) if folded else 0), len(listed), where)
+                self.assertTrue(set(rows) <= set(listed), where)
+                self.assertNotRegex(text, r"^│ … \d+ more", where)
 
 
 if __name__ == "__main__":
