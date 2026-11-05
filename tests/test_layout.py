@@ -154,7 +154,7 @@ def panels(canvas):
 
 
 class FrameLayoutTest(unittest.TestCase):
-    """draw() gives the table its rows first, then fits the panels above it."""
+    """draw() fits the panels and the table to the screen, the way fit_layout() says."""
 
     def setUp(self):
         saved = lxdtop.G
@@ -178,18 +178,20 @@ class FrameLayoutTest(unittest.TestCase):
         self.assertEqual(panels(render(monitor(rows(8)), 119, 45)), {"cpu by container", "containers"})
         self.assertIn("cpu", panels(render(monitor(rows(8)), 120, 45)))
 
-    def test_rows_come_first_then_host_panels_then_the_graph(self):
-        # 45 rows high: the status line, then panels, then the table (rows + 3).
-        self.assertEqual(panels(render(monitor(rows(26)), 160, 45)),
-                         {"cpu", "memory", "network", "cpu by container", "lxd events", "containers"})
-        self.assertEqual(panels(render(monitor(rows(27)), 160, 45)),
-                         {"cpu by container", "lxd events", "containers"})   # host panels go first
-        self.assertEqual(panels(render(monitor(rows(34)), 160, 45)),
-                         {"cpu by container", "lxd events", "containers"})   # the graph keeps 7 rows
-        self.assertEqual(panels(render(monitor(rows(35)), 160, 45)), {"containers"})
+    def test_the_host_panels_stay_and_rows_give_way(self):
+        # 45 rows high: the status line, the panels, then the table (rows + 3). Past 26 rows the
+        # graph shrinks, then only the top running instances keep a row: the panels all stay.
+        everything = {"cpu", "memory", "network", "cpu by container", "lxd events", "containers"}
+        for n in (26, 27, 34, 35, 60):
+            self.assertEqual(panels(render(monitor(rows(n)), 160, 45)), everything, n)
+        # On a much shorter screen, once fewer than MIN_RUNNING rows would be left, the graph goes,
+        # then the host panels last.
+        self.assertEqual(panels(render(monitor(rows(30)), 160, 24)), everything)       # 5 rows, "+25 more"
+        self.assertEqual(panels(render(monitor(rows(30)), 160, 23)), {"cpu", "memory", "network", "containers"})
+        self.assertEqual(panels(render(monitor(rows(30)), 160, 16)), {"containers"})
 
     def test_every_row_is_shown_when_it_fits(self):
-        for n in (1, 8, 26, 35, 41):
+        for n in (1, 8, 26, 27):                            # 27: beside the host panels and a 7-row graph
             text = render(monitor(rows(n)), 160, 45).text()
             for i in range(n):
                 self.assertIn(f" c{i:02} ", text, f"{n} rows")
@@ -197,9 +199,9 @@ class FrameLayoutTest(unittest.TestCase):
 
     def test_rows_that_do_not_fit_are_counted(self):
         text = render(monitor(rows(60)), 160, 45).text()
-        self.assertIn(" c39 ", text)
-        self.assertNotIn(" c40 ", text)
-        self.assertIn("… 20 more", text)
+        self.assertIn(" c25 ", text)                         # the top 26, in the sort order
+        self.assertNotIn(" c26 ", text)
+        self.assertIn("│ +34 more ", text)
 
     def test_columns_drop_as_the_window_narrows(self):
         def headers(width):
