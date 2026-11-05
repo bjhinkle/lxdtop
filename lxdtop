@@ -182,12 +182,14 @@ GLYPHS_ASCII = dict(full="#", mid="=", low="-", cell="#", cell_off=".", idle="."
                     up="^", down="v", sorted="v", more="~", deg="", times="x")
 G = GLYPHS_UNICODE
 
-# The fine drawing, for terminal windows (see pick_drawing()), adds braille for the CPU graph and
-# history (a cell is two columns of four dots: U+2800 plus one bit per dot) and eighth blocks for
-# meters, filled from the left, or from the bottom for the per-thread bars.
+# The fine drawing, for terminal windows (see pick_drawing()), adds braille for the CPU graph, its
+# history and the network graph (a cell is two columns of four dots: U+2800 plus one bit per dot) and
+# eighth blocks for meters, filled from the left, or from the bottom for the per-thread bars.
 BRAILLE = 0x2800
 BRAILLE_LEFT = (0, 0x40, 0x44, 0x46, 0x47)       # 0 to 4 dots up a cell's left column
 BRAILLE_RIGHT = (0, 0x80, 0xA0, 0xB0, 0xB8)      # and up its right column
+BRAILLE_LEFT_DOWN = (0, 0x01, 0x03, 0x07, 0x47)  # 0 to 4 dots down a cell's left column (network out)
+BRAILLE_RIGHT_DOWN = (0, 0x08, 0x18, 0x38, 0xB8)  # and down its right column
 EIGHTHS_LEFT = " ▏▎▍▌▋▊▉█"                       # 0 to 8 eighths of a cell
 EIGHTHS_UP = " ▁▂▃▄▅▆▇█"
 FINE = False             # True while the fine drawing is in use
@@ -1495,7 +1497,8 @@ def draw_net_panel(cv, y, x, h, w, mon):
     ins, outs = list(mon.net_in), list(mon.net_out)
     label_w = 11
     gw = w - 4 - label_w
-    window_in, window_out = ins[-gw:], outs[-gw:]
+    shown = gw * 2 if FINE else gw               # the fine graph has two samples a cell
+    window_in, window_out = ins[-shown:], outs[-shown:]
     peak = max(window_in + window_out, default=0)
     box(cv, y, x, h, w, "b_net", title=[[("network", "title")]],
         right=[[("peak ", "dim"), (fmt_mbps(mbps(peak)) + " Mb/s", "text")]])
@@ -1508,22 +1511,49 @@ def draw_net_panel(cv, y, x, h, w, mon):
     cv.put(y + 2, ix, (fmt_mbps(mbps(recent_in)) + " Mb/s") if recent_in is not None else "", "bright")
     cv.put(y + 1 + half, ix, f"{G['up']} out", "net_out")
     cv.put(y + 2 + half, ix, (fmt_mbps(mbps(recent_out)) + " Mb/s") if recent_out is not None else "", "bright")
-    gx = ix + label_w + (gw - len(window_in))
-    for col, (v_in, v_out) in enumerate(zip(window_in, window_out)):
-        for level in range(half):                # level 0 sits on the middle line
-            for value, row, style in ((v_in, y + half - level, "net_in"),
-                                      (v_out, y + 1 + half + level, "net_out")):
-                glyph = column_glyph(value / scale * half - level)
-                if glyph:
-                    cv.put(row, gx + col, glyph, style)
-                elif level == 0:
-                    cv.put(row, gx + col, G["idle"], "faint")
+    if FINE:
+        draw_fine_net_graph(cv, y + 1, ix + label_w, gw, half, window_in, window_out, scale)
+    else:
+        gx = ix + label_w + (gw - len(window_in))
+        for col, (v_in, v_out) in enumerate(zip(window_in, window_out)):
+            for level in range(half):                # level 0 sits on the middle line
+                for value, row, style in ((v_in, y + half - level, "net_in"),
+                                          (v_out, y + 1 + half + level, "net_out")):
+                    glyph = column_glyph(value / scale * half - level)
+                    if glyph:
+                        cv.put(row, gx + col, glyph, style)
+                    elif level == 0:
+                        cv.put(row, gx + col, G["idle"], "faint")
     # One entry per port in Mb/s, busiest first, so a busy trunk never falls off the end.
     pos = cv.put(y + rows, ix, "Mb/s  ", "dim", ix + w - 4)
     for nic, (r_in, r_out) in sorted(mon.nic_rates.items(), key=lambda item: (-sum(item[1]), item[0])):
         pos = put_parts(cv, y + rows, pos, [
             (nic + " ", "dim"), (G["down"], "net_in"), (fmt_mbps(mbps(r_in)) + " ", "text"),
             (G["up"], "net_out"), (fmt_mbps(mbps(r_out)) + "  ", "text")], ix + w - 4)
+
+
+def draw_fine_net_graph(cv, top, x, width, half, ins, outs, scale):
+    """The network graph in braille, for the fine drawing: two samples a cell, side by side, the newest
+    at the right, and four dots to a row, `half` rows each way from the middle line. Traffic in fills up
+    from that line and traffic out fills down from it, which eighth blocks can't do. As in the classic
+    drawing, a cell with too little traffic for a dot gets a faint dot by the line for each sample."""
+    dots = 4 * half
+    pad = [None] * (len(ins) % 2)                # so the newest sample ends a cell
+    cells = (len(ins) + len(pad)) // 2
+    start = x + width - cells
+    for values, up, style in ((pad + ins, True, "net_in"), (pad + outs, False, "net_out")):
+        lit = [None if value is None else min(dots, int(value / scale * dots + 0.5)) for value in values]
+        left_dots, right_dots = (BRAILLE_LEFT, BRAILLE_RIGHT) if up else (BRAILLE_LEFT_DOWN, BRAILLE_RIGHT_DOWN)
+        for col in range(cells):
+            left, right = lit[2 * col], lit[2 * col + 1]
+            for level in range(half):            # level 0 is next to the middle line
+                row = top + half - 1 - level if up else top + half + level
+                n_left, n_right = (min(4, max(0, (n or 0) - 4 * level)) for n in (left, right))
+                if n_left or n_right:
+                    cv.put(row, start + col, chr(BRAILLE + left_dots[n_left] + right_dots[n_right]), style)
+                elif level == 0:
+                    idle = (left_dots[1] if left is not None else 0) + (right_dots[1] if right is not None else 0)
+                    cv.put(row, start + col, chr(BRAILLE + idle), "faint")
 
 
 def draw_graph(cv, y0, x0, width, height, mon):
@@ -2349,12 +2379,12 @@ def pick_drawing(asked, colors):
     """Choose the drawing, and say on the help screen which it is and why.
 
     The classic drawing is what the Linux console can show: 16 colors, and only the characters in
-    Ubuntu's console font. The fine one is for terminal windows: braille for the CPU graph and
-    history, eighth blocks for meters, and ten shades of green to red on them. It needs a UTF-8
-    locale, 256 colors and a font with those characters. With no --drawing (`asked`), lxdtop draws
-    fine when TERM isn't the console's (linux) and the terminal has at least 256 `colors`; --dump
-    has no terminal to ask (colors is None), so it draws classic unless asked. --ascii, or a locale
-    that isn't UTF-8, draws plain ASCII whatever was asked.
+    Ubuntu's console font. The fine one is for terminal windows: braille for the CPU graph, its
+    history and the network graph, eighth blocks for meters, and ten shades of green to red on
+    them. It needs a UTF-8 locale, 256 colors and a font with those characters. With no --drawing
+    (`asked`), lxdtop draws fine when TERM isn't the console's (linux) and the terminal has at least
+    256 `colors`; --dump has no terminal to ask (colors is None), so it draws classic unless asked.
+    --ascii, or a locale that isn't UTF-8, draws plain ASCII whatever was asked.
     """
     global FINE, DRAWING
     term = os.environ.get("TERM", "")

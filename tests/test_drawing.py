@@ -83,6 +83,12 @@ def plain(text):
     return ESC.sub("", text)
 
 
+def net_graph(lines, width):
+    """The network panel's graph in a frame's lines: its four rows (in, then out), past the labels."""
+    x = 2 * (width * 52 // 160)
+    return [line[x + 13:width - 2] for line in lines[2:6]]
+
+
 class PickDrawingTest(unittest.TestCase):
     def pick(self, asked=None, colors=256, term="xterm-256color", ascii=False, encoding="UTF-8"):
         with drawing(False), glyphs(lxdtop.GLYPHS_ASCII if ascii else lxdtop.GLYPHS_UNICODE), \
@@ -209,8 +215,77 @@ class FineGraphTest(unittest.TestCase):
         self.assertIn("CPU HISTORY (last 2 min)", fine)
 
 
+class FineNetGraphTest(unittest.TestCase):
+    """The network graph in the fine drawing: braille, two samples a cell, and four dots to a row, with
+    traffic in filling up from the middle line and traffic out filling down from it."""
+
+    def graph(self, ins, outs, width=56, fine=True):
+        """Draw the network panel (7 rows, as on screen) and return its graph's rows and the panel's top."""
+        mon = support.monitor()
+        mon.net_in.clear()
+        mon.net_out.clear()
+        mon.net_in.extend(ins)
+        mon.net_out.extend(outs)
+        canvas = lxdtop.TextCanvas(7, width)
+        with drawing(fine), glyphs(lxdtop.GLYPHS_UNICODE):
+            lxdtop.draw_net_panel(canvas, 0, 0, 7, width, mon)
+        rows = [canvas.cells[y][13:width - 2] for y in range(1, 5)]
+        return ["".join(ch for ch, _ in row) for row in rows], rows, "".join(ch for ch, _ in canvas.cells[0])
+
+    def test_in_fills_up_and_out_fills_down(self):
+        # 8 Mb/s at the peak: a scale of 1,000,000 bytes a second to the dot, eight dots each way.
+        text, rows, _ = self.graph([1e6, 8e6], [4e6, 0.0])
+        self.assertEqual([line[-1] for line in text], [
+            chr(0x2800 + 0xB8),               # in, upper row: the right column's last four dots
+            chr(0x2800 + 0x40 + 0xB8),        # in, by the middle line: one dot at the bottom left, four right
+            chr(0x2800 + 0x47),               # out, by the middle line: four dots down the left
+            " "])                             # out, lower row: nothing
+        self.assertEqual([row[-1][1] for row in rows[:3]], ["net_in", "net_in", "net_out"])
+        self.assertEqual(set("".join(line[:-1] for line in text)), {" "})     # one cell: two samples
+
+    def test_two_samples_a_cell_the_newest_at_the_right(self):
+        # Odd: the oldest sample (8 dots) sits alone, in the right column of its cell. Then 1 dot and 4.
+        text, _, _ = self.graph([8e6, 1e6, 4e6], [0.0, 0.0, 0.0])
+        self.assertEqual(text[0][-2:], chr(0x2800 + 0xB8) + " ")
+        self.assertEqual(text[1][-2:], chr(0x2800 + 0xB8) + chr(0x2800 + 0x40 + 0xB8))
+
+    def test_too_little_for_a_dot_is_a_faint_dot_on_the_middle_line(self):
+        text, rows, _ = self.graph([0.0, 100.0, 0.0], [0.0, 0.0, 3e6])
+        self.assertEqual(text[1][-2:], chr(0x2800 + 0x80) + chr(0x2800 + 0x40 + 0x80))   # in: bottom dots
+        self.assertEqual(text[2][-2:], chr(0x2800 + 0x08) + chr(0x2800 + 0xB8))           # out: top dots, and 4
+        self.assertEqual([rows[1][-2][1], rows[1][-1][1], rows[2][-2][1], rows[2][-1][1]],
+                         ["faint", "faint", "faint", "net_out"])        # a cell has one color: the busy one's
+        self.assertEqual(text[0].strip(), "")                           # idle dots only by the middle line
+
+    def test_the_peak_and_the_graph_cover_twice_the_time(self):
+        # 41 cells: the classic graph shows the newest 41 samples, the fine one the newest 82.
+        ins = [1e6] * 100
+        ins[-60] = 50e6                                            # 400 Mb/s, 60 samples ago
+        _, _, classic = self.graph(ins, [0.0] * 100, fine=False)
+        _, _, fine = self.graph(ins, [0.0] * 100)
+        self.assertIn("┐peak 8.00 Mb/s┌", classic)
+        self.assertIn("┐peak 400 Mb/s┌", fine)
+
+    def test_the_classic_drawing_is_as_it_was(self):
+        text, rows, _ = self.graph([1e6, 8e6, 0.0], [4e6, 0.0, 0.0], fine=False)
+        self.assertEqual([line[-3:] for line in text], [" █ ", "░█·", "█··", "   "])   # a sample a column
+        self.assertEqual({row[-1][1] for row in rows[1:3]}, {"faint"})
+
+    def test_whole_frames(self):
+        for width, height in ((120, 30), (160, 45), (200, 60)):
+            mon = monitor()
+            mon.net_in.extend((i * 37) % 100 * 1e5 for i in range(300))
+            mon.net_out.extend((i * 53) % 100 * 4e4 for i in range(300))
+            fine = net_graph(plain(frame(width, height, fine=True, mon=mon)).split("\n"), width)
+            classic = net_graph(plain(frame(width, height, fine=False, mon=mon)).split("\n"), width)
+            self.assertFalse(SHADES & set("".join(fine)), f"{width}x{height}")
+            self.assertTrue(set("".join(fine)) <= BRAILLE | {" "}, f"{width}x{height}")
+            self.assertTrue(set("".join(classic)) <= SHADES | {" ", "·"}, f"{width}x{height}")
+            self.assertEqual([len(line) for line in fine], [len(line) for line in classic])
+
+
 class FineFrameTest(unittest.TestCase):
-    """The fine drawing on the whole screen: only the graph, the history and the meters change."""
+    """The fine drawing on the whole screen: only the graphs, the history and the meters change."""
 
     def test_only_the_graph_the_history_and_the_meters_change(self):
         # Cell by cell, the two drawings differ only where both have a drawing character, apart from
@@ -237,10 +312,12 @@ class FineFrameTest(unittest.TestCase):
         heading = next(i for i, line in enumerate(lines) if "CPU HISTORY" in line)
         x, w = lxdtop.table_layout(160 - 4)["hist"]
         history = [line[2 + x:2 + x + w] for line in lines[heading + 1:heading + 6]]   # the running instances
-        for text in graph + history:
+        network = net_graph(lines, 160)
+        for text in graph + history + network:
             self.assertFalse(SHADES & set(text), text)
         self.assertTrue(BRAILLE & set("".join(graph)))
         self.assertTrue(all(BRAILLE & set(text) for text in history), history)
+        self.assertTrue(BRAILLE & set("".join(network)), network)
 
     def test_meter_colors_by_level_and_memory_keeps_its_cache_and_free_colors(self):
         canvas = lxdtop.TextCanvas(7, 52)
