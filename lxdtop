@@ -5,7 +5,9 @@
 
 Run it on the LXD host itself, in a terminal or over SSH. It is laid out for a
 160x45 screen (a small console monitor or a large terminal window) and adapts
-to smaller windows by dropping panels, then columns. It uses only the Python
+to smaller windows. On a shorter one the CPU graph shrinks, the stopped
+instances share a line and only the top running ones are listed before a panel
+is dropped; a narrower one drops panels, then columns. It uses only the Python
 standard library: copy this one file to the host (for example ~/bin/lxdtop)
 and run it.
 
@@ -78,6 +80,11 @@ RECENT_KILL = 3600       # a recent memory kill: the kernel killed one of its pr
 NEAR_LIMIT_PCT = 90      # near a limit: memory or processes at this % of their limit or more (shown in
                          # yellow in the wide-screen columns; no warning)
 OPS_FROM = 160           # screens wider than this many columns get the extra columns (see OPS_COLUMNS)
+
+# How a short screen is shared: see fit_layout() for what gives way first.
+HOST_ROWS = 7            # the cpu, memory and network panels (on screens 120 columns wide or more)
+GRAPH_ROWS = (7, 14)     # the CPU-by-instance graph panel: its smallest height, and its tallest
+MIN_RUNNING = 5          # running instances the table keeps before the graph, then the host panels, go
 
 HISTORY = 900                      # samples kept per graph (30 min at 2 s)
 RATE_WINDOW = 4                    # disk and network rates average over the last 3 intervals
@@ -1624,7 +1631,7 @@ def warning_parts(alerts, room):
     return parts
 
 
-def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
+def draw_table_panel(cv, y, x, h, w, rows, mon, ui, shown=None, fold=False):
     sources_ok = mon.api_status == "ok"
     noun, alerts = instance_noun(mon), warnings(mon)
     title = [[(noun, "title")]]
@@ -1642,24 +1649,66 @@ def draw_table_panel(cv, y, x, h, w, rows, mon, ui):
     draw_header(cv, y + 1, ix, layout, ui)
     marked = {cg for *_, cg in alerts if cg}           # rows to mark in red
     room = h - 3
-    for i, row in enumerate(rows[:room]):
-        if i == room - 1 and len(rows) > room:
-            cv.put(y + 2 + i, ix, f"{G['more']} {len(rows) - i} more", "dim")
-            break
-        draw_row(cv, y + 2 + i, ix, layout, row, mon, marked)
+    live = [row for row in rows if row["live"]]
+    if shown is None or (shown >= len(live) and not fold):     # a row for every instance, as always
+        for i, row in enumerate(rows[:room]):
+            if i == room - 1 and len(rows) > room:
+                cv.put(y + 2 + i, ix, f"{G['more']} {len(rows) - i} more", "dim")
+                break
+            draw_row(cv, y + 2 + i, ix, layout, row, mon, marked)
+        return
+    # A short screen (see fit_layout()): the top running instances in the sort order, "+N more"
+    # for the rest of them, then the stopped instances on one line.
+    line, bottom = y + 2, y + h - 1
+    for row in live[:shown]:
+        draw_row(cv, line, ix, layout, row, mon, marked)
+        line += 1
+    if shown < len(live) and line < bottom:
+        cv.put(line, ix, f"+{len(live) - shown} more", "dim")
+        line += 1
+    gone = rows[len(live):]                           # the stopped ones, by name
+    if fold and gone and line < bottom:
+        parts = [(f"{len(gone)} stopped: ", "dim")]
+        for i, row in enumerate(gone):              # a stopped one with a warning keeps its red
+            parts.append(((", " if i else "") + row["name"], "hi" if row["cg"] in marked else "dim"))
+        if put_parts(cv, line, ix, parts, ix + iw) > ix + iw:
+            cv.put(line, ix + iw - 1, G["more"], "dim")   # cut to fit: say so
+
+
+def fit_layout(width, height, running, stopped):
+    """Share the screen's rows: (host panels, graph panel, running instances shown, fold the stopped).
+
+    When everything fits, this is the layout lxdtop always had. When the screen is short, space
+    gives way in this order: the CPU-by-instance graph shrinks to its smallest; then the stopped
+    instances fold into one line; then only the top running instances keep a row, with "+N more"
+    for the rest, down to MIN_RUNNING of them; then the graph goes; and the cpu, memory and
+    network panels go last.
+    """
+    host = HOST_ROWS if width >= 120 else 0
+    spare = height - 1 - (running + stopped + 3)        # rows left after the status line and the whole table
+    if spare - host >= GRAPH_ROWS[0] + (1 if host else 0):     # everything fits: the host panels came
+        return host, min(GRAPH_ROWS[1], spare - host), running, False   # with a graph of 8 or more
+    folded = 1 if stopped else 0                        # the line the stopped instances fold into
+    for host, graph in ((host, GRAPH_ROWS[0]), (host, 0), (0, 0)):
+        lines = height - 1 - host - graph - 3          # the table's rows, inside its edges, under its header
+        for used, fold in ((running + stopped, False), (running + folded, stopped > 0)):
+            if lines >= used:                           # every running instance fits
+                extra = min(GRAPH_ROWS[1] - graph, lines - used) if graph else 0   # the rest to the graph
+                return host, graph + extra, running, fold
+        if lines >= MIN_RUNNING + 1 + folded or not (host or graph):
+            return host, graph, max(0, lines - 1 - folded), stopped > 0          # the top ones, "+N more"
 
 
 def draw(cv, mon, ui):
-    """Lay the panels out to fit the screen; the container table always gets its rows first."""
+    """Lay the panels out to fit the screen: fit_layout() says how tall each one is."""
     if cv.w < 70 or cv.h < 12:
         cv.put(0, 0, f"lxdtop needs at least 70x12 (this is {cv.w}x{cv.h})", "hi")
         return
     rows = sort_rows(mon, ui.sort)
     draw_status(cv, 0, mon)
     y = 1
-    spare = cv.h - y - (len(rows) + 3)           # rows left after the table's border, header and rows
-    top_h = 7 if cv.w >= 120 and spare >= 15 else 0
-    mid_h = min(14, spare - top_h) if spare - top_h >= 7 else 0
+    running = sum(1 for row in rows if row["live"])
+    top_h, mid_h, shown, fold = fit_layout(cv.w, cv.h, running, len(rows) - running)
     if top_h:
         side = cv.w * 52 // 160
         draw_cpu_panel(cv, y, 0, top_h, side, mon)
@@ -1672,7 +1721,7 @@ def draw(cv, mon, ui):
         if events_w:
             draw_events_panel(cv, y, cv.w - events_w, mid_h, events_w, mon)
         y += mid_h
-    draw_table_panel(cv, y, 0, cv.h - y, cv.w, rows, mon, ui)
+    draw_table_panel(cv, y, 0, cv.h - y, cv.w, rows, mon, ui, shown, fold)
 
 
 # --- Running it ---------------------------------------------------------------
