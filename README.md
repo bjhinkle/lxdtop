@@ -46,6 +46,11 @@ These come from a running container's cgroup, so stopped instances and VMs leave
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.7.1
+
+- **A crash fix.** lxdtop no longer exits when an instance's CPU controller is turned on while it runs. That instance shows no throttling figure for one refresh, then the real one.
+- **`? keys` on the main screen.** The instance table's bottom edge now says where the help screen is. At 80 columns it gives way to a longer `lxd api` status, such as `no access`, and the rest of the screen is as before.
+
 ## What's new in 1.7.0
 
 - **Keys for a closer look.** `?` lists every key. `/` filters the table by name, the arrows highlight a row, and Enter opens a page with everything lxdtop has on that instance: its readings and limits, throttling, pressure, memory kills, newest snapshot and recent events. Esc acts at once. All of it is read-only, and with nothing highlighted the screen is as before.
