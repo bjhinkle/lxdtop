@@ -83,35 +83,35 @@ class SplitArrowKeyTest(unittest.TestCase):
 
 
 class BusiestProcessTest(unittest.TestCase):
-    """BJ's screenshot: java at 7.9% inside wazuh at 1.1%. The process's CPU was averaged with its
+    """From a real host's screen: java at 7.9% inside its container at 1.1%. The process's CPU was averaged with its
     reading before, while the container's is the last interval's alone."""
 
     def readings(self, *intervals):
-        """A container, wazuh, whose only busy process is java: for each 2 s interval, the CPU the cgroup
+        """A container, app, whose only busy process is java: for each 2 s interval, the CPU the cgroup
         counted and the clock ticks java used. The busiest process after the last."""
         host = FakeHost(self)
         host.set_basics()
         host.set_cpu_times((100, 0, 900), [(25, 0, 225)] * 4)
-        host.add_container("wazuh", 1_000_000)
+        host.add_container("app", 1_000_000)
         usec, ticks = 1_000_000, 0
-        host.add_process(4242, "java", "/lxc.payload.wazuh/system.slice/wazuh.service", utime=ticks, start=500)
+        host.add_process(4242, "java", "/lxc.payload.app/system.slice/app.service", utime=ticks, start=500)
         with host.installed():
             mon = lxdtop.Monitor(None, None)
             mon.sample()
             for cgroup_usec, java_ticks in intervals:
                 host.clock += 2
                 usec, ticks = usec + cgroup_usec, ticks + java_ticks
-                host.write("/sys/fs/cgroup/lxc.payload.wazuh/cpu.stat", f"usage_usec {usec}\n")
-                host.add_process(4242, "java", "/lxc.payload.wazuh/system.slice/wazuh.service", utime=ticks,
+                host.write("/sys/fs/cgroup/lxc.payload.app/cpu.stat", f"usage_usec {usec}\n")
+                host.add_process(4242, "java", "/lxc.payload.app/system.slice/app.service", utime=ticks,
                                  start=500)
                 mon.sample()
-        (wazuh,) = mon.rows
-        return wazuh["cpu"], wazuh["top"], lxdtop.reading_json(mon, 2)["instances"][0]["busiest_process"]
+        (app,) = mon.rows
+        return app["cpu"], app["top"], lxdtop.reading_json(mon, 2)["instances"][0]["busiest_process"]
 
     def test_never_more_than_its_container(self):
         cpu, top, json_top = self.readings((300_000, 30 * TICKS // 100), (20_000, 2 * TICKS // 100))   # 15%, then 1%
         self.assertEqual(cpu, 1.0)
-        self.assertEqual(top, ("java", 1.0))                  # the last 2 s, as wazuh's: not (15 + 1) / 2
+        self.assertEqual(top, ("java", 1.0))                  # the last 2 s, as app's: not (15 + 1) / 2
         self.assertEqual(json_top, dict(name="java", cpu_pct=1.0))
 
     def test_its_clock_ticks_cannot_put_it_over(self):
