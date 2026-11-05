@@ -104,6 +104,24 @@ class TimeoutTest(unittest.TestCase):
         self.assertEqual(timeouts[0], 5)
         self.assertEqual(timeouts[targets.index(INSTANCES):], [30] * (len(targets) - targets.index(INSTANCES)))
 
+    def test_lxds_metrics_too(self):
+        """#16: get_text(), which reads LXD's metrics for VMs off ZFS (#34), kept 5 s on a cluster member."""
+        timeouts = []
+        real = lxdtop.UnixHTTPConnection
+
+        def recorded(path, timeout=5):
+            timeouts.append(timeout)
+            return real(path, timeout)
+
+        routes = cluster_routes()
+        routes["/1.0/metrics"] = (200, b"# no VMs here\n")
+        with mock.patch.object(lxdtop, "UnixHTTPConnection", recorded), FakeLxd(routes) as lxd:
+            api = lxdtop.LxdApi(lxd.path)
+            api.vm_disks_wanted = frozenset({"win"})          # as Monitor sets it for a VM with no disk counters
+            api.fetch()
+        targets = [target for _, target, _ in lxd.requests]
+        self.assertEqual(timeouts[targets.index("/1.0/metrics")], 30)
+
 
 if __name__ == "__main__":
     unittest.main()

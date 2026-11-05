@@ -745,7 +745,7 @@ class LxdApi:
 
     def get_text(self, path):
         """A GET whose answer is text rather than JSON: LXD's metrics."""
-        conn = UnixHTTPConnection(self.socket_path)
+        conn = UnixHTTPConnection(self.socket_path, self.timeout)
         try:
             conn.request("GET", path)
             reply = conn.getresponse()
