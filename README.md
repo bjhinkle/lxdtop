@@ -46,6 +46,10 @@ These come from a running container's cgroup, so stopped instances and VMs leave
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.8.0
+
+- **A finer drawing for terminal windows.** In a terminal with 256 colors and a UTF-8 locale, the CPU graph and the CPU history column are drawn in braille dots, meters move in eighths of a character, and the CPU, memory and swap meters shade from green through yellow to red. The Linux console and `--ascii` look exactly as before, and `--drawing classic` keeps the old look anywhere. See [Terminals](#terminals).
+
 ## What's new in 1.7.1
 
 - **A crash fix.** lxdtop no longer exits when an instance's CPU controller is turned on while it runs. That instance shows no throttling figure for one refresh, then the real one.
@@ -101,7 +105,8 @@ Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, n
 | `--interval N` | Seconds between readings (default 2) |
 | `--no-api` | Skip LXD's API: no names, IPs, VMs, stopped instances or events |
 | `--ascii` | Plain ASCII drawing characters |
-| `--dump` | Print one frame as text and exit, for testing (with `--color`, `--size COLSxROWS`, `--samples N`) |
+| `--drawing fine` or `--drawing classic` | Choose the drawing: fine (braille graphs, smooth meters) or classic (as on the Linux console). lxdtop picks one when this isn't given: see [Terminals](#terminals) |
+| `--dump` | Print one frame as text and exit, for testing (with `--color`, `--size COLSxROWS`, `--samples N`, `--drawing`) |
 | `--dump --json` | Print one reading as a JSON document instead, for scripts and monitoring checks: see [One reading as JSON](#one-reading-as-json) |
 
 The clock follows the system time zone. Set `TZ` to change it, for example `TZ=UTC lxdtop`.
@@ -167,7 +172,12 @@ Network traffic is shown in bits per second and data in bytes: bandwidth is in b
 
 ## Terminals
 
-On the Linux console, lxdtop uses 16 colors and only the characters in Ubuntu's default console font, so its graphs use full, medium and light shade blocks. Terminals with 256 colors get finer greys and blues.
+lxdtop has two drawings and picks one when it starts. The help screen (`?`) says which, and why.
+
+- **Classic** is what the Linux console can show: 16 colors and only the characters in Ubuntu's default console font, so graphs use full, medium and light shade blocks, and meters use `■`. Terminals with 256 colors get finer greys and blues.
+- **Fine** is for a terminal window that can show it: a UTF-8 locale, at least 256 colors, and a `TERM` other than `linux`. The CPU-by-instance graph and the CPU history column are drawn in braille dots, two readings to a character, so they cover twice the time in the same width. Meters fill in eighths of a character, and the CPU, memory-used and swap meters shade from green through yellow to red with their level. The ZFS cache and free memory keep their own colors, since a full one is no warning.
+
+`--drawing classic` keeps the classic drawing in a terminal window. `--drawing fine` asks for the fine one where lxdtop wouldn't pick it, for example a terminal whose `TERM` claims fewer colors than it has. `--dump` draws classic unless `--drawing fine` is given, so `lxdtop --dump --drawing fine` and `lxdtop --dump` show the two side by side. `--ascii`, or a locale that isn't UTF-8, draws plain ASCII whichever is asked for. tmux and screen set a `TERM` of their own, so on the console inside them, use `--drawing classic`.
 
 ## Status
 
