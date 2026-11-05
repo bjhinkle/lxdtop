@@ -46,6 +46,10 @@ These come from a running container's cgroup, so stopped instances and VMs leave
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.6.0
+
+- **`--dump --json`.** One reading as a single JSON document: everything the screen shows, as numbers in base units, for scripts, a monitoring check, or a view that gathers several hosts over ssh. See [One reading as JSON](#one-reading-as-json).
+
 ## What's new in 1.5.0
 
 - **Security fixes.** A review of 1.4.0 found nothing high-severity, and everything it found is fixed. Text from inside containers can't send escape sequences to your terminal or shift the screen. A process name that isn't UTF-8, or an odd or stalled answer on LXD's socket, no longer stops lxdtop or its updates, and the event panel names the error it reconnects after. Interface names from LXD stay inside `/sys/class/net`, a delegated ZFS dataset can't take another instance's disk numbers, and `lxdtop-remote` passes hosts and options to ssh without them being read as options or shell code. Details are in [SECURITY-REVIEW.md](SECURITY-REVIEW.md).
@@ -86,6 +90,7 @@ Keys: `q` quits, `s` cycles the sort (cpu, mem, disk, net, name), and `-` and `+
 | `--no-api` | Skip LXD's API: no names, IPs, VMs, stopped instances or events |
 | `--ascii` | Plain ASCII drawing characters |
 | `--dump` | Print one frame as text and exit, for testing (with `--color`, `--size COLSxROWS`, `--samples N`) |
+| `--dump --json` | Print one reading as a JSON document instead, for scripts and monitoring checks: see [One reading as JSON](#one-reading-as-json) |
 
 The clock follows the system time zone. Set `TZ` to change it, for example `TZ=UTC lxdtop`.
 
@@ -108,6 +113,27 @@ Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time
 ## Run it full-time on a console screen
 
 `examples/lxdtop-console.service` is a systemd unit that keeps lxdtop running on virtual terminal 8, for a small monitor attached to the host. Switch to it with Alt+F8 at the keyboard, or with `lxdtop-remote screen myhost` from another machine.
+
+## One reading as JSON
+
+`lxdtop --dump --json` prints one reading as a single JSON document instead of the text frame. `--samples` and `--interval` work as with `--dump`. For example, `ssh myhost '~/bin/lxdtop --dump --json'` from another machine, or in a script:
+
+```bash
+lxdtop --dump --json | python3 -c 'import json, sys; [print(i["name"], i["cpu_pct"]) for i in json.load(sys.stdin)["instances"]]'
+```
+
+Numbers stay numbers, in base units, and each key ends in its unit: `_bytes`, `_s` (seconds), `_bytes_per_s` (disk), `_bits_per_s` (network, decimal) or `_pct`. CPU % means what it does on screen: an instance's or a process's 100 is one core, and the host's `busy_pct` is the share of the whole machine. A value lxdtop has no reading for is `null`, never `0`, and so is a limit that isn't set. As on screen, exec command lines appear only with `--show-commands`, and nothing comes from an instance's config. Text from inside containers is escaped (`\u001b`), never written raw.
+
+| Field | What it holds |
+|---|---|
+| `schema`, `lxdtop_version`, `taken_at`, `interval_s`, `lxd_api` | This format's version (1), lxdtop's version, when the reading was taken (UTC, ISO 8601), the seconds between readings, and the state of LXD's API (`ok`, `off`, `no access`, `error (…)`) |
+| `host` | `name`, `lxd_version`, `os`, `kernel`, `cluster_member`, `uptime_s`. `cpu`: `busy_pct`, `threads_busy_pct`, `outside_instances_pct` (the graph's "host itself", 100 = one core), `temp_c`, `clock_mhz`, `load_1m`, `load_5m`, `load_15m`. `memory`: `total_bytes`, `used_bytes` (without the ZFS ARC), `zfs_arc_bytes`, `available_bytes`, `swap_total_bytes`, `swap_used_bytes`. `root_fs`: `used_bytes`, `total_bytes` |
+| `network` | The host's physical ports: `in_bits_per_s` and `out_bits_per_s` (all ports, over the last three readings), `peak_bits_per_s`, and `ports`, each with `name`, `in_bits_per_s` and `out_bits_per_s` |
+| `pools` | `name`, `used_bytes`, `total_bytes` (from LXD) and `health` (a ZFS pool's state: `ONLINE`, `DEGRADED`, …) |
+| `warnings` | Most serious first: `severity` (5 a pool down, 4 a memory kill, 3 a degraded pool, 2 high pressure, 1 throttling), `kind`, `instance` or `pool`, and `text` as the screen shows it |
+| `events` | `status`, and the `feed`, newest first: `time`, `action` (LXD's, such as `instance-started`), `instance`, `detail`, `user`, `count` |
+| `instance_counts` | `running`, `stopped` |
+| `instances` | In the table's order: `name`, `type`, `state`, `ipv4`, `uptime_s`, `cpu_pct`, `cpu_history_pct`, `busiest_process` (`name`, `cpu_pct`), `mem_bytes`, `disk_read_bytes_per_s`, `disk_write_bytes_per_s`, `disk_source` (`zfs` or `io.stat`), `net_in_bits_per_s`, `net_out_bits_per_s`, `tasks`. Limits and ops signals: `cpu_limit_cores`, `cpu_throttled_pct`, `mem_limit_bytes`, `mem_of_limit_pct`, `tasks_limit`, `tasks_of_limit_pct`, `waiting_on`, `waiting_pct`, `mem_kills` (since lxdtop started), `mem_kills_total` (the kernel's count since the instance started), `last_mem_kill_ago_s`, `newest_snapshot_at`, `newest_snapshot_age_s` |
 
 ## Where the numbers come from
 

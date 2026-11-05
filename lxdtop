@@ -55,7 +55,7 @@ import types
 import unicodedata
 import urllib.parse
 
-VERSION = "1.5.0 (2026-11-04)"
+VERSION = "1.6.0 (2026-11-05)"
 TIMEZONE = None      # the clock's default (None = the system's); TZ overrides it
 CGROUP_GLOB = "/sys/fs/cgroup/lxc.payload.*"
 CGROUP_PREFIX = "lxc.payload."
