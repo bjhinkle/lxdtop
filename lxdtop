@@ -584,6 +584,7 @@ class LxdEvents:
         self.lock = threading.Lock()
         self.feed = collections.deque(maxlen=50)     # newest first
         self.status = "connecting"
+        self.member = ""                             # on a cluster, this member's name (Monitor has it from the API)
 
     def start(self):
         threading.Thread(target=self._loop, daemon=True).start()
@@ -642,6 +643,8 @@ class LxdEvents:
                     message = b""
 
     def _record(self, event):
+        if self.member and event.get("location", self.member) != self.member:
+            return                                   # it happened on another cluster member
         meta = event.get("metadata") or {}
         # Outside the default project, LXD adds "?project=<name>" to the source: leave it off.
         parts = urllib.parse.unquote(meta.get("source", "").partition("?")[0]).split("/")   # /1.0/instances/<name>/...
@@ -708,6 +711,8 @@ class Monitor:
         instances = {}
         if self.api:
             instances, self.api_status, self.server, self.pools = self.api.snapshot()
+            if self.events:
+                self.events.member = self.server.get("member", "")   # so the feed keeps to this cluster member
         uptime = float((read("/proc/uptime") or "0").split()[0])
         self.procs.sample(now)
         if now - self.zfs_checked > 30:          # after the processes: it reads each container's first one
