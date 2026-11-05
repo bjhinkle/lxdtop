@@ -99,6 +99,8 @@ lxdtop-remote install myhost    # copy lxdtop to myhost:~/bin/lxdtop
 lxdtop-remote myhost            # run it in this terminal
 ```
 
+`install` copies lxdtop over one SSH connection to `~/bin/lxdtop.new` on the host and checks it there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and `lxdtop.new --version` must print lxdtop's version. Only then is it renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was, so the console service never restarts into a half-copied file. On success it prints the version and the SHA-256 it checked.
+
 On the host it runs `~/bin/lxdtop`, or the `lxdtop` on the host's PATH when `~/bin` has none, so a single copy in `/usr/local/bin` serves every user.
 
 Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time zone for the clock, and a window size to switch to while it runs. The comments at the top of the script list them.

@@ -13,9 +13,21 @@ $FAKE_SSH_LOG, one JSON line per run, then acts out what lxdtop-remote relies on
                           characters; older versions don't, and neither does
                           this stand-in.
   ssh <dest> <words...>   join the words with spaces, as ssh does, and run the
-                          result with sh -c in $FAKE_SSH_REMOTE_HOME, which
-                          stands in for the login shell on the host. With
+                          result with the login shell's -c in $FAKE_SSH_REMOTE_HOME,
+                          which stands in for the home directory on the host. The
+                          login shell is $FAKE_SSH_LOGIN_SHELL (default sh), and
+                          $FAKE_SSH_REMOTE_PATH, if set, is the host's PATH. With
                           FAKE_SSH_DRY set, only record it.
+
+Two things that can happen to what ssh sends the host on its standard input:
+
+  FAKE_SSH_FLIP_BYTE=N    byte N arrives changed.
+  FAKE_SSH_DROP_AFTER=N   the connection drops after N bytes. The host's sshd
+                          then closes the command's pipes: its input ends there,
+                          and nothing it prints comes back, but it keeps running,
+                          because sshd doesn't stop a command that has no
+                          terminal. This waits for it, so a test sees what it
+                          left behind, then fails as ssh does, with status 255.
 """
 
 import getopt
@@ -65,7 +77,28 @@ def main():
     if os.environ.get("FAKE_SSH_DRY") or not command:
         return 0
     home = os.environ["FAKE_SSH_REMOTE_HOME"]
-    return subprocess.run(["sh", "-c", command], cwd=home, env=dict(os.environ, HOME=home)).returncode
+    env = dict(os.environ, HOME=home, PATH=os.environ.get("FAKE_SSH_REMOTE_PATH", os.environ.get("PATH", "")))
+    host = [os.environ.get("FAKE_SSH_LOGIN_SHELL", "sh"), "-c", command]
+    flip, drop = os.environ.get("FAKE_SSH_FLIP_BYTE"), os.environ.get("FAKE_SSH_DROP_AFTER")
+    if flip is None and drop is None:
+        return subprocess.run(host, cwd=home, env=env).returncode
+    data = bytearray(sys.stdin.buffer.read())
+    if flip is not None:
+        data[int(flip)] ^= 1
+    if drop is None:
+        return subprocess.run(host, cwd=home, env=env, input=data).returncode
+    pipe = subprocess.PIPE
+    proc = subprocess.Popen(host, cwd=home, env=env, stdin=pipe, stdout=pipe, stderr=pipe)
+    try:
+        proc.stdin.write(data[:int(drop)])
+        proc.stdin.close()
+    except BrokenPipeError:                 # the command stopped reading
+        pass
+    proc.stdout.close()
+    proc.stderr.close()
+    proc.wait()
+    print("client_loop: send disconnect: Broken pipe", file=sys.stderr)
+    return 255
 
 
 if __name__ == "__main__":
