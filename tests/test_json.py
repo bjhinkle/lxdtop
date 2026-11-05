@@ -234,6 +234,28 @@ class JsonDumpTest(unittest.TestCase):
         self.assertEqual((db["disk_read_bytes_per_s"], db["disk_source"]), (None, None))
         self.assertEqual((db["net_in_bits_per_s"], db["net_out_bits_per_s"]), (None, None))   # no host-side NIC
 
+    def test_a_file_it_could_not_read_is_null_not_zero(self):
+        self.host.remove("/proc/loadavg")
+        self.host.write("/proc/meminfo", "MemTotal:       65536000 kB\nMemAvailable:   32768000 kB\n")   # no swap lines
+        self.host.remove("/sys/fs/cgroup/lxc.payload.web/memory.current")
+        self.host.remove("/proc/5151/status")                     # the VM's QEMU process: its VmRSS
+        doc = self.reading()
+        cpu, memory = doc["host"]["cpu"], doc["host"]["memory"]
+        self.assertEqual((cpu["load_1m"], cpu["load_5m"], cpu["load_15m"]), (None, None, None))
+        self.assertEqual((memory["swap_total_bytes"], memory["swap_used_bytes"]), (None, None))
+        self.assertEqual((memory["total_bytes"], memory["available_bytes"]), (65536000 * 1024, 32768000 * 1024))
+        web, win = self.instance(doc, "web"), self.instance(doc, "win")
+        self.assertEqual((web["mem_bytes"], web["mem_of_limit_pct"]), (None, None))
+        self.assertEqual(web["tasks"], 10)                        # the rest of web is read as before
+        self.assertIsNone(win["mem_bytes"])
+        self.assertEqual(win["cpu_history_pct"], [None, 0.0])
+
+    def test_without_proc_meminfo_every_memory_field_is_null(self):
+        self.host.remove("/proc/meminfo")
+        memory = self.reading()["host"]["memory"]
+        self.assertEqual(memory, dict(total_bytes=None, used_bytes=None, zfs_arc_bytes=8589934592, available_bytes=None,
+                                      swap_total_bytes=None, swap_used_bytes=None))
+
     def test_no_api(self):
         doc = self.reading(api=False)
         self.assertEqual(doc["lxd_api"], "off")

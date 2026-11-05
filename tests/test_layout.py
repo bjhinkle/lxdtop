@@ -6,7 +6,7 @@ import time
 import types
 import unittest
 
-from tests.support import glyphs, lxdtop, monitor, render, row
+from tests.support import HOST_READING, glyphs, lxdtop, monitor, render, row
 
 ALL_HEADERS = ("NAME", "UP", "CPU", "CPU HISTORY", "BUSIEST PROCESS", "MEM", "DISK R", "DISK W",
                "IN Mb/s", "OUT Mb/s", "TASKS", "IPV4")
@@ -312,6 +312,31 @@ class TableRowTest(unittest.TestCase):
         self.assertIn("MEM↓", header_line(render(mon, 160, 45, sort="mem")))
         self.assertIn("DISK R↓", header_line(render(mon, 160, 45, sort="disk")))
         self.assertIn("NAME↓", header_line(render(mon, 160, 45, sort="name")))
+
+
+class NoReadingTest(unittest.TestCase):
+    """A file lxdtop couldn't read leaves its reading out (None), and the panels draw without it."""
+
+    def test_no_meminfo_loadavg_or_memory_current(self):
+        host = dict(HOST_READING, mem_total=None, mem_used=None, mem_free=None, swap_total=None, swap_used=None,
+                    load=[])
+        mon = monitor([row("web", mem=None), row("db")], host=host)
+        for width, height in ((80, 24), (160, 45), (200, 60)):
+            lines = render(mon, width, height).text().splitlines()
+            self.assertEqual(len(lines), height)
+            if width >= 120:                                     # the host panels
+                side = width * 52 // 160
+                memory = [line[side:2 * side] for line in lines[1:8]]
+                self.assertRegex(memory[0], r"^╭─┐memory┌─+╮$")    # no total
+                for label in ("used", "free"):
+                    (line,) = [line for line in memory if line.startswith(f"│ {label} ")]
+                    self.assertRegex(line, rf"^│ {label} +■+ +│$")     # an empty meter: no number, no %
+                self.assertFalse(any(line.startswith("│ swap ") for line in memory))
+                self.assertRegex(lines[6][:side], r"^│ load +\d+ threads │$")
+            web = next(line for line in lines if "● web " in line)
+            db = next(line for line in lines if "● db " in line)
+            self.assertNotIn("384M", web)                        # web's MEM is blank, db's is as it was
+            self.assertIn("384M", db)
 
 
 class SortTest(unittest.TestCase):
