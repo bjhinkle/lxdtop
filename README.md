@@ -116,17 +116,18 @@ Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12.
 
 ## Install and run
 
-On the LXD host, download `lxdtop` beside where it goes, check that it runs, and move it into place:
+On the LXD host, download the latest release and its checksum, check one against the other, copy lxdtop beside where it goes, check that it runs, and move it into place:
 
 ```bash
-mkdir -p ~/bin
-curl -fsSL -o ~/bin/lxdtop.new https://raw.githubusercontent.com/bjhinkle/lxdtop/main/lxdtop
-chmod 755 ~/bin/lxdtop.new
-~/bin/lxdtop.new --version | grep '^lxdtop ' && sync ~/bin/lxdtop.new && mv ~/bin/lxdtop.new ~/bin/lxdtop
+cd "$(mktemp -d)"
+curl -fsSLO https://github.com/bjhinkle/lxdtop/releases/latest/download/lxdtop
+curl -fsSLO https://github.com/bjhinkle/lxdtop/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS && mkdir -p ~/bin && install -m 755 lxdtop ~/bin/lxdtop.new &&
+  ~/bin/lxdtop.new --version | grep '^lxdtop ' && sync ~/bin/lxdtop.new && mv ~/bin/lxdtop.new ~/bin/lxdtop
 ~/bin/lxdtop
 ```
 
-The fourth line prints the version. Only if the download runs and says it is lxdtop does it go on: `sync` flushes the copy to disk, so that a power cut just after can't leave an empty file, and `mv` replaces `~/bin/lxdtop` with it in one step. A download cut partway never becomes `~/bin/lxdtop`, so the console service never restarts into a half-downloaded file.
+The first line moves to a new, empty directory for the two files. There, `sha256sum -c` prints `lxdtop: OK` only if the download's SHA-256 is the one `SHA256SUMS` lists for it: that proves the download is whole and is, byte for byte, the file published with the release, though not who published it, since both files come from there. Only then does anything touch `~/bin`: `install` copies the download beside `~/bin/lxdtop`, the copy must print lxdtop's version, `sync` flushes it to disk, so that a power cut just after can't leave an empty file, and `mv` replaces `~/bin/lxdtop` with it in one step. A download cut partway, or one that isn't the published file, never reaches `~/bin/lxdtop`, so the console service never restarts into it.
 
 From a clone, copy it the same way, beside where it goes, and rename it into place:
 
