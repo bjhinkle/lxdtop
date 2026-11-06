@@ -277,6 +277,11 @@ OWN_COPY = ("this account still has its own ~/bin/lxdtop, which lxdtop-remote ru
             "as does a PATH with ~/bin first, and which nothing updates now. To use /usr/local/bin/lxdtop, remove it: "
             "rm ~/bin/lxdtop")
 
+ROOT_ID = """#!/bin/sh
+# Stands in for id on the host, where the login is root: id -u prints 0.
+[ "$1" = -u ] && echo 0
+"""
+
 SYNC_AS_ROOT = """#!/bin/sh
 # Stands in for sync on the host, run by sudo: write down what it was asked to flush, and what that file
 # and the installed copy held at that moment.
@@ -763,6 +768,33 @@ class SystemInstallTest(HostCase):
         self.assert_refused(result, old, f"installing in {self.system_bin} needs sudo, and this host has none; "
                                          f"{self.installed} was not changed")
         self.assertEqual(os.listdir(self.remote_home), [])
+
+    def test_a_root_login_needs_no_sudo(self):
+        """#16: logged in as root, it was refused on a host without sudo, though root needs none.
+
+        Now a root login runs root's part itself, with the same checks and messages, and never asks sudo, even
+        where there is one. Here the stand-in id says the login is root, and the stand-in /usr/local/bin is
+        writable, as it is for root.
+        """
+        self.host_path = self.path_without("sudo")
+        as_root = self.host_tool("id", ROOT_ID)
+        os.chmod(self.system_bin, 0o755)
+        for host, path in (("without sudo", as_root), ("with a sudo that refuses", self.sudo + os.pathsep + as_root)):
+            with self.subTest(host):
+                result = self.install(sudo=False, FAKE_SSH_REMOTE_PATH=path, FAKE_SUDO="refuse")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[1:], self.report)
+                self.assert_new_copy()
+        self.assertEqual(self.sudo_runs(), [])
+        self.assertEqual(len(self.connections()), 2)            # one login each
+        os.remove(self.installed)
+        os.mkdir(self.installed)
+        result = self.install(sudo=False, FAKE_SSH_REMOTE_PATH=as_root)
+        self.assertEqual(result.returncode, 1)                  # root's part refuses, and says why once
+        self.assertEqual(result.stderr, f"lxdtop-remote: can not replace {self.installed}: it is a directory, or a "
+                                        f"link to one; {self.installed} was not changed\n")
+        self.assertEqual(os.listdir(self.installed), [])
+        self.assertEqual(self.leftovers(), [])
 
     def test_a_connection_that_goes_quiet_ends_the_install_within_a_minute(self):
         """As plain install's does: see InstallTest. Its sleep returns at once here, so that minute passes at once."""
