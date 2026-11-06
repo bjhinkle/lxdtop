@@ -1,6 +1,7 @@
 """The README's install commands, run as written, with a stand-in curl or install."""
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -13,6 +14,7 @@ import unittest
 from tests.support import LXDTOP_PATH, ROOT, lxdtop
 
 README = os.path.join(ROOT, "README.md")
+FAKE_SUDO = os.path.join(ROOT, "tests", "fake_sudo.py")
 
 RELEASE = "https://github.com/bjhinkle/lxdtop/releases/latest/download/"
 
@@ -45,15 +47,30 @@ OLD = "#!/bin/sh\necho 'lxdtop 1.4.0 (the old copy)'\n"
 
 SYNC = f'''#!{sys.executable}
 """Stands in for sync FILE: writes down what it was asked to flush, and the SHA-256 of that file and of
-~/bin/lxdtop at that moment, then exits with $SYNC_EXIT (default 0)."""
+the installed copy ($INSTALLED, or ~/bin/lxdtop) at that moment, then exits with $SYNC_EXIT (default 0)."""
 import hashlib, os, sys
 def held(path):
     with open(path, "rb") as f:
         return hashlib.sha256(f.read()).hexdigest()
+installed = os.environ.get("INSTALLED") or os.path.join(os.environ["HOME"], "bin", "lxdtop")
 with open(os.environ["SYNC_LOG"], "a") as log:
     log.write(" ".join(["sync"] + sys.argv[1:]) + "\\n")
-    log.write(held(sys.argv[1]) + "\\n" + held(os.path.join(os.environ["HOME"], "bin", "lxdtop")) + "\\n")
+    log.write(held(sys.argv[1]) + "\\n" + held(installed) + "\\n")
 sys.exit(int(os.environ.get("SYNC_EXIT", "0")))
+'''
+
+ROOT_INSTALL = "#!" + sys.executable + '''
+"""Stands in for `install -m MODE -o OWNER -g GROUP SOURCE DEST`, run by sudo: copies SOURCE to DEST with that
+mode, as GNU install does, and writes down the owner and group it was asked for, which only root can set."""
+import getopt, os, shutil, sys
+options, (source, dest) = getopt.getopt(sys.argv[1:], "m:o:g:")
+options = dict(options)
+with open(os.environ["OWNER_LOG"], "a") as log:
+    log.write(options["-o"] + ":" + options["-g"] + " " + dest + "\\n")
+if os.path.lexists(dest):
+    os.unlink(dest)
+shutil.copyfile(source, dest)
+os.chmod(dest, int(options["-m"], 8))
 '''
 
 
@@ -69,12 +86,13 @@ def add_tool(directory, name, text):
     os.chmod(path, 0o755)
 
 
-def install_commands():
-    """The README's commands under "Install and run", without the last one, which starts lxdtop."""
+def release_commands(start):
+    """The README's commands under "Install and run" that install the latest release and then start it with
+    `start`, without that last line."""
     with open(README, encoding="utf-8") as f:
-        section = f.read().split("\n## Install and run\n", 1)[1]
-    lines = section.split("```bash\n", 1)[1].split("\n```", 1)[0].splitlines()
-    assert lines[-1] == "~/bin/lxdtop", lines
+        section = f.read().split("\n## Install and run\n", 1)[1].split("\n## ", 1)[0]
+    blocks = [block.splitlines() for block in re.findall(r"```bash\n(.*?)\n```", section, re.S)]
+    (lines,) = [lines for lines in blocks if lines[-1] == start and any("releases/latest" in line for line in lines)]
     return "\n".join(lines[:-1]) + "\n"
 
 
@@ -105,7 +123,9 @@ os.chmod(dest, mode)
 
 @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
 class ReadmeInstallTest(unittest.TestCase):
-    """The README's install of the latest release, run as written, with a stand-in curl serving the release."""
+    """The README's install of the latest release in ~/bin, run as written, with a stand-in curl serving it."""
+
+    start = "~/bin/lxdtop"                      # how the README then starts it
 
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="lxdtop-readme-")
@@ -144,10 +164,13 @@ class ReadmeInstallTest(unittest.TestCase):
             f.write(OLD)
         os.chmod(self.installed, 0o755)
 
+    def commands(self):
+        return release_commands(self.start)
+
     def run_readme(self, **env):
         environ = dict(PATH=self.path, HOME=self.home, LANG="C.UTF-8", TMPDIR=self.tmpdir,
                        FAKE_RELEASE=self.release, CURL_LOG=self.curl_log, **env)
-        return subprocess.run([shutil.which("sh"), "-c", install_commands()], capture_output=True, text=True,
+        return subprocess.run([shutil.which("sh"), "-c", self.commands()], capture_output=True, text=True,
                               cwd=self.tmp, env=environ, timeout=60)
 
     def assert_installed(self, result):
@@ -244,6 +267,59 @@ class ReadmeInstallTest(unittest.TestCase):
         result = self.run_readme(SYNC_LOG=self.sync_log, SYNC_EXIT="1")
         self.assertNotEqual(result.returncode, 0)
         self.assert_old_copy()
+
+
+class ReadmeSystemInstallTest(ReadmeInstallTest):
+    """The README's install of the latest release in /usr/local/bin, for every account: the same tests.
+
+    Here /usr/local/bin is a stand-in that only the stand-in sudo, tests/fake_sudo.py,
+    can write to, so a step that writes there without sudo fails, as it would on a
+    real host. install is a stand-in too, since only root can make a file root's.
+    """
+
+    start = "lxdtop"
+
+    def setUp(self):
+        super().setUp()
+        root = os.path.join(self.tmp, "root")
+        self.system_bin = os.path.join(root, "usr", "local", "bin")
+        os.makedirs(self.system_bin)
+        os.chmod(self.system_bin, 0o555)
+        self.addCleanup(os.chmod, self.system_bin, 0o755)
+        self.installed = os.path.join(self.system_bin, "lxdtop")
+        self.sudo_log = os.path.join(self.tmp, "sudo-log")
+        self.owner_log = os.path.join(self.tmp, "owner-log")
+        self.root = root
+        add_tool(self.tools, "sudo", f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_SUDO}" "$@"\n')
+        add_tool(self.tools, "install", ROOT_INSTALL)
+
+    def commands(self):
+        return super().commands().replace("/usr/local/bin", self.system_bin)
+
+    def run_readme(self, **env):
+        return super().run_readme(FAKE_SUDO_ROOT=self.root, FAKE_SUDO_LOG=self.sudo_log, OWNER_LOG=self.owner_log,
+                                  INSTALLED=self.installed, **env)
+
+    def old_copy(self):
+        os.chmod(self.system_bin, 0o755)
+        try:
+            with open(self.installed, "w") as f:
+                f.write(OLD)
+            os.chmod(self.installed, 0o755)
+        finally:
+            os.chmod(self.system_bin, 0o555)
+
+    def test_only_install_and_mv_run_as_root(self):
+        """The download, the checksum, the version check and the flush run as you."""
+        self.old_copy()
+        self.assert_installed(self.run_readme())
+        new = self.installed + ".new"
+        with open(self.sudo_log) as f:
+            self.assertEqual([json.loads(line)["argv"] for line in f],
+                             [["install", "-m", "755", "-o", "root", "-g", "root", "lxdtop", new],
+                              ["mv", new, self.installed]])
+        with open(self.owner_log) as f:
+            self.assertEqual(f.read(), f"root:root {new}\n")
 
 
 @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")

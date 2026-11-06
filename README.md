@@ -116,7 +116,23 @@ Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12.
 
 ## Install and run
 
-On the LXD host, download the latest release and its checksum, check one against the other, copy lxdtop beside where it goes, check that it runs, and move it into place:
+On an LXD host you look after, install one copy for every account, in `/usr/local/bin`, as tools such as btop are installed. Download the latest release and its checksum, check one against the other, copy lxdtop beside where it goes, check that it runs, and move it into place:
+
+```bash
+cd "$(mktemp -d)"
+curl -fsSLO https://github.com/bjhinkle/lxdtop/releases/latest/download/lxdtop
+curl -fsSLO https://github.com/bjhinkle/lxdtop/releases/latest/download/SHA256SUMS
+sha256sum -c SHA256SUMS && sudo install -m 755 -o root -g root lxdtop /usr/local/bin/lxdtop.new &&
+  /usr/local/bin/lxdtop.new --version | grep '^lxdtop ' && sync /usr/local/bin/lxdtop.new &&
+  sudo mv /usr/local/bin/lxdtop.new /usr/local/bin/lxdtop
+lxdtop
+```
+
+The first line moves to a new, empty directory for the two files. There, `sha256sum -c` prints `lxdtop: OK` only if the download's SHA-256 is the one `SHA256SUMS` lists for it: that proves the download is whole and is, byte for byte, the file published with the release, though not who published it, since both files come from there. Only then does anything touch `/usr/local/bin`: `install` copies the download beside `/usr/local/bin/lxdtop`, owned by root, so that no other account can change it, the copy must print lxdtop's version, `sync` flushes it to disk, so that a power cut just after can't leave an empty file, and `mv` replaces `/usr/local/bin/lxdtop` with it in one step. A download cut partway, or one that isn't the published file, never reaches `/usr/local/bin/lxdtop`, so the console service never restarts into it. Only `install` and `mv` run as root, and the version check runs as you. If a check fails, `/usr/local/bin/lxdtop` stays as it was, and `sudo rm /usr/local/bin/lxdtop.new` removes what's left.
+
+Every account on the host can then run `lxdtop`. Members of the `lxd` group, and root, see everything. Anyone else sees each running container's CPU, memory and disk, as [Requirements](#requirements) says. To update it, run the same lines again. An lxdtop that's already running keeps the version it started with until it restarts.
+
+Without root, install it for your own account in `~/bin` instead, with the same steps and no `sudo`:
 
 ```bash
 cd "$(mktemp -d)"
@@ -127,7 +143,7 @@ sha256sum -c SHA256SUMS && mkdir -p ~/bin && install -m 755 lxdtop ~/bin/lxdtop.
 ~/bin/lxdtop
 ```
 
-The first line moves to a new, empty directory for the two files. There, `sha256sum -c` prints `lxdtop: OK` only if the download's SHA-256 is the one `SHA256SUMS` lists for it: that proves the download is whole and is, byte for byte, the file published with the release, though not who published it, since both files come from there. Only then does anything touch `~/bin`: `install` copies the download beside `~/bin/lxdtop`, the copy must print lxdtop's version, `sync` flushes it to disk, so that a power cut just after can't leave an empty file, and `mv` replaces `~/bin/lxdtop` with it in one step. A download cut partway, or one that isn't the published file, never reaches `~/bin/lxdtop`, so the console service never restarts into it.
+An account with its own `~/bin/lxdtop` runs that one, not `/usr/local/bin/lxdtop`, wherever `~/bin` comes first on its PATH, as Ubuntu's `~/.profile` puts it, and `lxdtop-remote` prefers it too. Nothing updates it but these lines, so on a host with both, remove it with `rm ~/bin/lxdtop`.
 
 From a clone, copy it the same way, beside where it goes, and rename it into place:
 
@@ -139,7 +155,7 @@ install -m 755 lxdtop ~/bin/lxdtop.new
 
 `install` straight onto `~/bin/lxdtop` would remove the old file before copying the new one, so for a moment there'd be no lxdtop there, or only part of one. As above, `sync` flushes the copy to disk before `mv` renames it into place.
 
-Over SSH, ask for a terminal: `ssh -t <host> '~/bin/lxdtop'`.
+Over SSH, ask for a terminal: `ssh -t <host> lxdtop`, or `ssh -t <host> '~/bin/lxdtop'` for a copy in `~/bin`.
 
 Keys: `?` lists them all. `q` quits, `s` cycles the sort (cpu, mem, disk, net, name, then the wide-screen columns throttled and waiting), and `-` and `+` change the refresh interval (1 to 10 seconds). `/` filters the table by name (Enter keeps the filter, Esc clears it), the up and down arrows highlight a row, and Enter opens a page with everything lxdtop has on the highlighted instance, its recent events included: up to 50 of its own, however busy the rest of the host is (Esc or `q` goes back). No key changes anything on the host.
 
@@ -161,27 +177,32 @@ The clock follows the system time zone. Set `TZ` to change it, for example `TZ=U
 
 ```bash
 ln -s "$PWD/contrib/lxdtop-remote" ~/.local/bin/lxdtop-remote
-lxdtop-remote install myhost    # copy lxdtop to myhost:~/bin/lxdtop
-lxdtop-remote myhost            # run it in this terminal
+lxdtop-remote install --system myhost   # copy lxdtop to myhost:/usr/local/bin/lxdtop, for every account
+lxdtop-remote install myhost            # or to myhost:~/bin/lxdtop, for your account alone, without root
+lxdtop-remote myhost                    # run it in this terminal
 ```
 
 `install` copies lxdtop over one SSH connection to a new file of its own in `~/bin` on the host, `lxdtop.new.` and six random characters, so that two installs at once never share one. It checks the copy there: its SHA-256 must match your copy's (from `sha256sum`, or `shasum` on macOS), and its `--version` must print lxdtop's version. Only then is it flushed to disk and renamed over `~/bin/lxdtop`, in one step that replaces a symlink there rather than writing through it. If a check fails or the connection drops partway, `~/bin/lxdtop` stays as it was and the new file is removed, so the console service never restarts into a half-copied file. A connection that drops without a word, which sshd can take hours to notice, ends the install on the host once nothing more has arrived for a minute, and ssh on your machine gives up a minute after it last heard from the host. On success it prints the version and the SHA-256 it checked.
+
+`install --system` installs `/usr/local/bin/lxdtop`, owned by root, for every account, and uses sudo on the host for that. The copy arrives in a new file in your home directory, where it gets the same checks, as you. Then sudo copies it to a new file beside `/usr/local/bin/lxdtop`, which only root can change, checks that file's SHA-256 again, and flushes it and renames it into place in the same way. Root never runs the copy. Where sudo asks for a password, `lxdtop-remote` logs in a second time, with a terminal for sudo to ask on, and that login removes the file in your home directory whatever happens. If the host has no sudo, or sudo refuses, nothing changes. Plain `install`, without `--system`, still installs `~/bin/lxdtop`, for your account alone, and needs no root.
+
+Each says when the account has the other kind of copy too. After `install --system`, that's a `~/bin/lxdtop` of its own, which runs in front of the new copy and which nothing updates now. After `install`, it's a `/usr/local/bin/lxdtop` the install didn't update, with the command that does.
 
 An lxdtop that's already running keeps running the version it started with. `install` doesn't restart anything, but when the console service below is running, it says so, with the command that restarts it.
 
 Every connection it makes gives up a minute after it last heard from the host, so a connection that drops without a word ends the view, rather than leaving it frozen until TCP gives up.
 
-On the host it runs `~/bin/lxdtop`, or the `lxdtop` on the host's PATH when `~/bin` has none, so a single copy in `/usr/local/bin` serves every user.
+On the host it runs `~/bin/lxdtop`, or the `lxdtop` on the host's PATH when `~/bin` has none, so the single copy that `install --system` puts in `/usr/local/bin` serves every user.
 
 Optional settings live in `~/.config/lxdtop/remote.conf`: a default host, a time zone for the clock, and a window size to switch to while it runs. The comments at the top of the script list them.
 
 ## Run it full-time on a console screen
 
-`examples/lxdtop-console.service` is a systemd unit that keeps lxdtop running on virtual terminal 8, for a small monitor attached to the host. Switch to it with Alt+F8 at the keyboard, or with `lxdtop-remote screen myhost` from another machine. After installing a new version, restart it to run that one: `sudo systemctl restart lxdtop-console`.
+`examples/lxdtop-console.service` is a systemd unit that keeps lxdtop running on virtual terminal 8, for a small monitor attached to the host. It runs `/usr/local/bin/lxdtop`. A unit made from an earlier example runs `~/bin/lxdtop`: to move it to the copy for every account, change its `ExecStart` to `/usr/local/bin/lxdtop` and run `sudo systemctl daemon-reload`. Switch to it with Alt+F8 at the keyboard, or with `lxdtop-remote screen myhost` from another machine. After installing a new version, restart it to run that one: `sudo systemctl restart lxdtop-console`.
 
 ## One reading as JSON
 
-`lxdtop --dump --json` prints one reading as a single JSON document instead of the text frame. `--samples` and `--interval` work as with `--dump`. For example, `ssh myhost '~/bin/lxdtop --dump --json'` from another machine, or in a script:
+`lxdtop --dump --json` prints one reading as a single JSON document instead of the text frame. `--samples` and `--interval` work as with `--dump`. For example, `ssh myhost lxdtop --dump --json` from another machine, or in a script:
 
 ```bash
 lxdtop --dump --json | python3 -c 'import json, sys; [print(i["name"], i["cpu_pct"]) for i in json.load(sys.stdin)["instances"]]'
