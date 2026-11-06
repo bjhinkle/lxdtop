@@ -14,7 +14,9 @@ After=snap.lxd.daemon.service
 User=YOUR_USER
 Environment=TERM=linux LANG=C.UTF-8
 # Environment=TZ=America/New_York
-ExecStart=/home/YOUR_USER/bin/lxdtop
+# The copy for every account, from the README or lxdtop-remote install --system. For
+# a copy in YOUR_USER's own ~/bin instead: ExecStart=/home/YOUR_USER/bin/lxdtop
+ExecStart=/usr/local/bin/lxdtop
 StandardInput=tty
 StandardOutput=tty
 TTYPath=/dev/tty8
