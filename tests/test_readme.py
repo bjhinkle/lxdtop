@@ -14,16 +14,31 @@ from tests.support import LXDTOP_PATH, ROOT, lxdtop
 
 README = os.path.join(ROOT, "README.md")
 
+RELEASE = "https://github.com/bjhinkle/lxdtop/releases/latest/download/"
+
 FAKE_CURL = f'''#!{sys.executable}
-"""Stands in for curl -o FILE URL: writes $FAKE_CURL_BODY to FILE, or only its first $FAKE_CURL_CUT
-bytes, then exits with $FAKE_CURL_EXIT (curl's 18 means "partial file")."""
+"""Stands in for curl -o FILE URL, or curl -O URL: writes the file that URL names from the stand-in release
+in $FAKE_RELEASE, to FILE or under its own name here, and writes URL down in $CURL_LOG. With $FAKE_CURL_CUT,
+it writes only that many bytes of lxdtop, then exits with $FAKE_CURL_EXIT (curl's 18 means "partial file")."""
 import os, sys
-with open(os.environ["FAKE_CURL_BODY"], "rb") as f:
+url = sys.argv[-1]
+name = url.rsplit("/", 1)[-1]
+with open(os.environ["CURL_LOG"], "a") as log:
+    log.write(url + "\\n")
+with open(os.path.join(os.environ["FAKE_RELEASE"], name), "rb") as f:
     body = f.read()
-cut = os.environ.get("FAKE_CURL_CUT")
-with open(sys.argv[sys.argv.index("-o") + 1], "wb") as f:
+cut = os.environ.get("FAKE_CURL_CUT") if name == "lxdtop" else None
+with open(sys.argv[sys.argv.index("-o") + 1] if "-o" in sys.argv else name, "wb") as f:
     f.write(body[:int(cut)] if cut else body)
-sys.exit(int(os.environ.get("FAKE_CURL_EXIT", "0")))
+sys.exit(int(os.environ.get("FAKE_CURL_EXIT", "0")) if cut else 0)
+'''
+
+MKTEMP = f'''#!{sys.executable}
+"""Stands in for mktemp -d: makes a new directory in $TMPDIR and prints its name, as GNU mktemp does.
+macOS's mktemp makes it in the user's own temporary directory whatever $TMPDIR says, out of the test's reach."""
+import os, sys, tempfile
+assert sys.argv[1:] == ["-d"], sys.argv
+print(tempfile.mkdtemp(prefix="tmp.", dir=os.environ["TMPDIR"]))
 '''
 
 OLD = "#!/bin/sh\necho 'lxdtop 1.4.0 (the old copy)'\n"
@@ -90,17 +105,38 @@ os.chmod(dest, mode)
 
 @unittest.skipUnless(shutil.which("sh"), "needs a POSIX shell")
 class ReadmeInstallTest(unittest.TestCase):
+    """The README's install of the latest release, run as written, with a stand-in curl serving the release."""
+
     def setUp(self):
         tmp = tempfile.TemporaryDirectory(prefix="lxdtop-readme-")
         self.addCleanup(tmp.cleanup)
+        self.tmp = tmp.name
         self.home = os.path.join(tmp.name, "home")
         self.tools = os.path.join(tmp.name, "tools")
+        self.release = os.path.join(tmp.name, "release")
+        self.tmpdir = os.path.join(tmp.name, "tmp")             # where the README's mktemp makes its directory
+        self.curl_log = os.path.join(tmp.name, "curl-log")
         self.sync_log = os.path.join(tmp.name, "sync-log")
-        os.makedirs(self.home)
-        os.makedirs(self.tools)
+        for path in (self.home, self.tools, self.release, self.tmpdir):
+            os.makedirs(path)
         add_tool(self.tools, "curl", FAKE_CURL)
+        add_tool(self.tools, "mktemp", MKTEMP)
         self.path = self.tools + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin")
         self.installed = os.path.join(self.home, "bin", "lxdtop")
+        with open(LXDTOP_PATH, "rb") as f:
+            self.published = f.read()
+        self.publish(self.published)
+
+    def publish(self, body):
+        """The release: lxdtop, and SHA256SUMS with its SHA-256, as `sha256sum lxdtop` writes it."""
+        self.serve(body)
+        with open(os.path.join(self.release, "SHA256SUMS"), "w") as f:
+            f.write(f"{sha256(body)}  lxdtop\n")
+
+    def serve(self, body):
+        """What a download of the release's lxdtop gets."""
+        with open(os.path.join(self.release, "lxdtop"), "wb") as f:
+            f.write(body)
 
     def old_copy(self):
         os.makedirs(os.path.dirname(self.installed))
@@ -108,22 +144,29 @@ class ReadmeInstallTest(unittest.TestCase):
             f.write(OLD)
         os.chmod(self.installed, 0o755)
 
-    def run_readme(self, body=LXDTOP_PATH, **env):
-        environ = dict(PATH=self.path, HOME=self.home, LANG="C.UTF-8", FAKE_CURL_BODY=body, **env)
+    def run_readme(self, **env):
+        environ = dict(PATH=self.path, HOME=self.home, LANG="C.UTF-8", TMPDIR=self.tmpdir,
+                       FAKE_RELEASE=self.release, CURL_LOG=self.curl_log, **env)
         return subprocess.run([shutil.which("sh"), "-c", install_commands()], capture_output=True, text=True,
-                              env=environ, timeout=60)
+                              cwd=self.tmp, env=environ, timeout=60)
 
     def assert_installed(self, result):
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout, f"lxdtop {lxdtop.VERSION}\n")         # the version, shown by grep
-        with open(self.installed, "rb") as copy, open(LXDTOP_PATH, "rb") as original:
-            self.assertEqual(copy.read(), original.read())
+        # sha256sum's answer, then the version, shown by grep
+        self.assertEqual(result.stdout, f"lxdtop: OK\nlxdtop {lxdtop.VERSION}\n")
+        with open(self.installed, "rb") as copy:
+            self.assertEqual(copy.read(), self.published)
         self.assertEqual(stat.S_IMODE(os.stat(self.installed).st_mode), 0o755)
         self.assertFalse(os.path.exists(self.installed + ".new"))
 
     def assert_old_copy(self):
         with open(self.installed) as f:
             self.assertEqual(f.read(), OLD)
+
+    def assert_untouched(self):
+        """~/bin as it was: the old copy, and nothing beside it."""
+        self.assertEqual(os.listdir(os.path.dirname(self.installed)), ["lxdtop"])
+        self.assert_old_copy()
 
     def test_a_download_replaces_the_old_copy(self):
         self.old_copy()
@@ -132,24 +175,51 @@ class ReadmeInstallTest(unittest.TestCase):
     def test_the_first_install(self):
         self.assert_installed(self.run_readme())
 
+    def test_lxdtop_and_its_checksum_come_from_the_latest_release(self):
+        """#16: it downloaded lxdtop from main, with no published checksum to check it against."""
+        self.assert_installed(self.run_readme())
+        with open(self.curl_log) as f:
+            self.assertEqual(f.read().splitlines(), [RELEASE + "lxdtop", RELEASE + "SHA256SUMS"])
+
+    def test_a_download_that_is_not_the_published_file_leaves_the_old_copy(self):
+        """This one runs and says it's lxdtop, so only its SHA-256 can tell it from the release's file."""
+        self.old_copy()
+        self.serve(self.published + b"# not the published file\n")
+        result = self.run_readme()
+        self.assert_untouched()
+        self.assertEqual(result.stdout, "lxdtop: FAILED\n")
+        self.assertNotEqual(result.returncode, 0)
+
     def test_a_download_cut_partway_leaves_the_old_copy(self):
         self.old_copy()
         result = self.run_readme(FAKE_CURL_CUT="40000", FAKE_CURL_EXIT="18")
         self.assertNotEqual(result.returncode, 0)
-        self.assert_old_copy()
+        self.assert_untouched()
 
     def test_a_download_cut_where_it_still_runs_leaves_the_old_copy(self):
         """Cut just before its last lines, lxdtop is still a whole Python program that never calls main().
 
-        `--version` then exits 0 without printing anything, so checking its exit
-        status alone would install it. The README checks that it prints lxdtop's
-        version.
+        Its SHA-256 isn't the release's, so it never reaches ~/bin.
         """
-        with open(LXDTOP_PATH, "rb") as f:
-            cut = f.read().rindex(b'\nif __name__ == "__main__":')
+        cut = self.published.rindex(b'\nif __name__ == "__main__":')
         self.old_copy()
         result = self.run_readme(FAKE_CURL_CUT=str(cut))                       # and curl says all went well
         self.assertNotEqual(result.returncode, 0)
+        self.assert_untouched()
+
+    def test_a_published_file_that_does_not_say_it_is_lxdtop_leaves_the_old_copy(self):
+        """The checksum shows only that this is the published file. The README still checks that it runs.
+
+        Say the release's lxdtop were cut just before its last lines. It's still a
+        whole Python program that never calls main(), so `--version` exits 0 without
+        printing anything, and checking its exit status alone would install it. The
+        README checks that it prints lxdtop's version.
+        """
+        self.publish(self.published[:self.published.rindex(b'\nif __name__ == "__main__":')])
+        self.old_copy()
+        result = self.run_readme()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "lxdtop: OK\n")
         self.assert_old_copy()
         cut_off = subprocess.run([self.installed + ".new", "--version"], capture_output=True, text=True,
                                  env=dict(PATH=self.path), timeout=60)
