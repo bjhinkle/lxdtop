@@ -49,6 +49,11 @@ These come from a running container's cgroup, so stopped instances leave them em
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.10.0 (not released yet)
+
+- **`lxdtop-remote install --system` installs one copy for every account,** as `/usr/local/bin/lxdtop`, owned by root, using sudo on the host. The copy gets plain `install`'s checks, as you, then root checks its own copy of it again before renaming it into place, and never runs it. Where sudo asks for a password, `lxdtop-remote` logs in a second time, with a terminal for it. Plain `install` still installs `~/bin/lxdtop`, without root, and each says when the account also has the other kind of copy.
+- **The README installs lxdtop for every account, in `/usr/local/bin`,** with the install in `~/bin` kept for when you have no root, and `examples/lxdtop-console.service` runs `/usr/local/bin/lxdtop`.
+
 ## What's new in 1.9.0
 
 - **The busiest process never shows more CPU than its container.** Its figure was averaged with the reading before, so a process that had just gone quiet could show more than its whole container. Now it covers the last interval, as the container's does.
