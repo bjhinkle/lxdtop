@@ -103,8 +103,8 @@ flowchart LR
     nic --> mon
     rest --> mon
     ws --> mon
-    mon --> screen["draw(): curses, or --dump text"]
-    mon --> json["reading_json(): --dump --json"]
+    mon --> screen["draw()<br/>curses, or --dump text"]
+    mon --> json["reading_json()<br/>for --dump --json"]
 ```
 
 The files are the kernel's own counters. LXD's API adds what only LXD knows: names, addresses, VMs, stopped
@@ -299,13 +299,13 @@ restructured. This section reads them in the order they run.
 
 ```mermaid
 flowchart TD
-    first["mon.sample(), then a second reading 0.5 s later"] --> due
-    due{"Time for a reading?"} -- yes --> sample["mon.sample()<br/>the next one in ui.interval seconds"]
-    sample --> draw["draw() the whole frame"]
-    due -- no --> stale{"A second since the last frame,<br/>or did a key just act?"}
+    first["Two readings,<br/>0.5 s apart"] --> due
+    due{"Time for<br/>a reading?"} -- yes --> sample["mon.sample()"]
+    sample --> draw["draw()"]
+    due -- no --> stale{"Last frame over 1 s<br/>old, or a key acted?"}
     stale -- yes --> draw
     stale -- no --> key
-    draw --> key["screen.getch(): wait up to 250 ms for a key"]
+    draw --> key["getch(): wait up to<br/>250 ms for a key"]
     key --> act{"handle_key()"}
     act -- "q" --> quit["return"]
     act -- "anything else" --> due
@@ -350,14 +350,14 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    dir["A cgroup directory: lxc.payload.NAME"] --> cpu{"cpu.stat has usage_usec?"}
-    cpu -- no --> skip["Skip it: it stopped just now"]
-    cpu -- yes --> row["new_row(): memory, tasks,<br/>busiest process, uptime"]
-    row --> lim["read_cgroup_limits(), count_kills()"]
-    lim --> disk["read_disk(): ZFS, or io.stat"]
-    disk --> meas["measure(): rates from this<br/>container's earlier readings"]
-    meas --> cap["Cap the busiest process at<br/>the container's own CPU"]
-    cap --> rows["rows"]
+    dir["A cgroup directory"] --> cpu{"usage_usec<br/>in cpu.stat?"}
+    cpu -- no --> skip["Skip it:<br/>it just stopped"]
+    cpu -- yes --> row["new_row(): memory,<br/>tasks, process, uptime"]
+    row --> lim["read_cgroup_limits()<br/>count_kills()"]
+    lim --> disk["read_disk():<br/>ZFS, or io.stat"]
+    disk --> meas["measure(): rates from<br/>earlier readings"]
+    meas --> cap["Cap the busiest process<br/>at the container's CPU"]
+    cap --> rows["Add the row"]
 ```
 
 1. **Containers** ([lines 1138 to 1168][L1138-L1168]), one for each cgroup directory, as above. A container LXD
@@ -661,18 +661,18 @@ that runs on the host:
 
 ```mermaid
 flowchart TD
-    sum["Here: the copy's SHA-256, from sha256sum, or shasum on macOS"] --> conn
-    conn["One ssh connection, with the keepalive:<br/>the file on stdin, the check script as the command"] --> tidy
-    tidy["Host: remove what killed installs left behind"] --> tmp
-    tmp["mktemp ~/bin/lxdtop.new.XXXXXX:<br/>a new file for this install alone"] --> recv
-    recv["cat stdin into it, in the background,<br/>with a watchdog beside it"] -- "nothing new for a minute" --> fail
-    recv --> sha{"Its SHA-256 matches?"}
-    sha -- no --> fail["Remove the new file.<br/>~/bin/lxdtop is unchanged"]
-    sha -- yes --> runs{"Its --version prints lxdtop?"}
+    sum["Here: the copy's SHA-256"] --> conn
+    conn["One ssh connection:<br/>the file on stdin, and<br/>the script to run"] --> tidy
+    tidy["Host: remove leftovers<br/>of killed installs"] --> tmp
+    tmp["mktemp: a new file<br/>for this install"] --> recv
+    recv["cat stdin into it,<br/>with a watchdog"] -- "a minute with<br/>nothing new" --> fail
+    recv --> sha{"SHA-256<br/>matches?"}
+    sha -- no --> fail["Remove the new file.<br/>~/bin/lxdtop unchanged"]
+    sha -- yes --> runs{"--version says<br/>lxdtop?"}
     runs -- no --> fail
-    runs -- yes --> flush["sync: flush it to disk"]
-    flush --> mv["mv over ~/bin/lxdtop, in one step"]
-    mv --> done["Print the version and SHA-256, and say<br/>if lxdtop-console still runs the old copy"]
+    runs -- yes --> flush["sync: flush to disk"]
+    flush --> mv["mv over ~/bin/lxdtop,<br/>in one step"]
+    mv --> done["Print the version<br/>and the SHA-256"]
 ```
 
 - **The temp file.** `mktemp` makes `~/bin/lxdtop.new.` plus six random characters, so two installs at once never
@@ -992,8 +992,8 @@ Known issues, found and not fixed yet, are listed in [issue #16](https://github.
 [L489]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L489
 [L508-L516]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L508-L516
 [L522]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L522
-[L537]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L537
 [L537-L547]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L537-L547
+[L537]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L537
 [L550]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L550
 [L570]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L570
 [L573]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/lxdtop#L573
