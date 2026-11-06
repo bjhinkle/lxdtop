@@ -416,9 +416,9 @@ CPU threads to put it in the same unit as an instance's: % of one core.
 ```
 
 - Disk and network compare against the oldest kept reading, so a burst is spread over several intervals instead of
-  flashing for one. With four earlier readings kept, that is up to four intervals, 8 seconds at the default 2. The
-  comment on `RATE_WINDOW` ([line 98][L98]) says three: one burst put into a fake container's disk counters shows
-  for four readings, at a quarter of its rate. That is listed in [#16](https://github.com/bjhinkle/lxdtop/issues/16).
+  flashing for one. With four earlier readings kept, that is up to four intervals, 8 seconds at the default 2: one
+  burst put into a fake container's disk counters shows for four readings, at a quarter of its rate. The comment on
+  `RATE_WINDOW` ([line 98][L98]) says three intervals in 1.9.0 and 1.10.0, and four from 1.10.1.
 - `disk_src` must match. ZFS's totals and `io.stat`'s are different counters, and a rate from one to the other
   would be nonsense. The source can change when the ZFS map is looked up again.
 
