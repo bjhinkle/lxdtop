@@ -49,6 +49,11 @@ These come from a running container's cgroup, so stopped instances leave them em
 
 Every threshold is a named constant near the top of `lxdtop`, with a comment saying what it means: `THROTTLED_PCT`, `PRESSURE_PCT`, `RECENT_KILL`, `NEAR_LIMIT_PCT`, and `OPS_FROM` for the screen width.
 
+## What's new in 1.10.1 (not released yet)
+
+- **`lxdtop-remote install --system` works for a login as root on a host without sudo.** It was refused there, though root needs no sudo. A root login now runs root's part itself, with the same checks.
+- **After `install --system`, the note about the console service checks which lxdtop the service runs.** A unit made from an earlier example runs `~/bin/lxdtop`, so restarting it, as the note said, only started that copy again. Now the note says so, and how to move the service to `/usr/local/bin/lxdtop`.
+
 ## What's new in 1.10.0
 
 - **`lxdtop-remote install --system` installs one copy for every account,** as `/usr/local/bin/lxdtop`, owned by root, using sudo on the host. The copy gets plain `install`'s checks, as you, then root checks its own copy of it again before renaming it into place, and never runs it. Where sudo asks for a password, `lxdtop-remote` logs in a second time, with a terminal for it. Plain `install` still installs `~/bin/lxdtop`, without root, and each says when the account also has the other kind of copy.
