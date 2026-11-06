@@ -15,6 +15,7 @@ import unittest
 from tests.support import LXDTOP_PATH, REMOTE_PATH, ROOT, lxdtop
 
 FAKE_SSH = os.path.join(ROOT, "tests", "fake_ssh.py")
+FAKE_SUDO = os.path.join(ROOT, "tests", "fake_sudo.py")
 SH = shutil.which("sh")
 KEEPALIVE = [("-o", "ServerAliveInterval=15"), ("-o", "ServerAliveCountMax=3")]     # install's: see the script
 OWN_OPTIONS = {("-G", ""), ("-t", ""), *KEEPALIVE}       # every option lxdtop-remote gives ssh
@@ -39,6 +40,12 @@ class RemoteCase(unittest.TestCase):
         self.log = os.path.join(self.dir, "ssh.log")
         self.write(os.path.join(self.bin, "ssh"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_SSH}" "$@"\n', 0o755)
         self.write(os.path.join(self.remote_home, "bin", "lxdtop"), STUB_LXDTOP, 0o755)
+        # The host's /usr/local/bin, which only root can write to: here, only the stand-in sudo can
+        self.root = self.mkdir("root")
+        self.system_bin = os.path.join(self.root, "usr", "local", "bin")
+        os.makedirs(self.system_bin)
+        os.chmod(self.system_bin, 0o555)
+        self.addCleanup(os.chmod, self.system_bin, 0o755)
 
     def mkdir(self, name):
         path = os.path.join(self.dir, name)
@@ -51,12 +58,25 @@ class RemoteCase(unittest.TestCase):
             f.write(text)
         os.chmod(path, mode)
 
+    def on_host(self, text):
+        """Text as the host prints it: tests/fake_ssh.py points the command's /usr/local/bin at the stand-in."""
+        return text.replace("/usr/local/bin", self.system_bin)
+
+    def write_as_root(self, path, text, mode=0o755):
+        """A file in the stand-in /usr/local/bin, put there as root would."""
+        os.chmod(self.system_bin, 0o755)
+        try:
+            self.write(path, text, mode)
+        finally:
+            os.chmod(self.system_bin, 0o555)
+
     def conf(self, text):
         self.write(os.path.join(self.home, ".config", "lxdtop", "remote.conf"), text)
 
     def environ(self, **env):
         environ = dict(PATH=self.bin + os.pathsep + os.environ.get("PATH", "/usr/bin:/bin"), HOME=self.home,
-                       FAKE_SSH_LOG=self.log, FAKE_SSH_REMOTE_HOME=self.remote_home, LANG="C.UTF-8")
+                       FAKE_SSH_LOG=self.log, FAKE_SSH_REMOTE_HOME=self.remote_home, LANG="C.UTF-8",
+                       FAKE_SSH_ROOT=self.root, FAKE_SUDO_ROOT=self.root, FAKE_SUDO_LOG=self.log + ".sudo")
         environ.update(env)
         return environ
 
@@ -150,6 +170,16 @@ class RemoteTest(RemoteCase):
         self.assertNotIn("username", result.stderr)
         self.assertEqual(self.connections()[-1]["destination"], "lxdhost")
 
+    def test_install_takes_one_host_with_system_before_it(self):
+        """A --system after the host, or a second host, is refused rather than quietly dropped."""
+        for args in (("install", "--system"), ("install", "me@lxdhost", "--system"), ("install", "--system", "a", "b"),
+                     ("install", "a", "b")):
+            with self.subTest(args=args):
+                result = self.remote(*args)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("usage: lxdtop-remote install [--system] <host>", result.stderr)
+        self.assertEqual(self.ssh_runs(), [])
+
     def test_the_view_and_screen_give_up_on_a_quiet_connection_within_a_minute_too(self):
         """#16: after a drop without a word, the view stayed frozen until TCP gave up, and screen could wait as
         long. They get install's two keepalive options: see InstallTest's test of them."""
@@ -182,6 +212,7 @@ class RemoteTest(RemoteCase):
         marker = os.path.join(self.dir, "ran")
         option = f"-oProxyCommand=touch {marker}"
         for args, stdin, destination in ((("install", option), "", option),
+                                         (("install", "--system", option), "", option),
                                          (("screen", option), "", option),
                                          (("lxdhost",), option + "\n", f"{option}@lxdhost")):   # typed as the username
             with self.subTest(args=args, stdin=stdin):
@@ -229,6 +260,19 @@ echo "$*" >> "$HOME/systemctl-log"
 STILL_RUNNING = ("lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the "
                  "host with sudo systemctl restart lxdtop-console")
 
+SHARED_COPY = ("this host also has /usr/local/bin/lxdtop, for every account, and this install did not update it. "
+               "To update that one instead, use lxdtop-remote install --system, then remove this one: rm ~/bin/lxdtop")
+
+OWN_COPY = ("this account still has its own ~/bin/lxdtop, which lxdtop-remote runs instead of /usr/local/bin/lxdtop, "
+            "as does a PATH with ~/bin first, and which nothing updates now. To use /usr/local/bin/lxdtop, remove it: "
+            "rm ~/bin/lxdtop")
+
+SYNC_AS_ROOT = """#!/bin/sh
+# Stands in for sync on the host, run by sudo: write down what it was asked to flush, and what that file
+# and the installed copy held at that moment.
+{ echo "sync $*"; sha256sum < "$1"; sha256sum < "$INSTALLED"; } >> "$SYNC_LOG"
+"""
+
 SYNC_RECORDER = """#!/bin/sh
 # Stands in for sync on the host: write down what it was asked to flush, and what that file
 # and ~/bin/lxdtop held at that moment.
@@ -236,7 +280,53 @@ SYNC_RECORDER = """#!/bin/sh
 """
 
 
-class InstallTest(RemoteCase):
+class HostCase(RemoteCase):
+    """An install on a host with a login shell of its own, and the file it replaces there, self.installed."""
+
+    login_shell = "dash"                    # on the host; the classes at the end run these again with others
+
+    def setUp(self):
+        super().setUp()
+        self.shell = shutil.which(self.login_shell)
+        if not self.shell:
+            self.skipTest(f"needs {self.login_shell}")
+        self.host_path = os.environ.get("PATH", "/usr/bin:/bin")             # the PATH on the host
+
+    @staticmethod
+    def touch(path):
+        open(path, "w").close()
+
+    def wait_until(self, done, what):
+        for _ in range(3000):
+            if done():
+                return
+            time.sleep(0.01)
+        self.fail(f"waited 30 seconds for {what}")
+
+    def host_tool(self, name, text):
+        """A PATH for the host with this script in front, standing in for one of its tools."""
+        path = self.mkdir("host-" + name)
+        self.write(os.path.join(path, name), text, 0o755)
+        return path + os.pathsep + self.host_path
+
+    def state(self, path=None):
+        """What a failed install must leave exactly as it was: the file or symlink at path, and what it holds."""
+        path = path or self.installed
+        st = os.lstat(path)
+        with open(path, "rb") as f:
+            data = f.read()
+        return dict(inode=st.st_ino, mode=st.st_mode, mtime=st.st_mtime_ns, ctime=st.st_ctime_ns, data=data,
+                    link=os.readlink(path) if stat.S_ISLNK(st.st_mode) else None)
+
+    def assert_refused(self, result, old, says, status=1):
+        self.assertEqual(self.state(), old)                 # the installed file exactly as it was
+        self.assertEqual(self.leftovers(), [])              # and nothing left beside it
+        self.assertEqual(result.returncode, status, result.stderr)
+        self.assertIn(says, result.stderr)
+        self.assertNotIn("installed", result.stdout)
+
+
+class InstallTest(HostCase):
     """`install` checks the copy as a new file in ~/bin on the host, then renames it over ~/bin/lxdtop.
 
     SECURITY-REVIEW.md N-7: it used to write straight over ~/bin/lxdtop, so a
@@ -246,14 +336,8 @@ class InstallTest(RemoteCase):
     one, checked.
     """
 
-    login_shell = "dash"                    # on the host; the classes below run these again with others
-
     def setUp(self):
         super().setUp()
-        self.shell = shutil.which(self.login_shell)
-        if not self.shell:
-            self.skipTest(f"needs {self.login_shell}")
-        self.host_path = os.environ.get("PATH", "/usr/bin:/bin")             # the PATH on the host
         self.installed = os.path.join(self.remote_home, "bin", "lxdtop")     # the old copy: STUB_LXDTOP
 
     def install(self, **env):
@@ -271,17 +355,6 @@ class InstallTest(RemoteCase):
         self.addCleanup(proc.stdout.close)
         return proc
 
-    @staticmethod
-    def touch(path):
-        open(path, "w").close()
-
-    def wait_until(self, done, what):
-        for _ in range(3000):
-            if done():
-                return
-            time.sleep(0.01)
-        self.fail(f"waited 30 seconds for {what}")
-
     def leftovers(self):
         """The new files installs make beside ~/bin/lxdtop, if any are left there."""
         return sorted(name for name in os.listdir(os.path.dirname(self.installed)) if name.startswith("lxdtop.new"))
@@ -292,32 +365,10 @@ class InstallTest(RemoteCase):
             data = f.read()
         return len(data), hashlib.sha256(data).hexdigest()
 
-    def host_tool(self, name, text):
-        """A PATH for the host with this script in front, standing in for one of its tools."""
-        path = self.mkdir("host-" + name)
-        self.write(os.path.join(path, name), text, 0o755)
-        return path + os.pathsep + self.host_path
-
-    def state(self, path=None):
-        """What a failed install must leave exactly as it was: the file or symlink at path, and what it holds."""
-        path = path or self.installed
-        st = os.lstat(path)
-        with open(path, "rb") as f:
-            data = f.read()
-        return dict(inode=st.st_ino, mode=st.st_mode, mtime=st.st_mtime_ns, ctime=st.st_ctime_ns, data=data,
-                    link=os.readlink(path) if stat.S_ISLNK(st.st_mode) else None)
-
     def assert_new_copy(self):
         with open(self.installed, "rb") as copy, open(LXDTOP_PATH, "rb") as original:
             self.assertEqual(copy.read(), original.read())
         self.assertEqual(self.leftovers(), [])
-
-    def assert_refused(self, result, old, says, status=1):
-        self.assertEqual(self.state(), old)                 # ~/bin/lxdtop exactly as it was
-        self.assertEqual(self.leftovers(), [])              # and nothing left beside it
-        self.assertEqual(result.returncode, status, result.stderr)
-        self.assertIn(says, result.stderr)
-        self.assertNotIn("installed", result.stdout)
 
     def test_install_checks_the_copy_then_renames_it_into_place(self):
         old = self.state()
@@ -520,6 +571,22 @@ class InstallTest(RemoteCase):
         with open(os.path.join(self.remote_home, "systemctl-log")) as f:
             self.assertEqual(f.read().splitlines(), ["is-active --quiet lxdtop-console"] * 2)   # nothing restarted
 
+    def test_says_when_the_host_also_has_a_copy_for_every_account(self):
+        """That copy isn't updated, and this account runs its own ~/bin/lxdtop in front of it."""
+        installed = [f"installed lxdtop {lxdtop.VERSION}", f"SHA-256 {SHA256}, checked on the host"]
+        shared = os.path.join(self.system_bin, "lxdtop")
+        self.write_as_root(shared, STUB_LXDTOP)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[1:], installed + [self.on_host(SHARED_COPY)])
+        self.assertEqual(self.state(shared)["data"], STUB_LXDTOP.encode())           # left alone
+        os.chmod(self.system_bin, 0o755)
+        os.remove(shared)
+        os.symlink(self.installed, shared)              # a link to this account's copy is that copy, not another
+        os.chmod(self.system_bin, 0o555)
+        result = self.install()
+        self.assertEqual(result.stdout.splitlines()[1:], installed)
+
     def test_the_first_install_makes_bin(self):
         shutil.rmtree(os.path.join(self.remote_home, "bin"))
         result = self.install()
@@ -556,19 +623,227 @@ class InstallTest(RemoteCase):
         self.assertEqual(self.ssh_runs(), [])
 
 
-class BashInstallTest(InstallTest):
-    """The same, with bash as the login shell on the host."""
+class SystemInstallTest(HostCase):
+    """`install --system` puts one copy for every account at /usr/local/bin/lxdtop, with sudo on the host.
 
-    login_shell = "bash"
+    The copy arrives and is checked as plain install's is, in a new file in the home
+    directory. Then sudo, as root, copies it to a new file beside /usr/local/bin/lxdtop,
+    checks that one again, and renames it into place. When sudo wants a password, a
+    second login, with a terminal, does that part. Here /usr/local/bin is a stand-in
+    that only the stand-in sudo, tests/fake_sudo.py, can write to, and
+    tests/fake_ssh.py points the command's /usr/local/bin at it, so the host's
+    messages name the stand-in.
+    """
+
+    def setUp(self):
+        super().setUp()
+        shutil.rmtree(os.path.join(self.remote_home, "bin"))            # this account has no copy of its own
+        self.installed = os.path.join(self.system_bin, "lxdtop")
+        self.write_as_root(self.installed, STUB_LXDTOP)                  # the old copy
+        self.sudo = self.mkdir("host-sudo")
+        self.write(os.path.join(self.sudo, "sudo"), f'#!/bin/sh\nexec "{sys.executable}" "{FAKE_SUDO}" "$@"\n', 0o755)
+        self.report = [f"installed lxdtop {lxdtop.VERSION}", f"SHA-256 {SHA256}, checked on the host"]
+
+    def install(self, sudo=True, **env):
+        path = env.pop("FAKE_SSH_REMOTE_PATH", self.host_path)
+        return self.remote("install", "--system", "me@lxdhost", FAKE_SSH_LOGIN_SHELL=self.shell,
+                           FAKE_SSH_REMOTE_PATH=self.sudo + os.pathsep + path if sudo else path, **env)
+
+    def sudo_runs(self):
+        if not os.path.exists(self.log + ".sudo"):
+            return []
+        with open(self.log + ".sudo") as f:
+            return [json.loads(line) for line in f]
+
+    def leftovers(self):
+        """The new files installs make, if any are left: beside /usr/local/bin/lxdtop, and in the home directory."""
+        return sorted([name for name in os.listdir(self.system_bin) if name.startswith("lxdtop.new")] +
+                      ["~/" + name for name in os.listdir(self.remote_home) if name.startswith(".lxdtop.new")])
+
+    def path_without(self, name):
+        """The host's PATH without this tool: a directory of links to every other command on it."""
+        path = self.mkdir("host-without-" + name)
+        for directory in self.host_path.split(os.pathsep):
+            for tool in sorted(os.listdir(directory)) if os.path.isdir(directory) else ():
+                there, here = os.path.join(directory, tool), os.path.join(path, tool)
+                if tool != name and not os.path.lexists(here) and os.path.isfile(there) and os.access(there, os.X_OK):
+                    os.symlink(there, here)
+        return path
+
+    def assert_new_copy(self):
+        with open(self.installed, "rb") as copy, open(LXDTOP_PATH, "rb") as original:
+            self.assertEqual(copy.read(), original.read())
+        st = os.lstat(self.installed)
+        self.assertTrue(stat.S_ISREG(st.st_mode))
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o755)
+        self.assertEqual(self.leftovers(), [])
+
+    def test_install_checks_the_copy_then_root_renames_it_into_place(self):
+        old = self.state()
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertTrue(lines[0].endswith(" to me@lxdhost:/usr/local/bin/lxdtop"), lines[0])
+        self.assertEqual(lines[1:], self.report)
+        self.assert_new_copy()
+        self.assertNotEqual(os.lstat(self.installed).st_ino, old["inode"])     # renamed into place, not written over
+        self.assertEqual(len(self.connections()), 1)           # sudo needs no password: one connection, one login
+        check, install = self.sudo_runs()
+        self.assertEqual(check["argv"], ["-n", "true"])
+        self.assertEqual(install["argv"][:3] + install["argv"][4:5], ["-n", "sh", "-c", "lxdtop-remote"])
+        src, want = install["argv"][-2:]                        # the file the user checked, and its SHA-256
+        self.assertRegex(src, f"^{re.escape(self.remote_home)}/\\.lxdtop\\.new\\.[^/]{{6}}$")
+        self.assertEqual(want, SHA256)
+
+    def test_a_copy_that_arrives_damaged_is_refused_before_sudo(self):
+        old = self.state()
+        result = self.install(FAKE_SSH_FLIP_BYTE="5000")
+        self.assert_refused(result, old, "the copy that arrived is incomplete or damaged: its SHA-256 is ")
+        self.assertIn(f", not {SHA256}; {self.installed} was not changed", result.stderr)
+        self.assertEqual(self.sudo_runs(), [])
+
+    def test_a_file_that_does_not_run_is_refused_before_sudo(self):
+        old = self.state()
+        path = os.path.join(self.dir, "not-lxdtop")
+        self.write(path, "#!/bin/sh\necho 'top 4.0'\n")
+        self.assert_refused(self.install(LXDTOP=path), old, 'the copy is not lxdtop: its --version printed "top 4.0"')
+        self.assertEqual(self.sudo_runs(), [])
+
+    def test_root_checks_the_copy_again_before_it_installs_it(self):
+        """What sudo installs is what was checked: a change to the checked file before root copies it is refused."""
+        old = self.state()
+        result = self.install(FAKE_SUDO_CHANGE="1")
+        self.assert_refused(result, old, f"the copy changed after it was checked: its SHA-256 is no longer {SHA256}; "
+                                         f"{self.installed} was not changed\n")
+        self.assertEqual(len(self.sudo_runs()), 2)                      # root's part ran, and refused
+        self.assertNotIn("sudo did not run the install", result.stderr)  # and said so once
+
+    def test_a_password_for_sudo_gets_a_second_login_with_a_terminal(self):
+        result = self.install(FAKE_SUDO="password")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[1:], ["sudo on me@lxdhost wants a password: logging in again, "
+                                                          "with a terminal for it to ask on"] + self.report)
+        self.assertIn("[sudo] password for me: ", result.stderr)
+        self.assert_new_copy()                                  # the checked file, gone from the home directory too
+        first, second = self.connections()
+        self.assertNotIn(["-t", ""], first["options"])
+        self.assertIn(["-t", ""], second["options"])
+        check, install = self.sudo_runs()
+        self.assertEqual((check["argv"], check["terminal"]), (["-n", "true"], False))
+        self.assertEqual((install["argv"][:2], install["terminal"]), (["sh", "-c"], True))
+        name = install["argv"][-2].rsplit(".", 1)[1]            # the second login installs the file the first checked
+        self.assertIn(f"new=~/.lxdtop.new.{name} ", " ".join(second["words"]))
+
+    def test_without_a_terminal_for_the_password_nothing_changes(self):
+        old = self.state()
+        result = self.install(FAKE_SUDO="password", FAKE_SSH_NO_TERMINAL="1")
+        self.assert_refused(result, old, f"sudo did not run the install; {self.installed} was not changed")
+        self.assertIn("sudo: a terminal is required to read the password", result.stderr)
+
+    def test_sudo_that_refuses_leaves_the_old_copy(self):
+        old = self.state()
+        result = self.install(FAKE_SUDO="refuse")
+        self.assert_refused(result, old, "me is not in the sudoers file.\nlxdtop-remote: sudo did not run the install; "
+                                         f"{self.installed} was not changed\n")
+        self.assertEqual(len(self.connections()), 2)
+
+    def test_a_host_without_sudo_is_refused_before_anything_is_made(self):
+        old = self.state()
+        result = self.install(sudo=False, FAKE_SSH_REMOTE_PATH=self.path_without("sudo"))
+        self.assert_refused(result, old, f"installing in {self.system_bin} needs sudo, and this host has none; "
+                                         f"{self.installed} was not changed")
+        self.assertEqual(os.listdir(self.remote_home), [])
+
+    def test_a_connection_that_goes_quiet_ends_the_install_within_a_minute(self):
+        """As plain install's does: see InstallTest. Its sleep returns at once here, so that minute passes at once."""
+        old = self.state()
+        result = self.install(FAKE_SSH_STALL_AFTER="1000", FAKE_SSH_REMOTE_PATH=self.host_tool("sleep", NO_WAIT))
+        with open(self.log + ".host") as f:
+            host = json.load(f)
+        self.assertTrue(host["ended"], "the install on the host was still waiting after 20 seconds")
+        self.assertFalse(host["input_read"], "something on the host still reads the connection")
+        self.assertEqual(host["stderr"], "lxdtop-remote: nothing more of the copy arrived for a minute; "
+                                         f"{self.installed} was not changed\n")
+        self.assertEqual(self.state(), old)
+        self.assertEqual(self.leftovers(), [])
+        self.assertEqual(self.sudo_runs(), [])
+        self.assertEqual(result.returncode, 255)
+        self.assertIn("ssh failed before me@lxdhost confirmed the install; its /usr/local/bin/lxdtop is unchanged",
+                      result.stderr)
+
+    def test_warns_when_this_account_has_its_own_copy_in_bin(self):
+        """lxdtop-remote and a PATH with ~/bin first run that one in front of this one, and nothing updates it."""
+        own = os.path.join(self.remote_home, "bin", "lxdtop")
+        self.write(own, STUB_LXDTOP, 0o755)
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.splitlines()[1:], self.report + [self.on_host(OWN_COPY)])
+        with open(own) as f:
+            self.assertEqual(f.read(), STUB_LXDTOP)                      # left alone
+        os.remove(own)
+        os.symlink(self.installed, own)                 # a link to the copy for every account is that copy
+        result = self.install()
+        self.assertEqual(result.stdout.splitlines()[1:], self.report)
+
+    def test_the_copy_is_flushed_to_disk_before_the_rename(self):
+        log = os.path.join(self.dir, "sync-log")
+        result = self.install(FAKE_SSH_REMOTE_PATH=self.host_tool("sync", SYNC_AS_ROOT), SYNC_LOG=log,
+                              INSTALLED=self.installed)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assert_new_copy()
+        with open(log) as f:
+            # sync was asked to flush root's new file alone, once, when it held the whole copy and
+            # /usr/local/bin/lxdtop was still the old one: before the rename
+            synced, *held = f.read().splitlines()
+        self.assertRegex(synced, f"^sync {re.escape(self.system_bin)}/lxdtop\\.new\\.[^/]{{6}}$")
+        self.assertEqual(held, [f"{SHA256}  -", f"{hashlib.sha256(STUB_LXDTOP.encode()).hexdigest()}  -"])
+
+    def test_a_directory_at_usr_local_bin_lxdtop_is_left_alone(self):
+        os.chmod(self.system_bin, 0o755)
+        os.remove(self.installed)
+        os.mkdir(self.installed)
+        os.chmod(self.system_bin, 0o555)
+        result = self.install()
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(f"can not replace {self.installed}: it is a directory, or a link to one; {self.installed} was "
+                      "not changed", result.stderr)
+        self.assertEqual(os.listdir(self.installed), [])            # mv would have moved the copy into it
+        self.assertEqual(self.leftovers(), [])
+
+    def test_says_when_the_console_service_is_still_running_the_old_copy(self):
+        path = self.host_tool("systemctl", SYSTEMCTL)
+        for service, said in (("running", [STILL_RUNNING]), ("stopped", [])):
+            with self.subTest(service):
+                result = self.install(FAKE_SSH_REMOTE_PATH=path, CONSOLE_SERVICE=service)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[1:], self.report + said)
+        with open(os.path.join(self.remote_home, "systemctl-log")) as f:
+            self.assertEqual(f.read().splitlines(), ["is-active --quiet lxdtop-console"] * 2)   # nothing restarted
+
+    def test_what_an_install_stopped_outright_left_is_removed(self):
+        """New files two days old: the user's in the home directory, such as one left between the two logins, and
+        root's beside /usr/local/bin/lxdtop. No install is still using a file that old."""
+        home, system = self.remote_home, self.system_bin
+        files = [os.path.join(home, ".lxdtop.new.Ab12Cd"), os.path.join(home, ".lxdtop.new.Ef34Gh"),
+                 os.path.join(system, "lxdtop.new.Ij56Kl"), os.path.join(system, "lxdtop.new.Mn78Op")]
+        for path in files:
+            (self.write_as_root if path.startswith(self.system_bin) else self.write)(path, "part of a copy\n", 0o644)
+        three_days_ago = time.time() - 3 * 24 * 3600
+        for path in files[0], files[2]:
+            os.utime(path, (three_days_ago, three_days_ago))
+        result = self.install()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.leftovers(), ["lxdtop.new.Mn78Op", "~/.lxdtop.new.Ef34Gh"])
 
 
-class BusyBoxInstallTest(InstallTest):
-    """The same, on a host whose shell and tools all come from BusyBox, as on Alpine.
+class BusyBoxHost:
+    """The host's shell and tools all come from BusyBox, as on Alpine: the install classes above, run there.
 
     Some BusyBox builds run their own applets before they search the PATH, among them Ubuntu's
     busybox-static, which most Ubuntu systems (and CI's runners) have. A stand-in tool on the
     host's PATH never runs there, so the tests that need one are skipped on those builds; the
-    rest still run BusyBox's own tools, sync included.
+    rest still run BusyBox's own tools, sync included. BusyBox has no sudo, so the stand-in
+    sudo runs everywhere.
     """
 
     login_shell = "busybox"
@@ -591,6 +866,26 @@ class BusyBoxInstallTest(InstallTest):
         os.symlink(sys.executable, os.path.join(tools, "python3"))       # for lxdtop itself
         self.shell = os.path.join(tools, "sh")
         self.host_path = tools
+
+
+class BashInstallTest(InstallTest):
+    """The same, with bash as the login shell on the host."""
+
+    login_shell = "bash"
+
+
+class BusyBoxInstallTest(BusyBoxHost, InstallTest):
+    """The same, on a host whose shell and tools all come from BusyBox: see BusyBoxHost."""
+
+
+class BashSystemInstallTest(SystemInstallTest):
+    """The same, with bash as the login shell on the host."""
+
+    login_shell = "bash"
+
+
+class BusyBoxSystemInstallTest(BusyBoxHost, SystemInstallTest):
+    """The same, on a host whose shell and tools all come from BusyBox: see BusyBoxHost."""
 
 
 if __name__ == "__main__":

@@ -134,6 +134,18 @@ Where `lxdtop-remote` takes input from: the command line, `~/.config/lxdtop/remo
 
 ShellCheck 0.9.0 reported three notes, all on deliberate code. SC1091 is the `. remote.conf` at 24. SC2086 is `set -- $SCREEN_VTS` at 61, splitting `"1 8"` into two numbers. SC2016 is the single-quoted `run=` at 84, which is meant to expand on the host. Each now has an inline directive with its reason (`29f57f7`), and CI runs `shellcheck` at its default severity. Lowering CI to `--severity=warning` instead would also hide new unquoted variables, since ShellCheck counts SC2086 as a note too.
 
+### Added after the review: `install --system` uses sudo on the host
+
+`lxdtop-remote install --system <host>` installs one copy for every account, `/usr/local/bin/lxdtop`, owned by root. It is the only part of `lxdtop-remote` that does anything as root, through sudo on the host, and it is built so that root installs only what was checked:
+
+- **Everything before sudo runs as you.** The copy arrives over the one ssh connection in a new file in your home directory, made by `mktemp`, and gets plain `install`'s checks: its SHA-256 must match your copy's, and its `--version` must print lxdtop's version. Root never runs the copy.
+- **Root runs fixed code.** The part sudo runs is text in `lxdtop-remote`, given to `sudo sh -c`. No host, user name, option or setting goes into it as code. It gets two arguments: the checked file's path, made by `mktemp` on the host, and the SHA-256, which `lxdtop-remote` checks is 64 hex digits before it connects.
+- **Root checks its own copy.** It copies the checked file to a new file beside `/usr/local/bin/lxdtop`, made by `mktemp` as root, which no other account can change, and checks that file's SHA-256 before it flushes it and renames it into place. A change to the checked file between the checks and sudo is refused, not installed.
+- **The password stays with sudo.** The connection that carries the copy has no terminal for sudo to ask on, so where sudo wants a password, a second login with `ssh -t` runs only the sudo part, and sudo asks there. `lxdtop-remote` never sees the password. It passes the second login only the last six characters of the checked file's name, after checking they are letters and digits, and that login removes the file whatever happens.
+- **A refusal changes nothing.** If the host has no sudo, sudo refuses, or a check fails, `/usr/local/bin/lxdtop` stays as it was and the new files are removed. A file left by an install stopped outright is removed by a later `--system` install once it's two days old.
+
+How confirmed: `SystemInstallTest` in `tests/test_remote.py`, with dash, bash and BusyBox as the login shell, and a stand-in sudo, `tests/fake_sudo.py`, under which the stand-in `/usr/local/bin` can be written only while sudo runs a command. Not yet run with a real sudo on a real host.
+
 ## 4. The event websocket: slow, closed or malformed
 
 `LxdEvents` runs in its own daemon thread (538–539). The screen only copies the feed under a lock (624–626), so a slow or stuck event stream can't freeze the display. What happens in each case (since `da1017c`, the panel's `reconnecting` also names the error, as in `reconnecting (TimeoutError)`, the way the API footer names its errors, so a failure that repeats can't loop quietly):

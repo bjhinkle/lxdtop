@@ -18,6 +18,15 @@ $FAKE_SSH_LOG, one JSON line per run, then acts out what lxdtop-remote relies on
                           login shell is $FAKE_SSH_LOGIN_SHELL (default sh), and
                           $FAKE_SSH_REMOTE_PATH, if set, is the host's PATH. With
                           FAKE_SSH_DRY set, only record it.
+  ssh -t <dest> ...       the same, with a terminal, as when lxdtop-remote runs in
+                          one: $FAKE_SSH_TTY is set for the command, which is how
+                          tests/fake_sudo.py knows it can ask for a password. With
+                          FAKE_SSH_NO_TERMINAL set, ssh says it can't have one, as
+                          when its input isn't a terminal, and runs it without.
+
+The host's /usr/local/bin is $FAKE_SSH_ROOT/usr/local/bin: every /usr/local/bin in
+the command is changed to it before it runs, so that no test touches the real one.
+The log keeps the command as it was given.
 
 Two things that can happen to what ssh sends the host on its standard input:
 
@@ -92,6 +101,11 @@ def main():
         return 0
     home = os.environ["FAKE_SSH_REMOTE_HOME"]
     env = dict(os.environ, HOME=home, PATH=os.environ.get("FAKE_SSH_REMOTE_PATH", os.environ.get("PATH", "")))
+    command = command.replace("/usr/local/bin", os.path.join(os.environ["FAKE_SSH_ROOT"], "usr", "local", "bin"))
+    if ("-t", "") in opts and os.environ.get("FAKE_SSH_NO_TERMINAL"):
+        print("Pseudo-terminal will not be allocated because stdin is not a terminal.", file=sys.stderr)
+    elif ("-t", "") in opts:
+        env["FAKE_SSH_TTY"] = "1"
     host = [os.environ.get("FAKE_SSH_LOGIN_SHELL", "sh"), "-c", command]
     flip, drop = os.environ.get("FAKE_SSH_FLIP_BYTE"), os.environ.get("FAKE_SSH_DROP_AFTER")
     stall = os.environ.get("FAKE_SSH_STALL_AFTER")

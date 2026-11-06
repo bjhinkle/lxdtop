@@ -6,10 +6,12 @@
 #   lxdtop-remote [host] [lxdtop options]   show it in this terminal (q quits)
 #   lxdtop-remote install <host>            copy lxdtop to <host>:~/bin/lxdtop, check the copy there
 #                                           first, and print its version and SHA-256
+#   lxdtop-remote install --system <host>   the same, to <host>:/usr/local/bin/lxdtop, one copy for
+#                                           every account there, owned by root (needs sudo there)
 #   lxdtop-remote screen [host]             flip the host's console between two virtual terminals,
 #                                           e.g. a login on tty1 and lxdtop on tty8 (see examples/)
 # On the host it runs ~/bin/lxdtop, or the lxdtop on the host's PATH when ~/bin has none
-# (a copy installed once for every user, e.g. in /usr/local/bin).
+# (a copy installed once for every user, e.g. in /usr/local/bin by install --system).
 #
 # Settings are optional shell variables in ~/.config/lxdtop/remote.conf:
 #   DEFAULT_HOST=myhost       host to use when none is given
@@ -75,7 +77,10 @@ case "$1" in
     ssh_keepalive -- "$dest" "if [ \"\$(cat /sys/class/tty/tty0/active)\" = tty$2 ]; then sudo -n chvt $1 && echo \"console: tty$1\"; else sudo -n chvt $2 && echo \"console: tty$2\"; fi"
     exit ;;
   install)
-    [ -n "$2" ] || { echo "usage: lxdtop-remote install <host>" >&2; exit 2; }
+    shift
+    system=
+    if [ "$1" = --system ]; then system=1; shift; fi
+    if [ $# -ne 1 ] || [ -z "$1" ]; then echo "usage: lxdtop-remote install [--system] <host>" >&2; exit 2; fi
     [ -f "$LXDTOP" ] || { echo "lxdtop-remote: can't find $LXDTOP" >&2; exit 1; }
     # The SHA-256 of this copy, for the host to check what arrives against:
     # sha256sum on Linux, shasum on macOS.
@@ -85,8 +90,7 @@ case "$1" in
     if [ ${#sum} -ne 64 ]; then
       echo "lxdtop-remote: can't work out the SHA-256 of $LXDTOP (needs sha256sum or shasum)" >&2; exit 1
     fi
-    dest=$(login_for "$2") || exit 2
-    echo "copying $LXDTOP to $dest:~/bin/lxdtop"
+    dest=$(login_for "$1") || exit 2
     # One connection, so one login. On the host: write the copy to a new file of its own in
     # ~/bin, made by mktemp, so that two installs at once never share one. Check its SHA-256
     # and that it runs, flush it to disk, and only then rename it over ~/bin/lxdtop with mv,
@@ -98,18 +102,28 @@ case "$1" in
     # sshd may take hours to notice (Ubuntu's TCP keepalive starts after two), so the host
     # gives up once nothing more has arrived for a minute. It doesn't restart anything that
     # runs lxdtop, but it says so when the console service from examples/ is running.
+    # With --system, the new file is in the home directory instead, and after its checks,
+    # sudo does the rest as root: see $as_root below.
     # shellcheck disable=SC2016 # expanded by the shell on the host, not here
     check='
       new= pid= watch=
       clean() { for p in $pid $watch; do kill "$p" 2>/dev/null; done; [ -z "$new" ] || rm -f "$new"; }
-      fail() { clean; printf "lxdtop-remote: %s; ~/bin/lxdtop was not changed\n" "$1" >&2; exit 1; }
+      fail() { clean; printf "lxdtop-remote: %s; %s was not changed\n" "$1" "$target" >&2; exit 1; }
       trap "clean; exit 1" HUP INT TERM
-      mkdir -p ~/bin || fail "could not make ~/bin"
-      # What an install killed outright left behind: the one name earlier versions used, and
-      # new files two days old, which no install is still writing.
-      rm -f ~/bin/lxdtop.new
-      find ~/bin/. ! -name . -prune -type f -name "lxdtop.new.??????" -mtime +1 -exec rm -f {} \; 2>/dev/null
-      new=$(mktemp ~/bin/lxdtop.new.XXXXXX) || fail "could not make a new file in ~/bin"
+      if [ -z "$system" ]; then
+        mkdir -p ~/bin || fail "could not make ~/bin"
+        # What an install killed outright left behind: the one name earlier versions used, and
+        # new files two days old, which no install is still writing.
+        rm -f ~/bin/lxdtop.new
+        find ~/bin/. ! -name . -prune -type f -name "lxdtop.new.??????" -mtime +1 -exec rm -f {} \; 2>/dev/null
+        new=$(mktemp ~/bin/lxdtop.new.XXXXXX) || fail "could not make a new file in ~/bin"
+      else
+        command -v sudo >/dev/null || fail "installing in /usr/local/bin needs sudo, and this host has none"
+        # The same for --system, whose files wait in the home directory: new files two days old,
+        # left by an install killed outright or stopped between its two logins.
+        find ~/. ! -name . -prune -type f -name ".lxdtop.new.??????" -mtime +1 -exec rm -f {} \; 2>/dev/null
+        new=$(mktemp ~/.lxdtop.new.XXXXXX) || fail "could not make a new file in the home directory"
+      fi
       name="~/${new#"$HOME"/}"
       # Receive the copy in the background, so that a watch beside it can stop it. Once a
       # second, until cat ends, the watch looks at how much has arrived, and after a minute
@@ -138,20 +152,102 @@ case "$1" in
       chmod 755 "$new" || fail "could not make $name executable"
       out=$("$new" --version < /dev/null) || fail "the copy does not run: its --version exited with status $?"
       case $out in "lxdtop "*) ;; *) fail "the copy is not lxdtop: its --version printed \"$out\"" ;; esac
-      [ ! -d ~/bin/lxdtop ] || fail "can not replace ~/bin/lxdtop: it is a directory, or a link to one"
-      sync "$new" || fail "could not flush $name to disk"
-      mv -f "$new" ~/bin/lxdtop || fail "could not rename $name to ~/bin/lxdtop"
-      printf "installed %s\nSHA-256 %s, checked on the host\n" "$out" "$got"
+      if [ -z "$system" ]; then
+        [ ! -d ~/bin/lxdtop ] || fail "can not replace ~/bin/lxdtop: it is a directory, or a link to one"
+        sync "$new" || fail "could not flush $name to disk"
+        mv -f "$new" ~/bin/lxdtop || fail "could not rename $name to ~/bin/lxdtop"
+        printf "installed %s\nSHA-256 %s, checked on the host\n" "$out" "$got"
+        if [ -x /usr/local/bin/lxdtop ] && ! [ ~/bin/lxdtop -ef /usr/local/bin/lxdtop ]; then
+          echo "this host also has /usr/local/bin/lxdtop, for every account, and this install did not update it." \
+               "To update that one instead, use lxdtop-remote install --system, then remove this one: rm ~/bin/lxdtop"
+        fi
+      elif ! sudo -n true 2>/dev/null; then
+        # sudo wants a password, which needs a terminal, and this connection has the copy instead.
+        # The checked file waits for a second login, with one: say which file, by its last six
+        # characters, and keep it.
+        echo "${new##*.}"; exit 3
+      fi'
+    # With --system, sudo does the rest: the code in $root, as root, given the checked file and its
+    # SHA-256. When it needs no password, the first connection runs this. Otherwise a second login
+    # does, with ssh -t, so that sudo can ask on its terminal. Either way the checked file goes,
+    # and /usr/local/bin/lxdtop is either as it was or the whole new copy, checked. Then it shows
+    # what is installed by running it, and warns when this account's own ~/bin/lxdtop, which
+    # nothing updates now, runs in front of it: lxdtop-remote and a PATH with ~/bin first run that.
+    # shellcheck disable=SC2016 # expanded by the shell on the host, not here
+    as_root='
+      trap "rm -f \"\$new\"; exit 1" HUP INT TERM
+      sudo $nopw sh -c "$root" lxdtop-remote "$new" "$want"
+      status=$?
+      rm -f "$new"
+      [ "$status" -ne 2 ] || exit 1
+      if [ "$status" -ne 0 ]; then
+        echo "lxdtop-remote: sudo did not run the install; /usr/local/bin/lxdtop was not changed" >&2; exit 1
+      fi
+      printf "installed %s\nSHA-256 %s, checked on the host\n" "$(/usr/local/bin/lxdtop --version </dev/null)" "$want"
+      if [ -x ~/bin/lxdtop ] && ! [ ~/bin/lxdtop -ef /usr/local/bin/lxdtop ]; then
+        echo "this account still has its own ~/bin/lxdtop, which lxdtop-remote runs instead of" \
+             "/usr/local/bin/lxdtop, as does a PATH with ~/bin first, and which nothing updates now." \
+             "To use /usr/local/bin/lxdtop, remove it: rm ~/bin/lxdtop"
+      fi'
+    # The part sudo runs as root. It copies the checked file to a new file of its own beside
+    # /usr/local/bin/lxdtop, made by mktemp, which only root can change, and checks that file's
+    # SHA-256 again: what it renames into place is what was checked, whatever then happens to the
+    # first file. As in ~/bin, it flushes it to disk before the rename. It never runs the copy:
+    # the user ran its --version before sudo. When it refuses, it says why and exits 2, which sudo
+    # never does for its own failures (they are 1), so that the user's side doesn't say it again.
+    # shellcheck disable=SC2016 # expanded by the shell on the host, not here
+    root='
+      src=$1 want=$2 new=
+      clean() { [ -z "$new" ] || rm -f "$new"; }
+      fail() { clean; printf "lxdtop-remote: %s; /usr/local/bin/lxdtop was not changed\n" "$1" >&2; exit 2; }
+      trap "clean; exit 2" HUP INT TERM
+      find /usr/local/bin/. ! -name . -prune -type f -name "lxdtop.new.??????" -mtime +1 -exec rm -f {} \; 2>/dev/null
+      new=$(mktemp /usr/local/bin/lxdtop.new.XXXXXX) || fail "could not make a new file in /usr/local/bin"
+      cat <"$src" >"$new" || fail "could not copy the checked file to $new"
+      got=$(sha256sum <"$new") || fail "could not work out the SHA-256 of $new"
+      [ "${got%% *}" = "$want" ] || fail "the copy changed after it was checked: its SHA-256 is no longer $want"
+      chmod 755 "$new" || fail "could not make $new executable"
+      [ ! -d /usr/local/bin/lxdtop ] ||
+        fail "can not replace /usr/local/bin/lxdtop: it is a directory, or a link to one"
+      sync "$new" || fail "could not flush $new to disk"
+      mv -f "$new" /usr/local/bin/lxdtop || fail "could not rename $new to /usr/local/bin/lxdtop"'
+    console='
       if systemctl is-active --quiet lxdtop-console 2>/dev/null; then
         echo "lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the host" \
              "with sudo systemctl restart lxdtop-console"
       fi'
     # This end gives up on a quiet connection a minute after the host went quiet, as the host does.
-    ssh_keepalive -- "$dest" "want=$sum; $check" < "$LXDTOP"
-    status=$?
+    if [ -z "$system" ]; then
+      shown="its ~/bin/lxdtop"
+      echo "copying $LXDTOP to $dest:~/bin/lxdtop"
+      ssh_keepalive -- "$dest" "want=$sum target='~/bin/lxdtop' system=; $check$console" < "$LXDTOP"
+      status=$?
+    else
+      shown="its /usr/local/bin/lxdtop"
+      echo "copying $LXDTOP to $dest:/usr/local/bin/lxdtop"
+      # What the host prints comes back once it ends: status 3 means a file waits for a second
+      # login, and the last line is the end of its name, which goes into the next command only
+      # if it is six letters or digits.
+      first="want=$sum target=/usr/local/bin/lxdtop system=1 nopw=-n root='$root'; $check$as_root$console"
+      out=$(ssh_keepalive -- "$dest" "$first" < "$LXDTOP")
+      status=$?
+      if [ $status -ne 3 ]; then
+        [ -z "$out" ] || printf '%s\n' "$out"
+      else
+        kept=$(printf '%s\n' "$out" | tail -n 1)
+        case "$kept" in ??????) ;; *) kept=- ;; esac
+        case "$kept" in *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789]*)
+          echo "lxdtop-remote: $dest did not say which file waits for sudo; /usr/local/bin/lxdtop was not changed" >&2
+          exit 1 ;;
+        esac
+        echo "sudo on $dest wants a password: logging in again, with a terminal for it to ask on"
+        ssh_keepalive -t -- "$dest" "want=$sum new=~/.lxdtop.new.$kept nopw= root='$root'; $as_root$console"
+        status=$?
+      fi
+    fi
     # 255: ssh itself failed, and has said why. The host may or may not have got that far.
     if [ $status -eq 255 ]; then
-      echo "lxdtop-remote: ssh failed before $dest confirmed the install; its ~/bin/lxdtop is unchanged" \
+      echo "lxdtop-remote: ssh failed before $dest confirmed the install; $shown is unchanged" \
            "unless the whole copy arrived and passed its checks" >&2
     fi
     exit $status ;;
