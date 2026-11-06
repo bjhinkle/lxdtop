@@ -193,7 +193,7 @@ lxdtop-remote myhost                    # run it in this terminal
 
 Each says when the account has the other kind of copy too. After `install --system`, that's a `~/bin/lxdtop` of its own, which runs in front of the new copy and which nothing updates now. After `install`, it's a `/usr/local/bin/lxdtop` the install didn't update, with the command that does.
 
-An lxdtop that's already running keeps running the version it started with. `install` doesn't restart anything, but when the console service below is running, it says so, with the command that restarts it.
+An lxdtop that's already running keeps running the version it started with. `install` doesn't restart anything, but when the console service below is running, it says so, with the command that restarts it. After `install --system`, where the service runs another copy, such as the `~/bin/lxdtop` that a unit made from an earlier example runs, it says that instead, and how to move the service to `/usr/local/bin/lxdtop`.
 
 Every connection it makes gives up a minute after it last heard from the host, so a connection that drops without a word ends the view, rather than leaving it frozen until TCP gives up.
 

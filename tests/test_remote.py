@@ -251,14 +251,24 @@ for _ in range(3000):
 '''
 
 SYSTEMCTL = """#!/bin/sh
-# Stands in for systemctl on the host: write down what it was asked, and answer that lxdtop-console
-# is running when $CONSOLE_SERVICE says so.
+# Stands in for systemctl on the host: write down what it was asked, answer that lxdtop-console
+# is running when $CONSOLE_SERVICE says so, and that it runs $CONSOLE_RUNS, in systemd's words.
 echo "$*" >> "$HOME/systemctl-log"
-[ "$*" = "is-active --quiet lxdtop-console" ] && [ "$CONSOLE_SERVICE" = running ]
+case "$*" in
+  "is-active --quiet lxdtop-console") [ "$CONSOLE_SERVICE" = running ] ;;
+  "show -p ExecStart lxdtop-console")
+    echo "ExecStart={ path=$CONSOLE_RUNS ; argv[]=$CONSOLE_RUNS ; ignore_errors=no ;" \\
+         "start_time=[Fri 2026-11-06 09:00:00 UTC] ; stop_time=[n/a] ; pid=1234 ; code=(null) ; status=0/0 }" ;;
+  *) exit 1 ;;
+esac
 """
 
 STILL_RUNNING = ("lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the "
                  "host with sudo systemctl restart lxdtop-console")
+
+RUNS_ANOTHER = ("lxdtop-console runs {}, not /usr/local/bin/lxdtop, so a restart would not run this one: to move it "
+                "to this one, change its ExecStart to /usr/local/bin/lxdtop, then on the host run sudo systemctl "
+                "daemon-reload and sudo systemctl restart lxdtop-console")
 
 SHARED_COPY = ("this host also has /usr/local/bin/lxdtop, for every account, and this install did not update it. "
                "To update that one instead, use lxdtop-remote install --system, then remove this one: rm ~/bin/lxdtop")
@@ -814,11 +824,36 @@ class SystemInstallTest(HostCase):
         path = self.host_tool("systemctl", SYSTEMCTL)
         for service, said in (("running", [STILL_RUNNING]), ("stopped", [])):
             with self.subTest(service):
-                result = self.install(FAKE_SSH_REMOTE_PATH=path, CONSOLE_SERVICE=service)
+                result = self.install(FAKE_SSH_REMOTE_PATH=path, CONSOLE_SERVICE=service, CONSOLE_RUNS=self.installed)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(result.stdout.splitlines()[1:], self.report + said)
         with open(os.path.join(self.remote_home, "systemctl-log")) as f:
-            self.assertEqual(f.read().splitlines(), ["is-active --quiet lxdtop-console"] * 2)   # nothing restarted
+            asked = f.read().splitlines()
+        # which lxdtop the running service runs, asked once, and nothing restarted
+        self.assertEqual(asked, ["is-active --quiet lxdtop-console", "show -p ExecStart lxdtop-console",
+                                 "is-active --quiet lxdtop-console"])
+
+    def test_says_when_the_console_service_runs_another_copy(self):
+        """#16: a console service made from the earlier example runs ~/bin/lxdtop, which a restart only starts again.
+
+        The note said to restart it to run the new copy. Now it says the service runs another, and how to move the
+        service to /usr/local/bin/lxdtop, after one login or two.
+        """
+        own = os.path.join(self.remote_home, "bin", "lxdtop")
+        self.write(own, STUB_LXDTOP, 0o755)
+        path = self.host_tool("systemctl", SYSTEMCTL)
+        second = "sudo on me@lxdhost wants a password: logging in again, with a terminal for it to ask on"
+        for sudo, said in (("", []), ("password", [second])):
+            with self.subTest(sudo=sudo):
+                result = self.install(FAKE_SSH_REMOTE_PATH=path, FAKE_SUDO=sudo, CONSOLE_SERVICE="running",
+                                      CONSOLE_RUNS=own)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines()[1:], said + self.report + [
+                    self.on_host(OWN_COPY), self.on_host(RUNS_ANOTHER.format(own))])
+        os.remove(own)
+        os.symlink(self.installed, own)                 # a link to the copy for every account runs that copy
+        result = self.install(FAKE_SSH_REMOTE_PATH=path, CONSOLE_SERVICE="running", CONSOLE_RUNS=own)
+        self.assertEqual(result.stdout.splitlines()[1:], self.report + [STILL_RUNNING])
 
     def test_what_an_install_stopped_outright_left_is_removed(self):
         """New files two days old: the user's in the home directory, such as one left between the two logins, and
