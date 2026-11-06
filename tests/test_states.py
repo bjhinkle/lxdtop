@@ -125,6 +125,24 @@ class FrozenVmTest(Host):
         self.assertEqual(win["state"], "Frozen")
         self.assertIsNotNone(win["mem_bytes"])
 
+    def test_its_detail_view_shows_its_state_in_its_dots_color(self):
+        """#16: the detail view showed a frozen instance's state in green, as a running one's, where its dot
+        in the table is yellow. Now it's yellow too, for a container and a VM alike."""
+        mon = self.readings(frozen=("win", "web"))
+        for name, cg, color in (("web", "web", "mid"), ("win", "win", "mid"), ("db", "db", "lo")):
+            with self.subTest(name):
+                ui = lxdtop.new_ui(2)
+                ui.view, ui.detail = "detail", cg
+                canvas = lxdtop.TextCanvas(45, 160)
+                with glyphs(lxdtop.GLYPHS_UNICODE), \
+                        mock.patch.object(lxdtop.socket, "gethostname", return_value="lxdhost"):
+                    lxdtop.draw(canvas, mon, ui)
+                line = canvas.text().splitlines()[2]
+                state = "frozen" if color == "mid" else "running"
+                x = line.index(state)
+                self.assertEqual(line[:x], "│ state       ")
+                self.assertEqual({style for _, style in canvas.cells[2][x:x + len(state)]}, {color})
+
     def test_one_it_cannot_read_still_counts_as_frozen_and_says_why(self):
         self.host.remove("/proc/5151")
         mon = self.readings()

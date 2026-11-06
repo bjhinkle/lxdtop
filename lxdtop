@@ -2381,7 +2381,8 @@ def detail_lines(row, mon, gone):
     if gone:
         state = [("gone", "hi"), (": no longer on this host, last seen " + row["state"].lower(), "text")]
     else:
-        state = [(row["state"].lower(), "lo" if live else "dim")]
+        # in its dot's color in the table: green while it runs, yellow while it's frozen, grey with no readings
+        state = [(row["state"].lower(), ("mid" if row["state"] == "Frozen" else "lo") if live else "dim")]
     lines = [("state", state + [(f"   {'virtual machine' if vm else 'container'} on {where}", "dim")])]
     if row["unread"] and not gone:                   # a running VM lxdtop can't read: why, and what may cause it
         why, hint = row["unread"]
