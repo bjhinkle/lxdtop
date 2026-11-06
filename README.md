@@ -236,6 +236,8 @@ Early, and provided as is.
 
 Issues and pull requests are welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) for the few rules that keep lxdtop small and safe.
 
+[docs/WALKTHROUGH.md](docs/WALKTHROUGH.md) walks through how the code is designed and how it was built.
+
 ## License
 
 MIT. See [LICENSE](LICENSE).
