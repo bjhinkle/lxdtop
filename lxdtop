@@ -36,7 +36,7 @@ needs membership in the lxd group (or root). Without it lxdtop still runs,
 minus IPs, the network columns, VMs, stopped instances and the event feed.
 
 Needs Linux with cgroup v2 (Ubuntu 22.04 or later), LXD 5 or 6, and Python 3.
-Tested on Ubuntu 24.04 with LXD 6.7 and Python 3.12.
+Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12.
 """
 
 import argparse
@@ -95,7 +95,7 @@ GRAPH_ROWS = (7, 14)     # the CPU-by-instance graph panel: its smallest height,
 MIN_RUNNING = 5          # running instances the table keeps before the graph, then the host panels, go
 
 HISTORY = 900                      # samples kept per graph (30 min at 2 s)
-RATE_WINDOW = 4                    # disk and network rates average over the last 3 intervals
+RATE_WINDOW = 4                    # disk and network rates average over the last 4 intervals
 INTERVALS = (1, 2, 3, 5, 10)       # seconds; - and + step through these
 SORTS = ("cpu", "mem", "disk", "net", "name", "throttled", "waiting")    # the last two: wide-screen columns
 SORT_COLUMNS = {"cpu": {"cpu"}, "mem": {"mem"}, "disk": {"rd", "wr"},

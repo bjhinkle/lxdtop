@@ -5,8 +5,9 @@ follows the data: where each number comes from, how two readings become a rate, 
 It ends with a reading order and the design choices most worth arguing about.
 
 Line numbers are for lxdtop 1.9.0, and each one links to the file at the `v1.9.0` tag, so the links keep showing
-the code this page describes after the file changes. When this page was written, `lxdtop` and
-`contrib/lxdtop-remote` on `main` were the same as in 1.9.0.
+the code this page describes after the file changes. The parts of `contrib/lxdtop-remote` that 1.10.0 added,
+`install --system` among them, link to the `v1.10.0` tag instead. Apart from its version, `lxdtop` is the same in
+1.9.0 and 1.10.0.
 
 ## Contents
 
@@ -416,9 +417,9 @@ CPU threads to put it in the same unit as an instance's: % of one core.
 ```
 
 - Disk and network compare against the oldest kept reading, so a burst is spread over several intervals instead of
-  flashing for one. With four earlier readings kept, that is up to four intervals, 8 seconds at the default 2. The
-  comment on `RATE_WINDOW` ([line 98][L98]) says three: one burst put into a fake container's disk counters shows
-  for four readings, at a quarter of its rate. That is listed in [#16](https://github.com/bjhinkle/lxdtop/issues/16).
+  flashing for one. With four earlier readings kept, that is up to four intervals, 8 seconds at the default 2: one
+  burst put into a fake container's disk counters shows for four readings, at a quarter of its rate. The comment on
+  `RATE_WINDOW` ([line 98][L98]) says three intervals in 1.9.0 and 1.10.0, and four from 1.10.1.
 - `disk_src` must match. ZFS's totals and `io.stat`'s are different counters, and a rate from one to the other
   would be nonsense. The source can change when the ZFS map is looked up again.
 
@@ -630,8 +631,9 @@ the events LXD announced during its few seconds.
 ## 6. contrib/lxdtop-remote
 
 [contrib/lxdtop-remote](../contrib/lxdtop-remote) runs lxdtop on a host over ssh from a Mac or Linux machine. It is
-about 180 lines of POSIX sh, and CI runs shellcheck on it at its default severity. The machine it runs on may be
-macOS or Linux, and the host's login shell may be dash, bash or BusyBox's sh.
+about 180 lines of POSIX sh in 1.9.0, and about 270 since `install --system` came in 1.10.0. CI runs shellcheck on
+it at its default severity. The machine it runs on may be macOS or Linux, and the host's login shell may be dash,
+bash or BusyBox's sh.
 
 - **Settings** are shell variables in `~/.config/lxdtop/remote.conf`, which it runs as shell code
   ([line 26][R26]). That's by design, and note N-6 in the security review says what it means.
@@ -697,6 +699,57 @@ flowchart TD
   [line 153][R153] says the host's file is unchanged unless the whole copy arrived and passed its checks: a drop
   right after the last byte looks like a normal end, so the host goes ahead (note N-7).
 
+**`install --system`** ([lines 79 to 253][S79-S253] in 1.10.0) installs one copy for every account,
+`/usr/local/bin/lxdtop`, owned by root, through sudo on the host. It keeps every check above and adds root's own,
+in two more pieces of host code, `as_root` and `root`:
+
+```mermaid
+flowchart TD
+    first["First login: the copy<br/>arrives in the home<br/>directory and gets<br/>the checks, as you"] --> pw
+    pw{"sudo needs<br/>a password?"} -- no --> asroot
+    pw -- yes --> three["Host exits 3, printing<br/>the file's last six<br/>characters"]
+    three --> again["Second login, ssh -t,<br/>so sudo can ask"]
+    again --> asroot["As root: copy it beside<br/>/usr/local/bin/lxdtop,<br/>check its SHA-256 again"]
+    asroot --> mv["sync, then mv<br/>into place"]
+```
+
+- **The checks run as you.** With `--system`, `check` first refuses a host with no sudo. Otherwise it puts its new
+  file in the home directory, `~/.lxdtop.new.` plus six random characters, and removes such files two days old
+  ([lines 121 to 125][S121-S125]). From 1.10.1, a login as root needs no sudo, as below.
+- **Root runs fixed code.** `as_root` ([lines 177 to 191][S177-S191]) runs `sudo sh -c "$root"` with two
+  arguments: the checked file and its SHA-256. `root` ([lines 199 to 213][S199-S213]) is text in the script, so no
+  host, user name or setting goes into it as code. From 1.10.1, a login as root runs `sh -c "$root"` itself,
+  without sudo, after the same checks, which then run as root too.
+- **Root checks its own copy.** `root` copies the checked file to a new file beside `/usr/local/bin/lxdtop`, made
+  by `mktemp` as root, so no other account can change it, and checks that file's SHA-256 again before `chmod`,
+  `sync` and `mv`. A change to the checked file after its checks is refused, not installed. `root` never runs the
+  copy: its `--version` ran before.
+- **Status 2 means root refused.** `root`'s `fail()` says why and exits 2, which sudo never does for its own
+  failures (they are 1), so `as_root` ([line 182][S182]) doesn't say it again.
+- **A password needs a second login.** The first connection carries the copy on standard input, so sudo has no
+  terminal to ask on there. `sudo -n true` ([lines 164 to 168][S164-S168]) asks whether sudo would need a
+  password. If so, the host keeps the checked file, prints the last six characters of its name and exits 3. The
+  local side takes them only if they are six letters or digits ([lines 237 to 242][S237-S242]), then logs in again
+  with `ssh -t` ([line 244][S244]) and runs only `as_root`, where sudo can ask. That login removes the checked file
+  whatever happens.
+- **Each says when there's the other kind of copy.** After `--system`, that's the account's own `~/bin/lxdtop`,
+  which `lxdtop-remote` and a PATH with `~/bin` first run in front of the new copy, and which nothing updates now
+  ([lines 187 to 190][S187-S190]). After plain `install`, it's a `/usr/local/bin/lxdtop` the install didn't update
+  ([lines 160 to 163][S160-S163]).
+- **The console service.** Neither restarts anything. When `lxdtop-console` is running, the host says how to
+  restart it ([lines 214 to 218][S214-S218]). From 1.10.1, after `--system`, it first asks systemd which program
+  the service runs, with `systemctl show -p ExecStart`. A unit made from the example before 1.10.0 runs
+  `~/bin/lxdtop`, which a restart only starts again, so then the note says how to move it to
+  `/usr/local/bin/lxdtop` instead.
+
+**The README's install** ([Install and run](../README.md#install-and-run)) takes the same steps by hand, without
+`lxdtop-remote`, and since 1.10.0 it installs in `/usr/local/bin` too. It downloads `lxdtop` and `SHA256SUMS` from
+the latest release into a new, empty directory, and `sha256sum -c` checks one against the other before anything
+touches `/usr/local/bin`. Then `sudo install -m 755 -o root -g root` copies it beside its place, as
+`/usr/local/bin/lxdtop.new`, owned by root, its `--version` runs as you, `sync` flushes it, and `sudo mv` renames
+it into place. Only `install` and `mv` run as root. Without root, the same lines with no `sudo` install
+`~/bin/lxdtop`, as the README's install did before 1.10.0.
+
 ## 7. Tests and CI
 
 ```bash
@@ -758,8 +811,8 @@ class ExampleTest(unittest.TestCase):
   short read-only list appears, and that the imports are still the 16 above.
 - [tests/test_untrusted_text.py](../tests/test_untrusted_text.py) feeds lxdtop names a container could choose:
   bytes that aren't UTF-8, escape sequences, `\r`, wide characters.
-- [tests/test_readme.py](../tests/test_readme.py) runs the README's install commands as written, with stand-ins for
-  `curl` and `install` and a fake release.
+- [tests/test_readme.py](../tests/test_readme.py) runs the README's install commands as written, the one in
+  `/usr/local/bin` and the one in `~/bin`, with stand-ins for `curl`, `install` and `sudo`, and a fake release.
 
 ### `lxdtop-remote`'s tests: a fake ssh, dash, bash and BusyBox
 
@@ -775,6 +828,12 @@ connection does.
 - `BusyBoxInstallTest` uses BusyBox's shell and tools, as on Alpine. Some BusyBox builds, Ubuntu's busybox-static
   among them, run their own `sync` and `sleep` before they look at the PATH, so the tests that need a stand-in for
   those skip there. Where there's no BusyBox at all, as on a Mac, the class skips.
+
+`SystemInstallTest`, `BashSystemInstallTest` and `BusyBoxSystemInstallTest` do the same for `install --system`.
+[tests/fake_sudo.py](../tests/fake_sudo.py) stands in for sudo, which asks for no password, asks for one, or
+refuses. Nothing runs as root: the stand-in `/usr/local/bin` can be written only while the stand-in sudo runs a
+command, and the fake ssh points the command's `/usr/local/bin` at it, so a step that writes there without sudo
+fails, as it would on a real host.
 
 ### CI
 
@@ -880,7 +939,8 @@ The files were built from the final `main` and published with `gh release create
 they were downloaded from the public links and checked with `sha256sum -c`, and the released file was installed on
 a real host through the same check. The only earlier tag is `v1.4.0`: 1.5.0 to 1.8.2 were never tagged.
 
-The README's install downloads both files and runs `sha256sum -c SHA256SUMS` before anything touches `~/bin`. That
+The README's install downloads both files and runs `sha256sum -c SHA256SUMS` before anything touches
+`/usr/local/bin`, or `~/bin` for the install without root. That
 proves the download is whole and is, byte for byte, the file published with the release. It doesn't prove who
 published it, since both files come from the same place.
 
@@ -920,7 +980,8 @@ One person drives the editor, and the other runs things.
 9. **`Canvas.put()` and `box()`** ([lines 1287][L1287] and [1403][L1403]), then `draw_main()` and `fit_layout()`
    ([lines 2326][L2326] and [2286][L2286]). Resize a terminal that's running lxdtop and watch things give way.
 10. **`KEYS` and `handle_key()`** ([lines 2699][L2699] and [2780][L2780]).
-11. **`install` in contrib/lxdtop-remote** ([lines 77 to 157][R77-R157]), with the diagram in section 6.
+11. **`install` in contrib/lxdtop-remote** ([lines 77 to 157][R77-R157]), with the first diagram in section 6.
+    Then `as_root` and `root` ([lines 170 to 213][S170-S213] in 1.10.0), with the second.
 12. **tests/support.py, then tests/test_rates.py.** Then write one small test of your own with `FakeHost`.
 
 ### Choices worth questioning
@@ -1097,3 +1158,15 @@ Known issues, found and not fixed yet, are listed in [issue #16](https://github.
 [R158-R178]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/contrib/lxdtop-remote#L158-L178
 [R171]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/contrib/lxdtop-remote#L171
 [R173-R174]: https://github.com/bjhinkle/lxdtop/blob/v1.9.0/contrib/lxdtop-remote#L173-L174
+[S79-S253]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L79-L253
+[S121-S125]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L121-L125
+[S160-S163]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L160-L163
+[S164-S168]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L164-L168
+[S170-S213]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L170-L213
+[S177-S191]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L177-L191
+[S182]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L182
+[S187-S190]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L187-L190
+[S199-S213]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L199-L213
+[S214-S218]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L214-L218
+[S237-S242]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L237-L242
+[S244]: https://github.com/bjhinkle/lxdtop/blob/v1.10.0/contrib/lxdtop-remote#L244

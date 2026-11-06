@@ -7,7 +7,8 @@
 #   lxdtop-remote install <host>            copy lxdtop to <host>:~/bin/lxdtop, check the copy there
 #                                           first, and print its version and SHA-256
 #   lxdtop-remote install --system <host>   the same, to <host>:/usr/local/bin/lxdtop, one copy for
-#                                           every account there, owned by root (needs sudo there)
+#                                           every account there, owned by root (needs sudo there,
+#                                           or a login as root)
 #   lxdtop-remote screen [host]             flip the host's console between two virtual terminals,
 #                                           e.g. a login on tty1 and lxdtop on tty8 (see examples/)
 # On the host it runs ~/bin/lxdtop, or the lxdtop on the host's PATH when ~/bin has none
@@ -103,7 +104,7 @@ case "$1" in
     # gives up once nothing more has arrived for a minute. It doesn't restart anything that
     # runs lxdtop, but it says so when the console service from examples/ is running.
     # With --system, the new file is in the home directory instead, and after its checks,
-    # sudo does the rest as root: see $as_root below.
+    # sudo, or a login as root itself, does the rest as root: see $as_root below.
     # shellcheck disable=SC2016 # expanded by the shell on the host, not here
     check='
       new= pid= watch=
@@ -118,7 +119,9 @@ case "$1" in
         find ~/bin/. ! -name . -prune -type f -name "lxdtop.new.??????" -mtime +1 -exec rm -f {} \; 2>/dev/null
         new=$(mktemp ~/bin/lxdtop.new.XXXXXX) || fail "could not make a new file in ~/bin"
       else
-        command -v sudo >/dev/null || fail "installing in /usr/local/bin needs sudo, and this host has none"
+        # Root may write in /usr/local/bin without sudo. Anyone else needs it.
+        [ "$(id -u)" = 0 ] || command -v sudo >/dev/null ||
+          fail "installing in /usr/local/bin needs sudo, and this host has none"
         # The same for --system, whose files wait in the home directory: new files two days old,
         # left by an install killed outright or stopped between its two logins.
         find ~/. ! -name . -prune -type f -name ".lxdtop.new.??????" -mtime +1 -exec rm -f {} \; 2>/dev/null
@@ -161,7 +164,7 @@ case "$1" in
           echo "this host also has /usr/local/bin/lxdtop, for every account, and this install did not update it." \
                "To update that one instead, use lxdtop-remote install --system, then remove this one: rm ~/bin/lxdtop"
         fi
-      elif ! sudo -n true 2>/dev/null; then
+      elif [ "$(id -u)" != 0 ] && ! sudo -n true 2>/dev/null; then
         # sudo wants a password, which needs a terminal, and this connection has the copy instead.
         # The checked file waits for a second login, with one: say which file, by its last six
         # characters, and keep it.
@@ -169,14 +172,19 @@ case "$1" in
       fi'
     # With --system, sudo does the rest: the code in $root, as root, given the checked file and its
     # SHA-256. When it needs no password, the first connection runs this. Otherwise a second login
-    # does, with ssh -t, so that sudo can ask on its terminal. Either way the checked file goes,
-    # and /usr/local/bin/lxdtop is either as it was or the whole new copy, checked. Then it shows
+    # does, with ssh -t, so that sudo can ask on its terminal. A login as root needs no sudo: the
+    # first connection runs that code itself. Either way the checked file goes, and
+    # /usr/local/bin/lxdtop is either as it was or the whole new copy, checked. Then it shows
     # what is installed by running it, and warns when this account's own ~/bin/lxdtop, which
     # nothing updates now, runs in front of it: lxdtop-remote and a PATH with ~/bin first run that.
     # shellcheck disable=SC2016 # expanded by the shell on the host, not here
     as_root='
       trap "rm -f \"\$new\"; exit 1" HUP INT TERM
-      sudo $nopw sh -c "$root" lxdtop-remote "$new" "$want"
+      if [ "$(id -u)" = 0 ]; then
+        sh -c "$root" lxdtop-remote "$new" "$want"
+      else
+        sudo $nopw sh -c "$root" lxdtop-remote "$new" "$want"
+      fi
       status=$?
       rm -f "$new"
       [ "$status" -ne 2 ] || exit 1
@@ -189,12 +197,13 @@ case "$1" in
              "/usr/local/bin/lxdtop, as does a PATH with ~/bin first, and which nothing updates now." \
              "To use /usr/local/bin/lxdtop, remove it: rm ~/bin/lxdtop"
       fi'
-    # The part sudo runs as root. It copies the checked file to a new file of its own beside
-    # /usr/local/bin/lxdtop, made by mktemp, which only root can change, and checks that file's
-    # SHA-256 again: what it renames into place is what was checked, whatever then happens to the
-    # first file. As in ~/bin, it flushes it to disk before the rename. It never runs the copy:
-    # the user ran its --version before sudo. When it refuses, it says why and exits 2, which sudo
-    # never does for its own failures (they are 1), so that the user's side doesn't say it again.
+    # The part sudo runs as root, or a root login runs itself. It copies the checked file to a new
+    # file of its own beside /usr/local/bin/lxdtop, made by mktemp, which only root can change, and
+    # checks that file's SHA-256 again: what it renames into place is what was checked, whatever
+    # then happens to the first file. As in ~/bin, it flushes it to disk before the rename. It never
+    # runs the copy: the user ran its --version before this. When it refuses, it says why and exits
+    # 2, which sudo never does for its own failures (they are 1), so that the user's side doesn't
+    # say it again.
     # shellcheck disable=SC2016 # expanded by the shell on the host, not here
     root='
       src=$1 want=$2 new=
@@ -211,10 +220,30 @@ case "$1" in
         fail "can not replace /usr/local/bin/lxdtop: it is a directory, or a link to one"
       sync "$new" || fail "could not flush $new to disk"
       mv -f "$new" /usr/local/bin/lxdtop || fail "could not rename $new to /usr/local/bin/lxdtop"'
+    # When the console service from examples/ is running, it says how to restart it to run the new copy.
+    # After --system, it first asks systemd which program the service runs, from a line such as
+    # "ExecStart={ path=/usr/local/bin/lxdtop ; argv[]=/usr/local/bin/lxdtop ; ... }". A service made
+    # from an earlier example runs ~/bin/lxdtop, which a restart would only start again, so then it
+    # says how to move the service to /usr/local/bin/lxdtop.
+    # shellcheck disable=SC2016 # expanded by the shell on the host, not here
     console='
       if systemctl is-active --quiet lxdtop-console 2>/dev/null; then
-        echo "lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the host" \
-             "with sudo systemctl restart lxdtop-console"
+        runs=
+        if [ -n "$system" ]; then
+          runs=$(systemctl show -p ExecStart lxdtop-console 2>/dev/null)
+          case $runs in
+            "ExecStart={ path="*) runs=${runs#"ExecStart={ path="}; runs=${runs%%" ;"*} ;;
+            *) runs= ;;
+          esac
+        fi
+        if [ -n "$runs" ] && ! [ "$runs" -ef /usr/local/bin/lxdtop ]; then
+          echo "lxdtop-console runs $runs, not /usr/local/bin/lxdtop, so a restart would not run this one: to move" \
+               "it to this one, change its ExecStart to /usr/local/bin/lxdtop, then on the host run" \
+               "sudo systemctl daemon-reload and sudo systemctl restart lxdtop-console"
+        else
+          echo "lxdtop-console is still running the lxdtop it started with: to run this one, restart it on the host" \
+               "with sudo systemctl restart lxdtop-console"
+        fi
       fi'
     # This end gives up on a quiet connection a minute after the host went quiet, as the host does.
     if [ -z "$system" ]; then
@@ -241,7 +270,7 @@ case "$1" in
           exit 1 ;;
         esac
         echo "sudo on $dest wants a password: logging in again, with a terminal for it to ask on"
-        ssh_keepalive -t -- "$dest" "want=$sum new=~/.lxdtop.new.$kept nopw= root='$root'; $as_root$console"
+        ssh_keepalive -t -- "$dest" "want=$sum new=~/.lxdtop.new.$kept system=1 nopw= root='$root'; $as_root$console"
         status=$?
       fi
     fi
