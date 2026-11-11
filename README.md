@@ -122,7 +122,7 @@ Every threshold is a named constant near the top of `lxdtop`, with a comment say
 - Python 3
 - Membership in the `lxd` group, or root, for IP addresses, VMs, stopped instances and the event feed. Without it, lxdtop still shows each running container, by name, with its CPU, memory and disk.
 
-Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12.
+Tested on Ubuntu 24.04 with LXD 6.7 and 6.9 and Python 3.12. `--dump --json` also checked on Arch Linux (Omarchy) with Arch's own LXD 6.9 package and Python 3.14: it finds Arch's socket at `/var/lib/lxd/unix.socket`, and without access to it (an account outside the `lxd` group) it reports `no access` and still lists the instances.
 
 ## Install and run
 
